@@ -23,6 +23,15 @@ const CODE_TO_STATUS = ['active', 'victory', 'defeat', 'intermission'];
 const KIND_TO_CODE = { cell: 0, assist: 1, cabin: 2 };
 const CODE_TO_KIND = ['cell', 'assist', 'cabin'];
 
+const OUTCOME_TO_CODE = { direct: 0, partial: 1, miss: 2 };
+const CODE_TO_OUTCOME = ['direct', 'partial', 'miss'];
+
+const MISS_TO_CODE = { none: 0, overshot: 1, short: 2, wide: 3 };
+const CODE_TO_MISS = ['none', 'overshot', 'short', 'wide'];
+
+const DIR_TO_CODE = { '': 0, N: 1, NE: 2, E: 3, SE: 4, S: 5, SW: 6, W: 7, NW: 8 };
+const CODE_TO_DIR = ['', 'N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+
 function clamp(v, lo, hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
@@ -64,7 +73,7 @@ export function packPlaneFlags(state) {
   if (state.releasing) fl |= PLANE_FLAG_RELEASING;
   if (state.scooping) fl |= PLANE_FLAG_SCOOPING;
   if (state.autopilot) fl |= PLANE_FLAG_AUTOPILOT;
-  if (state.stallWarn || (state.bounceTimer > 0)) fl |= PLANE_FLAG_STALL_OR_BOUNCE;
+  if (state.stallWarn || (state.bounceTimer > 0) || state.crashed) fl |= PLANE_FLAG_STALL_OR_BOUNCE;
   if (state.outOfBounds) fl |= PLANE_FLAG_OUT_OF_BOUNDS;
   return fl;
 }
@@ -289,6 +298,7 @@ export function encodeFireDeltaWithOverflow(delta, maxChars = PAYLOAD_CAPS.fireR
     ms: Math.max(0, Math.round(delta.missionScore ?? 0)),
   };
   if (delta.wave != null) payload.wv = Math.max(1, Math.floor(delta.wave));
+  if (delta.opIndex != null) payload.oi = clamp(Math.floor(delta.opIndex), 0, 4);
   if (delta.status && delta.status !== 'active') payload.st = STATUS_TO_CODE[delta.status] ?? 0;
   if (delta.intermissionTimer > 0) payload.it = Math.round(delta.intermissionTimer * 10);
 
@@ -308,6 +318,21 @@ export function encodeFireDeltaWithOverflow(delta, maxChars = PAYLOAD_CAPS.fireR
       KIND_TO_CODE[ev.kind] ?? 0,
     ]);
   }
+  if (Array.isArray(delta.dropOutcomes) && delta.dropOutcomes.length > 0) {
+    payload.o = delta.dropOutcomes.slice(0, 12).map((o) => [
+      o.slotId | 0,
+      Math.round(o.impactX ?? 0),
+      Math.round(o.impactZ ?? 0),
+      Math.max(0, Math.round(o.cellsExtinguished ?? 0)),
+      Math.max(0, Math.round(o.cellsCooled ?? 0)),
+      Math.max(0, Math.round(o.pointsAwarded ?? 0)),
+      OUTCOME_TO_CODE[o.outcome] ?? 2,
+      MISS_TO_CODE[o.missType] ?? 0,
+      DIR_TO_CODE[o.missDirCompass || ''] ?? 0,
+      Math.max(0, Math.round(o.missDistM ?? 0)),
+      o.cabinSaved ? 1 : 0,
+    ]);
+  }
 
   // Deduplicate changedCells by idx (latest wins)
   const rawCells = Array.isArray(delta.changedCells) ? delta.changedCells : [];
@@ -320,9 +345,13 @@ export function encodeFireDeltaWithOverflow(delta, maxChars = PAYLOAD_CAPS.fireR
   // Measure base envelope overhead with empty "f":""
   payload.f = '';
   let baseStr = JSON.stringify(payload);
-  // If scoreHits alone somehow blew the budget, trim scoreHits first.
+  // If scoreHits or dropOutcomes alone blew the budget, trim scoreHits first, then dropOutcomes.
   while (baseStr.length > maxChars && payload.h && payload.h.length > 0) {
     payload.h.pop();
+    baseStr = JSON.stringify(payload);
+  }
+  while (baseStr.length > maxChars && payload.o && payload.o.length > 0) {
+    payload.o.pop();
     baseStr = JSON.stringify(payload);
   }
   const availB64Chars = Math.max(0, maxChars - baseStr.length);
@@ -364,6 +393,21 @@ export function decodeFireDelta(str) {
   const scoreHits = Array.isArray(obj.h)
     ? obj.h.map((t) => ({ slotId: t[0] | 0, pts: Number(t[1]) || 0, kind: CODE_TO_KIND[t[2] | 0] || 'cell' }))
     : [];
+  const dropOutcomes = Array.isArray(obj.o)
+    ? obj.o.map((t) => ({
+        slotId: t[0] | 0,
+        impactX: Number(t[1]) || 0,
+        impactZ: Number(t[2]) || 0,
+        cellsExtinguished: Math.max(0, t[3] | 0),
+        cellsCooled: Math.max(0, t[4] | 0),
+        pointsAwarded: Math.max(0, Number(t[5]) || 0),
+        outcome: CODE_TO_OUTCOME[t[6] | 0] || 'miss',
+        missType: CODE_TO_MISS[t[7] | 0] || 'none',
+        missDirCompass: CODE_TO_DIR[t[8] | 0] || '',
+        missDistM: Math.max(0, Number(t[9]) || 0),
+        cabinSaved: Boolean(t[10]),
+      }))
+    : [];
   return {
     windDirDeg,
     windSpeedKt,
@@ -371,8 +415,10 @@ export function decodeFireDelta(str) {
     cabinChanges,
     scoreHits,
     scoreEvents: scoreHits,
+    dropOutcomes,
     missionScore: Number(obj.ms) || 0,
     wave: obj.wv != null ? (obj.wv | 0) : undefined,
+    opIndex: obj.oi != null ? clamp(obj.oi | 0, 0, 4) : undefined,
     status: obj.st != null ? (CODE_TO_STATUS[obj.st | 0] || 'active') : 'active',
     intermissionTimer: obj.it != null ? (Number(obj.it) / 10) : 0,
   };
@@ -481,6 +527,7 @@ export function encodeFireKey(state, maxChars = PAYLOAD_CAPS.fireKey) {
     c: cabinHp,
     w: encodeWind(state.windDirDeg ?? 90, state.windSpeedKt ?? 12),
     wv: Math.max(1, Math.floor(state.wave ?? 1)),
+    oi: clamp(Math.floor(state.opIndex ?? 0), 0, 4),
     ms: Math.max(0, Math.round(state.missionScore ?? 0)),
     st: STATUS_TO_CODE[state.status ?? 'active'] ?? 0,
     it: Math.round(Math.max(0, state.intermissionTimer ?? 0) * 10),
@@ -528,6 +575,7 @@ export function decodeFireKey(str) {
     windDirDeg,
     windSpeedKt,
     wave: Math.max(1, obj.wv | 0),
+    opIndex: obj.oi != null ? clamp(obj.oi | 0, 0, 4) : 0,
     missionScore: Number(obj.ms) || 0,
     status: CODE_TO_STATUS[obj.st | 0] || 'active',
     intermissionTimer: (Number(obj.it) || 0) / 10,
@@ -542,6 +590,7 @@ export function encodeMeta(meta) {
     : [];
   const obj = {
     wv: Math.max(1, Math.floor(meta.wave ?? 1)),
+    oi: clamp(Math.floor(meta.opIndex ?? 0), 0, 4),
     ms: Math.max(0, Math.round(meta.missionScore ?? 0)),
     bp: Math.round(clamp(meta.burningPct ?? 0, 0, 100) * 10),
     ca: Math.max(0, meta.cabinsAlive | 0),
@@ -569,6 +618,7 @@ export function decodeMeta(str) {
   }
   return {
     wave: Math.max(1, obj.wv | 0),
+    opIndex: obj.oi != null ? clamp(obj.oi | 0, 0, 4) : 0,
     missionScore: Number(obj.ms) || 0,
     burningPct: (Number(obj.bp) || 0) / 10,
     cabinsAlive: obj.ca | 0,

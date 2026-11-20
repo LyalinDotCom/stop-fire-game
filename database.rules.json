@@ -209,7 +209,7 @@
           ".read": "auth !== null",
           "$slot": {
             ".write": "(auth !== null && newData.exists() && (auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && newData.child('e').val() === root.child('worlds').child($w).child('authority').child('epoch').val())",
-            ".validate": "($slot.matches(/^([0-9]|1[0-5])$/) && newData.hasChildren(['e', 'q', 't', 'd']) && newData.child('t').val() === now && newData.child('q').val() % 16 + '' === $slot)",
+            ".validate": "($slot.matches(/^([0-9]|1[0-5])$/) && newData.hasChildren(['e', 'q', 't', 'd']) && newData.child('t').val() === now && newData.child('q').val() % 16 + '' === $slot && (!data.exists() || newData.child('e').val() > data.child('e').val() || newData.child('q').val() > data.child('q').val()))",
             "e": {
               ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 1000000000)"
             },
@@ -229,7 +229,7 @@
         },
         "fireKey": {
           ".read": "auth !== null",
-          ".write": "(auth !== null && newData.exists() && (auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && newData.child('e').val() === root.child('worlds').child($w).child('authority').child('epoch').val() && (!data.exists() || now - data.child('t').val() >= 4000))",
+          ".write": "(auth !== null && newData.exists() && (auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && newData.child('e').val() === root.child('worlds').child($w).child('authority').child('epoch').val() && (!data.exists() || newData.child('e').val() > data.child('e').val() || now - data.child('t').val() >= 4000))",
           ".validate": "(newData.hasChildren(['e', 'q', 't', 'd']) && newData.child('t').val() === now)",
           "e": {
             ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 1000000000)"
@@ -249,7 +249,7 @@
         },
         "meta": {
           ".read": "auth !== null",
-          ".write": "(auth !== null && newData.exists() && (auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && newData.child('e').val() === root.child('worlds').child($w).child('authority').child('epoch').val() && (!data.exists() || now - data.child('t').val() >= 800))",
+          ".write": "(auth !== null && newData.exists() && (auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && newData.child('e').val() === root.child('worlds').child($w).child('authority').child('epoch').val() && (!data.exists() || newData.child('e').val() > data.child('e').val() || now - data.child('t').val() >= 800))",
           ".validate": "(newData.hasChildren(['e', 't', 'd']) && newData.child('t').val() === now)",
           "e": {
             ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 1000000000)"

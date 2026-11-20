@@ -59,10 +59,10 @@ export class WorldCallouts {
       !proj.visible ||
       !Number.isFinite(proj.x) ||
       !Number.isFinite(proj.y) ||
-      proj.x < 0.03 ||
-      proj.x > 0.97 ||
-      proj.y < 0.09 ||
-      proj.y > 0.87
+      proj.x < 0.04 ||
+      proj.x > 0.96 ||
+      proj.y < 0.07 ||
+      proj.y > 0.90
     ) {
       if (pin.visible) {
         pin.root.classList.remove('is-visible');

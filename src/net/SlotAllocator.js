@@ -16,15 +16,15 @@ const MAX_CLAIM_RETRIES = 8;
 
 /** Compute staggered basin-perimeter entry spawn pose for slotId 0..99. */
 export function computeEntrySpawnPose(slotId, terrain) {
-  const halfWorld = terrain?.halfWorld ?? 1600;
-  const radius = halfWorld * 0.82;
+  const halfWorld = terrain?.halfWorld ?? 1024;
+  const radius = halfWorld * 0.62;
   const angle = ((slotId * 137.508) % 360) * (Math.PI / 180);
   const x = Math.sin(angle) * radius;
   const z = -Math.cos(angle) * radius;
   const groundY = terrain?.getHeight ? terrain.getHeight(x, z) : 20;
   const waterY = terrain?.waterLevel ?? 12;
   const baseElevation = Math.max(groundY, waterY);
-  const agl = 60 + (slotId % 5) * 12.5;
+  const agl = 52 + (slotId % 5) * 8;
   const y = baseElevation + agl;
   const yawDeg = ((Math.atan2(-x, z) * 180) / Math.PI + 360) % 360;
   return {
@@ -146,7 +146,7 @@ export class SlotAllocator {
     colorIdx = 0,
     connId = this.connId,
     buildHash = getBuildHash(),
-    mapId = 'cascadia',
+    mapId = 'op01',
     cap = MAX_SLOTS,
   } = {}) {
     if (this._claiming) return { seated: false, slotId: this.slotId, createdWorld: false, queued: false };

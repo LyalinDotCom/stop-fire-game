@@ -26,8 +26,9 @@ export const FIRE_KEY_INTERVAL_MS = 5000; // 0.2 Hz (>= 4 s rule)
 export const META_INTERVAL_MS = 2000; // 0.5 Hz (>= 0.8 s rule)
 export const INDEX_INTERVAL_MS = 10000; // 0.1 Hz (>= 5 s rule)
 export const EVICT_AWAY_GRACE_MS = 60000; // >= 60 s grace before evicting away slot
-export const HOST_SCOOP_MAX_AGL = 6.0; // Host validates scoop <= 6.0 m above water
+export const HOST_SCOOP_MAX_AGL = (FLIGHT_CONSTANTS.SCOOP_EXIT_AGL ?? 11.5) + 0.5; // Tracks forgiving lake scoop ceiling
 const MIN_DROP_BURST_SEC = 0.25;
+const CRASH_SPEED_THRESHOLD_KMH = 40;
 
 const KMH_TO_MS = 1 / 3.6;
 const DEG_TO_RAD = Math.PI / 180;
@@ -47,12 +48,17 @@ export class HostBroadcaster {
     terrain,
     fireSim,
     epoch = 1,
+    opIndex = 0,
     buildHash = getBuildHash(),
-    worldName = 'Cascadia Mega-Basin',
+    worldName = 'Cinderpine Basin',
     localSlotId = null,
     planesIntervalMs = PLANES_INTERVAL_MS,
     onScoreEvents = null,
     onImpactEvents = null,
+    onDropOutcomes = null,
+    onWorldEvents = null,
+    onOperationAdvance = null,
+    onOperationHydrated = null,
     onSimStep = null,
     enableBackgroundTicker = true,
   }) {
@@ -61,12 +67,17 @@ export class HostBroadcaster {
     this.terrain = terrain;
     this.fireSim = fireSim;
     this.epoch = epoch;
+    this.opIndex = Math.max(0, Math.min(4, Math.floor(opIndex) || 0));
     this.buildHash = buildHash;
     this.worldName = worldName;
     this.localSlotId = localSlotId;
     this.planesIntervalMs = planesIntervalMs;
     this.onScoreEvents = onScoreEvents;
     this.onImpactEvents = onImpactEvents;
+    this.onDropOutcomes = onDropOutcomes;
+    this.onWorldEvents = onWorldEvents;
+    this.onOperationAdvance = onOperationAdvance;
+    this.onOperationHydrated = onOperationHydrated;
     this.onSimStep = onSimStep;
 
     this.basePath = `worlds/${worldId}`;
@@ -91,8 +102,10 @@ export class HostBroadcaster {
     this._pendingCells = new Map();
     this._pendingCabins = new Map();
     this._pendingScores = [];
+    this._pendingDropOutcomes = [];
     this._overflowCells = [];
     this._needsWaveKeyPublish = false;
+    this._advancingOperation = false;
 
     this._lastPlanesAt = 0;
     this._lastFireRingAt = 0;
@@ -125,6 +138,44 @@ export class HostBroadcaster {
   setLocalAircraft(aircraft, dropSeq = 0) {
     this._localAircraft = aircraft;
     this._localDropSeq = dropSeq;
+  }
+
+  /**
+   * Swap active Operation terrain & FireSim (called on Operation 01->05->01 rollover
+   * or during Host failover hydration when the shard is already on another Operation).
+   */
+  setWorld({ terrain, fireSim, opIndex, worldName = null, publishNow = true } = {}) {
+    if (terrain) this.terrain = terrain;
+    if (fireSim) this.fireSim = fireSim;
+    if (typeof opIndex === 'number') {
+      this.opIndex = Math.max(0, Math.min(4, Math.floor(opIndex)));
+    }
+    if (typeof worldName === 'string' && worldName) {
+      this.worldName = worldName;
+    }
+
+    this._pendingCells.clear();
+    this._overflowCells.length = 0;
+    this._pendingCabins.clear();
+    this._pendingScores.length = 0;
+    this._pendingDropOutcomes.length = 0;
+    this._pilots.clear();
+    this._needsWaveKeyPublish = true;
+    this._advancingOperation = false;
+
+    if (publishNow && this.running && this.hydrated) {
+      const now = this.adapter.now();
+      if (!this._lastFireKeyAt || now - this._lastFireKeyAt >= PACING_MS.fireKey) {
+        this._needsWaveKeyPublish = false;
+        this.publishFireKey().catch(() => {});
+      }
+      if (!this._lastMetaAt || now - this._lastMetaAt >= PACING_MS.meta) {
+        this.publishMeta().catch(() => {});
+      }
+      if (!this._lastIndexAt || now - this._lastIndexAt >= PACING_MS.worldsIndex) {
+        this.publishWorldsIndex().catch(() => {});
+      }
+    }
   }
 
   async start({ isFailover = false } = {}) {
@@ -199,20 +250,30 @@ export class HostBroadcaster {
     if (fireKey && typeof fireKey.d === 'string') {
       try {
         const keyState = decodeFireKey(fireKey.d);
-        this.fireSim.applyExternalKey(keyState);
-        this.fireSeq = Number.isInteger(fireKey.q) ? fireKey.q : 0;
+        if (
+          typeof keyState.opIndex === 'number' &&
+          (keyState.opIndex !== this.opIndex || keyState.gridSize !== this.fireSim?.gridSize)
+        ) {
+          this.opIndex = Math.max(0, Math.min(4, keyState.opIndex));
+          await this.onOperationHydrated?.(this.opIndex, keyState);
+        }
+        if (this.fireSim && keyState.gridSize === this.fireSim.gridSize) {
+          this.fireSim.applyExternalKey(keyState);
+          this.fireSeq = Number.isInteger(fireKey.q) ? fireKey.q : 0;
 
-        if (fireRing && typeof fireRing === 'object') {
-          const deltas = Object.values(fireRing)
-            .filter((entry) => entry && Number.isInteger(entry.q) && entry.q > this.fireSeq && typeof entry.d === 'string')
-            .sort((a, b) => a.q - b.q);
-          for (const entry of deltas) {
-            try {
-              const delta = decodeFireDelta(entry.d);
-              this.fireSim.applyExternalDelta(delta);
-              this.fireSeq = entry.q;
-            } catch {
-              // Skip corrupted ring entry.
+          if (fireRing && typeof fireRing === 'object') {
+            const deltas = Object.values(fireRing)
+              .filter((entry) => entry && Number.isInteger(entry.q) && entry.q > this.fireSeq && typeof entry.d === 'string')
+              .sort((a, b) => a.q - b.q);
+            for (const entry of deltas) {
+              try {
+                const delta = decodeFireDelta(entry.d);
+                if (typeof delta.opIndex === 'number' && delta.opIndex !== this.opIndex) continue;
+                this.fireSim.applyExternalDelta(delta);
+                this.fireSeq = entry.q;
+              } catch {
+                // Skip corrupted ring entry.
+              }
             }
           }
         }
@@ -229,7 +290,8 @@ export class HostBroadcaster {
     this.hydrated = true;
     this._bgTicker?.start?.();
 
-    if (!this._lastFireKeyAt || now - this._lastFireKeyAt >= PACING_MS.fireKey) {
+    const epochAdvanced = !fireKey || this.epoch > (fireKey.e | 0);
+    if (epochAdvanced || !this._lastFireKeyAt || now - this._lastFireKeyAt >= PACING_MS.fireKey) {
       await this.publishFireKey().catch(() => {});
     }
     if (!this._lastIndexAt || now - this._lastIndexAt >= PACING_MS.worldsIndex) {
@@ -312,6 +374,7 @@ export class HostBroadcaster {
 
       if (slotId === this.localSlotId && this._localAircraft) {
         const a = this._localAircraft;
+        const isCrashed = !!a.crashed;
         if (!pilot) {
           pilot = {
             slotId,
@@ -322,11 +385,12 @@ export class HostBroadcaster {
             yawDeg: a.yawDeg,
             pitchDeg: a.pitchDeg,
             rollDeg: a.rollDeg,
-            speedKmh: a.speedKmh,
-            tankPct: a.tankPct ?? 100,
-            releasing: !!a.releasing,
-            scooping: !!a.scooping,
+            speedKmh: isCrashed ? 0 : a.speedKmh,
+            tankPct: isCrashed ? 0 : (a.tankPct ?? 100),
+            releasing: isCrashed ? false : !!a.releasing,
+            scooping: isCrashed ? false : !!a.scooping,
             autopilot: !!a.autopilot,
+            crashed: isCrashed,
             flags: 0,
             lastInputT: now,
             lastDropSeq: this._localDropSeq,
@@ -334,20 +398,37 @@ export class HostBroadcaster {
           };
           this._pilots.set(slotId, pilot);
         } else {
-          if (isDropSeqNewer(this._localDropSeq, pilot.lastDropSeq)) {
-            pilot.dropBurstTimer = Math.max(pilot.dropBurstTimer, MIN_DROP_BURST_SEC);
-            pilot.lastDropSeq = this._localDropSeq;
+          if (isCrashed) {
+            pilot.crashed = true;
+            pilot.tankPct = 0;
+            pilot.releasing = false;
+            pilot.scooping = false;
+            pilot.dropBurstTimer = 0;
+            pilot.speedKmh = 0;
+            pilot.x = a.x;
+            pilot.y = a.y;
+            pilot.z = a.z;
+          } else {
+            if (pilot.crashed) {
+              // Respawned cleanly after crash cycle — reset tank to local post-respawn level.
+              pilot.crashed = false;
+              pilot.tankPct = a.tankPct ?? 0;
+            }
+            if (isDropSeqNewer(this._localDropSeq, pilot.lastDropSeq)) {
+              pilot.dropBurstTimer = Math.max(pilot.dropBurstTimer, MIN_DROP_BURST_SEC);
+              pilot.lastDropSeq = this._localDropSeq;
+            }
+            pilot.x = a.x;
+            pilot.y = a.y;
+            pilot.z = a.z;
+            pilot.yawDeg = a.yawDeg;
+            pilot.pitchDeg = a.pitchDeg;
+            pilot.rollDeg = a.rollDeg;
+            pilot.speedKmh = a.speedKmh;
+            pilot.releasing = !!a.releasing;
+            pilot.scooping = !!a.scooping;
           }
           pilot.uid = uid;
-          pilot.x = a.x;
-          pilot.y = a.y;
-          pilot.z = a.z;
-          pilot.yawDeg = a.yawDeg;
-          pilot.pitchDeg = a.pitchDeg;
-          pilot.rollDeg = a.rollDeg;
-          pilot.speedKmh = a.speedKmh;
-          pilot.releasing = !!a.releasing;
-          pilot.scooping = !!a.scooping;
           pilot.autopilot = !!a.autopilot;
           pilot.lastInputT = now;
         }
@@ -355,6 +436,7 @@ export class HostBroadcaster {
         const rawIn = this._inputs[uid];
         const decoded = rawIn && typeof rawIn.d === 'string' ? decodeInput(rawIn.d) : null;
         if (decoded) {
+          const isCrashed = decoded.speedKmh < CRASH_SPEED_THRESHOLD_KMH;
           if (!pilot || pilot.uid !== uid) {
             pilot = {
               slotId,
@@ -365,33 +447,61 @@ export class HostBroadcaster {
               yawDeg: decoded.yawDeg,
               pitchDeg: decoded.pitchDeg,
               rollDeg: decoded.rollDeg,
-              speedKmh: clamp(decoded.speedKmh, FLIGHT_CONSTANTS.MIN_SPEED_KMH, FLIGHT_CONSTANTS.MAX_SPEED_KMH),
-              tankPct: pilot && pilot.uid === uid ? pilot.tankPct : 100,
-              releasing: decoded.releasing,
-              scooping: decoded.scooping,
+              speedKmh: isCrashed
+                ? 0
+                : clamp(decoded.speedKmh, FLIGHT_CONSTANTS.MIN_SPEED_KMH, FLIGHT_CONSTANTS.MAX_SPEED_KMH),
+              tankPct: isCrashed ? 0 : (pilot && pilot.uid === uid ? pilot.tankPct : 100),
+              releasing: isCrashed ? false : decoded.releasing,
+              scooping: isCrashed ? false : decoded.scooping,
               autopilot: decoded.autopilot,
+              crashed: isCrashed,
               flags: decoded.flags,
               lastInputT: rawIn.t || now,
               lastDropSeq: decoded.dropSeq,
-              dropBurstTimer: decoded.dropSeq > 0 && decoded.releasing ? MIN_DROP_BURST_SEC : 0,
+              dropBurstTimer: (!isCrashed && decoded.dropSeq > 0 && decoded.releasing) ? MIN_DROP_BURST_SEC : 0,
             };
             this._pilots.set(slotId, pilot);
+          } else if (isCrashed) {
+            pilot.crashed = true;
+            pilot.tankPct = 0;
+            pilot.releasing = false;
+            pilot.scooping = false;
+            pilot.dropBurstTimer = 0;
+            pilot.speedKmh = 0;
+            pilot.x = decoded.x;
+            pilot.y = decoded.y;
+            pilot.z = decoded.z;
+            pilot.yawDeg = decoded.yawDeg;
+            pilot.pitchDeg = clamp(decoded.pitchDeg, -45, 45);
+            pilot.rollDeg = clamp(decoded.rollDeg, -60, 60);
+            pilot.autopilot = decoded.autopilot;
+            pilot.flags = decoded.flags;
+            pilot.lastInputT = rawIn.t || now;
           } else {
-            const elapsedSec = Math.max(0.1, Math.min(2.0, ((rawIn.t || now) - pilot.lastInputT) / 1000 || dt));
-            const dx = decoded.x - pilot.x;
-            const dy = decoded.y - pilot.y;
-            const dz = decoded.z - pilot.z;
-            const dist = Math.hypot(dx, dy, dz);
-            const maxDist = Math.max(45, MAX_PLAUSIBLE_SPEED_MS * elapsedSec);
-            if (dist > maxDist && dist > 1e-3) {
-              const scale = maxDist / dist;
-              pilot.x += dx * scale;
-              pilot.y += dy * scale;
-              pilot.z += dz * scale;
-            } else {
+            if (pilot.crashed) {
+              // Remote pilot respawned on perimeter air corridor — snap immediately with empty tank.
+              pilot.crashed = false;
+              pilot.tankPct = 0;
               pilot.x = decoded.x;
               pilot.y = decoded.y;
               pilot.z = decoded.z;
+            } else {
+              const elapsedSec = Math.max(0.1, Math.min(2.0, ((rawIn.t || now) - pilot.lastInputT) / 1000 || dt));
+              const dx = decoded.x - pilot.x;
+              const dy = decoded.y - pilot.y;
+              const dz = decoded.z - pilot.z;
+              const dist = Math.hypot(dx, dy, dz);
+              const maxDist = Math.max(45, MAX_PLAUSIBLE_SPEED_MS * elapsedSec);
+              if (dist > maxDist && dist > 1e-3) {
+                const scale = maxDist / dist;
+                pilot.x += dx * scale;
+                pilot.y += dy * scale;
+                pilot.z += dz * scale;
+              } else {
+                pilot.x = decoded.x;
+                pilot.y = decoded.y;
+                pilot.z = decoded.z;
+              }
             }
             if (isDropSeqNewer(decoded.dropSeq, pilot.lastDropSeq)) {
               pilot.dropBurstTimer = Math.max(pilot.dropBurstTimer, MIN_DROP_BURST_SEC);
@@ -417,11 +527,19 @@ export class HostBroadcaster {
       pilot.x = clamp(pilot.x, -bound, bound);
       pilot.z = clamp(pilot.z, -bound, bound);
 
-      // Authoritative scoop validation: must be over water and <= 6.0 m above waterLevel.
+      if (pilot.crashed) {
+        pilot.scooping = false;
+        pilot.releasing = false;
+        pilot.tankPct = 0;
+        continue;
+      }
+
+      // Authoritative scoop validation: tracks FlightModel forgiving water scoop ceiling dynamically.
+      const maxScoopAgl = (FLIGHT_CONSTANTS.SCOOP_EXIT_AGL ?? 11.5) + 0.5;
       const overWater = this.terrain?.isWater ? this.terrain.isWater(pilot.x, pilot.z) : false;
       const waterLevel = this.terrain?.waterLevel ?? 12.0;
       const aglWater = pilot.y - waterLevel;
-      const validScoop = pilot.scooping && overWater && aglWater <= HOST_SCOOP_MAX_AGL;
+      const validScoop = pilot.scooping && overWater && aglWater <= maxScoopAgl;
       pilot.scooping = validScoop;
 
       if (validScoop) {
@@ -459,7 +577,35 @@ export class HostBroadcaster {
     }
 
     const stepDelta = this.fireSim.step(dt, Math.max(1, activeManualPilots || activeSlots.size));
+    const dropOutcomes = typeof this.fireSim.drainDropOutcomes === 'function'
+      ? this.fireSim.drainDropOutcomes()
+      : (stepDelta?.dropOutcomes || []);
+    const worldEvents = typeof this.fireSim.drainWorldEvents === 'function'
+      ? this.fireSim.drainWorldEvents()
+      : (stepDelta?.worldEvents || []);
+
+    if (dropOutcomes.length > 0) {
+      this._pendingDropOutcomes.push(...dropOutcomes);
+      if (this._pendingDropOutcomes.length > 24) {
+        this._pendingDropOutcomes.splice(0, this._pendingDropOutcomes.length - 24);
+      }
+      this.onDropOutcomes?.(dropOutcomes);
+    }
+    if (worldEvents.length > 0) {
+      this.onWorldEvents?.(worldEvents);
+    }
+
     if (stepDelta) {
+      const wantsOpAdvance = Boolean(stepDelta.advanceOperation);
+      if (wantsOpAdvance && this.onOperationAdvance && !this._advancingOperation) {
+        this._advancingOperation = true;
+        const fromOpIndex = this.opIndex;
+        const nextOpIndex = (fromOpIndex + 1) % 5;
+        const handled = this.onOperationAdvance({ fromOpIndex, nextOpIndex, stepDelta });
+        if (handled !== false) return;
+        this._advancingOperation = false;
+      }
+
       if (stepDelta.fullReset) {
         // Wave 2+ full reset: discard stale wave deltas and force a fresh fireKey!
         this._pendingCells.clear();
@@ -516,6 +662,7 @@ export class HostBroadcaster {
     this._pendingCabins.clear();
 
     const scoreEvents = this._pendingScores.splice(0, 48);
+    const dropOutcomes = this._pendingDropOutcomes.splice(0, 12);
 
     const { str, overflow } = encodeFireDeltaWithOverflow({
       windDirDeg: snap.windDirDeg,
@@ -523,8 +670,10 @@ export class HostBroadcaster {
       changedCells,
       cabinChanges,
       scoreEvents,
+      dropOutcomes,
       missionScore: snap.missionScore,
       wave: snap.wave,
+      opIndex: this.opIndex,
       status: snap.status,
       intermissionTimer: snap.intermissionTimer,
     });
@@ -548,6 +697,7 @@ export class HostBroadcaster {
     const full = this.fireSim.encodeFullState();
     const d = encodeFireKey({
       ...full,
+      opIndex: this.opIndex,
       gridSize: this.terrain?.gridSize ?? this.fireSim.gridSize,
     });
     this._lastFireKeyAt = this.adapter.now();
@@ -577,6 +727,7 @@ export class HostBroadcaster {
 
     const d = encodeMeta({
       wave: snap.wave,
+      opIndex: this.opIndex,
       missionScore: snap.missionScore,
       burningPct: snap.burningPct,
       cabinsAlive: snap.cabinsAlive,

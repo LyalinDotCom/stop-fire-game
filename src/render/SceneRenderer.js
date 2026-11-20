@@ -91,6 +91,10 @@ export class SceneRenderer {
     this._projVec = new THREE.Vector3();
     this._camForward = new THREE.Vector3();
     this._toTarget = new THREE.Vector3();
+    this._internalShake = 0;
+    this._wasCrashed = false;
+    this._crashOrbitAngle = 0;
+    this._crashPos = new THREE.Vector3();
 
     this.rebuildWorld(terrain);
     this.resize();
@@ -102,6 +106,8 @@ export class SceneRenderer {
   rebuildWorld(terrain) {
     this.terrain = terrain;
     this._cameraSnapped = false;
+    this._wasCrashed = false;
+    this._internalShake = 0;
 
     if (this._water) {
       this.scene.remove(this._water.mesh);
@@ -166,6 +172,39 @@ export class SceneRenderer {
   }
 
   /**
+   * Spawns unmistakable drop impact VFX (tall steam column + glowing splash rings on hit/partial;
+   * muted splash dust + amber-red ring on miss).
+   */
+  spawnDropImpactEffect(x, y, z, outcome, cellsExtinguished = 0) {
+    if (this._vfx) {
+      this._vfx.spawnDropImpactEffect(x, y, z, outcome, cellsExtinguished);
+    }
+  }
+
+  /**
+   * Spawns debris/spark burst and applies heavy camera shake when the plane clips a tree.
+   */
+  spawnTreeHitEffect(x, y, z) {
+    this._internalShake = Math.max(this._internalShake, 0.95);
+    if (this._vfx) {
+      this._vfx.spawnTreeHitEffect(x, y, z);
+    }
+  }
+
+  /**
+   * Spawns fiery crash fireball + smoke plume + heavy camera jolt on airframe loss.
+   */
+  spawnCrashExplosion(x, y, z) {
+    this._internalShake = Math.max(this._internalShake, 1.65);
+    if (Number.isFinite(x) && Number.isFinite(z)) {
+      this._crashPos.set(x, Number.isFinite(y) ? y : 18, z);
+    }
+    if (this._vfx) {
+      this._vfx.spawnCrashExplosion(x, y, z);
+    }
+  }
+
+  /**
    * Advances camera, lights, meshes, shaders, and VFX, then renders the 640x360 WebGL frame.
    */
   update({
@@ -183,27 +222,52 @@ export class SceneRenderer {
 
     // 1. Hero plane pose, livery & wing stencil
     if (localAircraft) {
-      if (localAircraft.colorIdx !== undefined) {
-        this._heroPlane.setLivery(localAircraft.colorIdx);
+      const isCrashed = Boolean(localAircraft.crashed);
+      if (isCrashed && !this._wasCrashed) {
+        this._crashPos.set(localAircraft.x, localAircraft.y, localAircraft.z);
+        this._crashOrbitAngle = ((localAircraft.yawDeg || 0) * Math.PI) / 180;
+        this._internalShake = Math.max(this._internalShake, 1.45);
+      } else if (!isCrashed && this._wasCrashed) {
+        // Snap chase camera cleanly onto respawned airframe
+        this._cameraSnapped = false;
       }
-      if (localAircraft.slotId !== undefined && localAircraft.slotId !== null && localAircraft.slotId >= 0) {
-        const digits = String(localAircraft.slotId % 100).padStart(2, '0');
-        this._heroPlane.setStencil(digits);
+      this._wasCrashed = isCrashed;
+
+      this._heroPlane.group.visible = !isCrashed;
+      if (!isCrashed) {
+        if (localAircraft.colorIdx !== undefined) {
+          this._heroPlane.setLivery(localAircraft.colorIdx);
+        }
+        if (localAircraft.slotId !== undefined && localAircraft.slotId !== null && localAircraft.slotId >= 0) {
+          const digits = String(localAircraft.slotId % 100).padStart(2, '0');
+          this._heroPlane.setStencil(digits);
+        } else {
+          this._heroPlane.setStencil('07');
+        }
+        this._heroPlane.updatePose(localAircraft, safeDt);
+      }
+
+      const combinedShake = Math.max(cameraShake || 0, this._internalShake);
+      if (isCrashed) {
+        this._updateCrashCamera(safeDt, elapsed, combinedShake);
       } else {
-        this._heroPlane.setStencil('07');
+        this._updateChaseCamera(localAircraft, safeDt, elapsed, combinedShake);
       }
-      this._heroPlane.updatePose(localAircraft, safeDt);
-      this._updateChaseCamera(localAircraft, safeDt, elapsed, cameraShake);
     }
+
+    this._internalShake = Math.max(0, this._internalShake - safeDt * 2.2);
 
     // 2. Skybox follows camera seamlessly
     this._skybox.update(this.camera.position, elapsed);
 
-    // 3. Water shimmer
+    // 3. Water shimmer & world animations (burning tree ember rims)
     if (this._water) {
       const windVx = fireSnapshot ? (fireSnapshot.windVx || 0) : 0;
       const windVz = fireSnapshot ? (fireSnapshot.windVz || 0) : 0;
       this._water.update(elapsed, windVx, windVz);
+    }
+    if (this._world && typeof this._world.update === 'function') {
+      this._world.update(elapsed);
     }
 
     // 4. Dynamic flickering orange fire PointLights tracking fireSnapshot.hotClusters
@@ -243,9 +307,11 @@ export class SceneRenderer {
     // Right vector in horizontal plane
     this._rightVec.set(Math.cos(yawRad), 0, Math.sin(yawRad));
 
-    // Target chase offset: 18 m behind, 6.5 m above tail
-    const followDist = 18.0;
-    const followHeight = 6.5;
+    // Target chase offset: 18 m behind, 6.5 m above tail (pull slightly wider in portrait mobile)
+    const aspect = this.camera ? this.camera.aspect : 16 / 9;
+    const portraitExtra = aspect < 0.9 ? Math.min(6.5, (0.9 - aspect) * 14.0) : 0;
+    const followDist = 18.0 + portraitExtra;
+    const followHeight = 6.5 + portraitExtra * 0.28;
     this._camDesiredPos.set(
       plane.x - fx * followDist,
       plane.y + followHeight - fy * 6.5,
@@ -313,6 +379,46 @@ export class SceneRenderer {
     this.camera.lookAt(this._camLook);
   }
 
+  _updateCrashCamera(dt, elapsed, shake) {
+    this._crashOrbitAngle += dt * 0.42;
+    const dist = 34.0;
+    const height = 18.0;
+    const cx = this._crashPos.x;
+    const cy = this._crashPos.y;
+    const cz = this._crashPos.z;
+
+    this._camDesiredPos.set(
+      cx - Math.sin(this._crashOrbitAngle) * dist,
+      cy + height,
+      cz + Math.cos(this._crashOrbitAngle) * dist
+    );
+    if (this.terrain) {
+      const groundH = Math.max(
+        this.terrain.waterLevel + 3.0,
+        this.terrain.getHeight(this._camDesiredPos.x, this._camDesiredPos.z) + 5.0
+      );
+      if (this._camDesiredPos.y < groundH) {
+        this._camDesiredPos.y = groundH;
+      }
+    }
+    this._camDesiredLook.set(cx, cy + 4.5, cz);
+
+    const alpha = 1.0 - Math.exp(-3.5 * dt);
+    this._camPos.lerp(this._camDesiredPos, alpha);
+    this._camLook.lerp(this._camDesiredLook, alpha);
+
+    let sx = 0;
+    let sy = 0;
+    if (shake > 0.001) {
+      sx = Math.sin(elapsed * 61.0) * shake * 0.9;
+      sy = Math.cos(elapsed * 79.0) * shake * 0.7;
+    }
+
+    this.camera.up.set(0, 1, 0);
+    this.camera.position.set(this._camPos.x + sx, this._camPos.y + sy, this._camPos.z);
+    this.camera.lookAt(this._camLook);
+  }
+
   _updateFireLights(fireSnapshot, elapsed) {
     const clusters = fireSnapshot && fireSnapshot.hotClusters ? fireSnapshot.hotClusters : null;
     const count = clusters ? Math.min(clusters.length, FIRE_LIGHT_COUNT) : 0;
@@ -373,15 +479,28 @@ export class SceneRenderer {
   }
 
   /**
-   * Updates internal WebGL render buffer size locked to 360 vertical rows at current viewport aspect.
+   * Updates internal WebGL render buffer size preserving crisp ~360px short-side retro pixelation
+   * in BOTH landscape (width >= height, e.g. 640x360) and portrait (height > width, e.g. 360x780),
+   * adapting vertical FOV cleanly in portrait so aircraft & horizon stay nicely framed.
    */
   resize() {
     const viewW = Math.max(1, window.innerWidth || this.canvas.clientWidth || 1280);
     const viewH = Math.max(1, window.innerHeight || this.canvas.clientHeight || 720);
     const aspect = viewW / viewH;
 
-    this._renderHeight = TARGET_RENDER_HEIGHT;
-    this._renderWidth = Math.max(320, Math.round(TARGET_RENDER_HEIGHT * aspect));
+    if (aspect >= 1.0) {
+      this._renderHeight = TARGET_RENDER_HEIGHT;
+      this._renderWidth = Math.max(320, Math.round(TARGET_RENDER_HEIGHT * aspect));
+      this.camera.fov = 52;
+    } else {
+      const safeAspect = Math.max(0.35, aspect);
+      this._renderWidth = TARGET_RENDER_HEIGHT;
+      this._renderHeight = Math.max(360, Math.round(TARGET_RENDER_HEIGHT / safeAspect));
+      // Preserve comfortable horizontal wingspan framing on vertical phone screens (52..78 deg vFOV)
+      const minHalfHFovRad = (28 * Math.PI) / 180;
+      const computedVFov = (2 * Math.atan(Math.tan(minHalfHFovRad) / safeAspect) * 180) / Math.PI;
+      this.camera.fov = Math.max(52, Math.min(78, computedVFov));
+    }
 
     this.renderer.setPixelRatio(1);
     this.renderer.setSize(this._renderWidth, this._renderHeight, false);

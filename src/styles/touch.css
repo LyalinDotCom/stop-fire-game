@@ -1,0 +1,1249 @@
+/* ==========================================================================
+   EMBER FRONT — Responsive Multi-Touch Controls & Mobile Safe Layout
+   Zero interference with desktop mouse/keyboard layout:
+   All HUD overrides are strictly scoped under body.touch-active,
+   @media (max-width: 640px), and @media (max-height: 500px).
+   ========================================================================== */
+
+/* Gesture & viewport hygiene when touch mode is active */
+html:has(body.touch-active),
+body.touch-active {
+  overscroll-behavior: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+  touch-action: none;
+}
+
+body.touch-active #game-canvas {
+  touch-action: none;
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+  height: 100vh;
+  height: 100dvh;
+}
+
+body.touch-active #hud-root {
+  height: 100vh;
+  height: 100dvh;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* ==========================================================================
+   1. Touch Control Layer (mounted inside #hud-root at z-index 26:
+      above passive HUD readouts 20-25, below top-right buttons 30 / drawer 50 / overlays 60)
+   ========================================================================== */
+.ef-touch-layer {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  height: 100dvh;
+  z-index: 26;
+  pointer-events: none;
+  touch-action: none;
+  overscroll-behavior: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  overflow: hidden;
+  transition: opacity 0.2s ease;
+}
+
+.ef-touch-layer.is-crashed {
+  opacity: 0.32;
+}
+
+/* Softly dim controls slightly during DEMO FLIGHT so canvas feels open & inviting */
+.ef-touch-layer.is-demo .ef-touch-left,
+.ef-touch-layer.is-demo .ef-touch-right {
+  opacity: 0.78;
+}
+
+/* ==========================================================================
+   2. Left Thumb — Virtual Flight Yoke (Circular Gimbal + Spring-Back Puck)
+   ========================================================================== */
+.ef-touch-left {
+  position: absolute;
+  bottom: calc(26px + env(safe-area-inset-bottom, 0px));
+  left: calc(24px + env(safe-area-inset-left, 0px));
+  pointer-events: auto;
+  touch-action: none;
+  transition: opacity 0.2s ease;
+}
+
+.ef-touch-stick-zone {
+  position: relative;
+  width: 130px;
+  height: 130px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 50% 50%,
+    rgba(15, 25, 31, 0.34) 0%,
+    rgba(15, 25, 31, 0.56) 72%,
+    rgba(10, 17, 22, 0.72) 100%
+  );
+  border: 1.5px solid rgba(255, 255, 255, 0.18);
+  box-shadow:
+    0 8px 26px rgba(0, 0, 0, 0.42),
+    inset 0 0 18px rgba(102, 217, 255, 0.06);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+  cursor: pointer;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.ef-touch-stick-zone.is-active {
+  border-color: rgba(243, 114, 51, 0.62);
+  box-shadow:
+    0 8px 28px rgba(0, 0, 0, 0.48),
+    0 0 16px rgba(243, 114, 51, 0.18),
+    inset 0 0 22px rgba(243, 114, 51, 0.08);
+}
+
+.ef-touch-gimbal-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.ef-gimbal-outer-ring {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.16);
+  stroke-width: 1.1;
+  stroke-dasharray: 2 5.5;
+}
+
+.ef-gimbal-inner-ring {
+  fill: none;
+  stroke: rgba(102, 217, 255, 0.14);
+  stroke-width: 0.9;
+}
+
+.ef-gimbal-deadzone-ring {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.14);
+  stroke-width: 1;
+  stroke-dasharray: 2.5 3;
+}
+
+.ef-gimbal-axis {
+  stroke: rgba(255, 255, 255, 0.16);
+  stroke-width: 1;
+  stroke-linecap: round;
+}
+
+.ef-gimbal-diag-tick {
+  stroke: rgba(255, 255, 255, 0.22);
+  stroke-width: 1.2;
+  stroke-linecap: round;
+}
+
+.ef-gimbal-dir-tick {
+  fill: rgba(238, 243, 245, 0.36);
+  transition: fill 0.09s ease, filter 0.09s ease;
+}
+
+.ef-gimbal-dir-tick.is-lit {
+  fill: #f37233;
+  filter: drop-shadow(0 0 4px rgba(243, 114, 51, 0.85));
+}
+
+.ef-touch-stick-puck {
+  position: relative;
+  width: 50px;
+  height: 50px;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 38% 32%,
+    rgba(36, 52, 62, 0.94) 0%,
+    rgba(15, 25, 31, 0.95) 78%
+  );
+  border: 1.8px solid rgba(102, 217, 255, 0.5);
+  box-shadow:
+    0 5px 16px rgba(0, 0, 0, 0.55),
+    inset 0 1px 1px rgba(255, 255, 255, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  will-change: transform;
+  transform: translate3d(0px, 0px, 0);
+}
+
+.ef-touch-stick-puck.is-springing {
+  transition: transform 0.16s cubic-bezier(0.22, 1.28, 0.36, 1), border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.ef-touch-stick-zone.is-active .ef-touch-stick-puck {
+  border-color: #f37233;
+  box-shadow:
+    0 6px 18px rgba(0, 0, 0, 0.62),
+    0 0 14px rgba(243, 114, 51, 0.42),
+    inset 0 1px 1px rgba(255, 255, 255, 0.26);
+}
+
+.ef-touch-puck-svg {
+  width: 28px;
+  height: 28px;
+  pointer-events: none;
+}
+
+.ef-puck-wing,
+.ef-puck-fin {
+  fill: none;
+  stroke: #eef3f5;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: stroke 0.12s ease;
+}
+
+.ef-puck-dot {
+  fill: #66d9ff;
+  transition: fill 0.12s ease;
+}
+
+.ef-touch-stick-zone.is-active .ef-puck-wing,
+.ef-touch-stick-zone.is-active .ef-puck-fin {
+  stroke: #ffffff;
+}
+
+.ef-touch-stick-zone.is-active .ef-puck-dot {
+  fill: #f37233;
+}
+
+/* ==========================================================================
+   3. Right Thumb — Throttle Rocker Capsule + Primary Water Drop Button
+   ========================================================================== */
+.ef-touch-right {
+  position: absolute;
+  bottom: calc(26px + env(safe-area-inset-bottom, 0px));
+  right: calc(24px + env(safe-area-inset-right, 0px));
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  pointer-events: none;
+  touch-action: none;
+  transition: opacity 0.2s ease;
+}
+
+/* Compact Vertical Throttle Rocker (+ / -) */
+.ef-touch-throttle {
+  pointer-events: auto;
+  touch-action: none;
+  width: 48px;
+  height: 98px;
+  border-radius: 24px;
+  background: rgba(15, 25, 31, 0.66);
+  border: 1.5px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.44);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  transition: border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.ef-touch-throttle.is-active {
+  border-color: rgba(255, 255, 255, 0.34);
+}
+
+.ef-touch-throttle-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  flex: 1;
+  width: 100%;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: rgba(238, 243, 245, 0.8);
+  cursor: pointer;
+  touch-action: none;
+  -webkit-tap-highlight-color: transparent;
+  transition: background-color 0.1s ease, color 0.1s ease;
+}
+
+.ef-touch-throttle-divider {
+  height: 1px;
+  width: 62%;
+  margin: 0 auto;
+  background: rgba(255, 255, 255, 0.16);
+  flex-shrink: 0;
+}
+
+.ef-throttle-icon-svg {
+  width: 21px;
+  height: 21px;
+  pointer-events: none;
+}
+
+.ef-chevron-primary,
+.ef-chevron-secondary {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.ef-chevron-secondary {
+  opacity: 0.48;
+}
+
+.ef-touch-throttle-btn.is-up.is-pressed {
+  background: rgba(243, 114, 51, 0.28);
+  color: #f37233;
+  box-shadow: inset 0 4px 12px rgba(243, 114, 51, 0.3);
+}
+
+.ef-touch-throttle-btn.is-up.is-pressed .ef-chevron-secondary {
+  opacity: 0.88;
+}
+
+.ef-touch-throttle-btn.is-down.is-pressed {
+  background: rgba(102, 217, 255, 0.24);
+  color: #66d9ff;
+  box-shadow: inset 0 -4px 12px rgba(102, 217, 255, 0.28);
+}
+
+.ef-touch-throttle-btn.is-down.is-pressed .ef-chevron-secondary {
+  opacity: 0.88;
+}
+
+/* Primary Water Drop Button (with live circular SVG tank gauge) */
+.ef-touch-drop-btn {
+  appearance: none;
+  pointer-events: auto;
+  touch-action: none;
+  position: relative;
+  width: 80px;
+  height: 80px;
+  padding: 0;
+  margin: 0;
+  border-radius: 50%;
+  border: 1.5px solid rgba(102, 217, 255, 0.38);
+  background: radial-gradient(
+    circle at 50% 42%,
+    rgba(22, 40, 50, 0.82) 0%,
+    rgba(13, 22, 28, 0.9) 76%
+  );
+  box-shadow:
+    0 8px 26px rgba(0, 0, 0, 0.48),
+    0 0 16px rgba(102, 217, 255, 0.14);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    transform 0.09s ease,
+    border-color 0.16s ease,
+    box-shadow 0.16s ease,
+    background 0.16s ease,
+    opacity 0.18s ease;
+}
+
+.ef-touch-drop-btn.is-pressed {
+  transform: scale(0.93);
+}
+
+.ef-drop-ring-svg {
+  position: absolute;
+  inset: -1px;
+  width: calc(100% + 2px);
+  height: calc(100% + 2px);
+  pointer-events: none;
+}
+
+.ef-drop-ring-track {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.12);
+  stroke-width: 3.4;
+}
+
+.ef-drop-ring-fill {
+  fill: none;
+  stroke: #66d9ff;
+  stroke-width: 3.8;
+  stroke-linecap: round;
+  transition: stroke 0.16s ease;
+  filter: drop-shadow(0 0 3px rgba(102, 217, 255, 0.55));
+}
+
+.ef-drop-lock-tick {
+  stroke: rgba(255, 255, 255, 0.22);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  transition: stroke 0.14s ease;
+}
+
+.ef-drop-icon-svg {
+  width: 34px;
+  height: 34px;
+  pointer-events: none;
+  position: relative;
+  z-index: 1;
+}
+
+.ef-drop-droplet {
+  fill: #66d9ff;
+  transition: fill 0.16s ease, filter 0.16s ease;
+}
+
+.ef-drop-sheen {
+  fill: none;
+  stroke: rgba(255, 255, 255, 0.65);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+}
+
+.ef-drop-cascade {
+  fill: none;
+  stroke: rgba(102, 217, 255, 0.72);
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  transition: stroke 0.16s ease, opacity 0.16s ease;
+}
+
+/* ON TARGET + Tank > 0: Glowing Emerald Green + Crisp Tactical Pulse */
+.ef-touch-drop-btn.is-on-target {
+  border-color: rgba(56, 242, 139, 0.94);
+  background: radial-gradient(
+    circle at 50% 42%,
+    rgba(16, 62, 40, 0.92) 0%,
+    rgba(10, 34, 24, 0.94) 78%
+  );
+  box-shadow:
+    0 8px 26px rgba(0, 0, 0, 0.48),
+    0 0 26px rgba(56, 242, 139, 0.56),
+    inset 0 0 18px rgba(56, 242, 139, 0.24);
+  animation: efTouchTargetPulse 0.75s ease-in-out infinite;
+}
+
+.ef-touch-drop-btn.is-on-target .ef-drop-ring-fill {
+  stroke: #38f28b;
+  filter: drop-shadow(0 0 6px rgba(56, 242, 139, 0.9));
+}
+
+.ef-touch-drop-btn.is-on-target .ef-drop-lock-tick {
+  stroke: #38f28b;
+}
+
+.ef-touch-drop-btn.is-on-target .ef-drop-droplet {
+  fill: #38f28b;
+  filter: drop-shadow(0 0 5px rgba(56, 242, 139, 0.75));
+}
+
+.ef-touch-drop-btn.is-on-target .ef-drop-cascade {
+  stroke: #94ffbf;
+}
+
+/* Actively Releasing Water Curtain */
+.ef-touch-drop-btn.is-releasing {
+  border-color: rgba(212, 250, 255, 0.92);
+  box-shadow:
+    0 6px 22px rgba(0, 0, 0, 0.52),
+    0 0 24px rgba(102, 217, 255, 0.62),
+    inset 0 0 18px rgba(196, 248, 255, 0.26);
+}
+
+.ef-touch-drop-btn.is-releasing .ef-drop-droplet {
+  fill: #d8f8ff;
+}
+
+.ef-touch-drop-btn.is-releasing .ef-drop-cascade {
+  stroke: #ffffff;
+}
+
+/* Actively Scooping Water from Lake */
+.ef-touch-drop-btn.is-scooping {
+  border-color: rgba(102, 217, 255, 0.85);
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.45),
+    0 0 22px rgba(102, 217, 255, 0.46);
+  animation: efTouchScoopPulse 0.85s ease-in-out infinite;
+}
+
+.ef-touch-drop-btn.is-scooping .ef-drop-ring-fill {
+  stroke: #8cf0ff;
+}
+
+/* Tank Empty State: Subtle Dimmed Cyan */
+.ef-touch-drop-btn.is-empty {
+  opacity: 0.5;
+  border-color: rgba(102, 217, 255, 0.22);
+  background: rgba(15, 25, 31, 0.58);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.36);
+  animation: none;
+}
+
+.ef-touch-drop-btn.is-empty .ef-drop-ring-track {
+  stroke: rgba(102, 217, 255, 0.2);
+  stroke-dasharray: 4 4;
+}
+
+.ef-touch-drop-btn.is-empty .ef-drop-droplet {
+  fill: rgba(102, 217, 255, 0.36);
+}
+
+.ef-touch-drop-btn.is-empty .ef-drop-sheen {
+  opacity: 0.25;
+}
+
+.ef-touch-drop-btn.is-empty .ef-drop-cascade {
+  stroke: rgba(102, 217, 255, 0.25);
+}
+
+.ef-touch-drop-btn.is-disabled {
+  pointer-events: none;
+  opacity: 0.35;
+  animation: none;
+}
+
+/* Crisp tap-to-takeover confirmation ring on canvas */
+.ef-touch-takeover-ripple {
+  position: fixed;
+  width: 56px;
+  height: 56px;
+  margin-left: -28px;
+  margin-top: -28px;
+  border-radius: 50%;
+  border: 2px solid rgba(243, 114, 51, 0.88);
+  box-shadow: 0 0 14px rgba(243, 114, 51, 0.45);
+  pointer-events: none;
+  animation: efTouchTakeoverRipple 0.34s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+/* ==========================================================================
+   4. Touch-Active Safe HUD Repositioning (Tablet & Base Touch — Zero Overlap)
+   Desktop mouse/keyboard layout is 100% untouched because body.touch-active
+   is only present on touch devices or when ?touch=1 is passed.
+   ========================================================================== */
+body.touch-active .ef-left-top-stack {
+  top: calc(14px + env(safe-area-inset-top, 0px));
+  left: calc(16px + env(safe-area-inset-left, 0px));
+}
+
+body.touch-active .ef-topright-cluster {
+  top: calc(14px + env(safe-area-inset-top, 0px));
+  right: calc(16px + env(safe-area-inset-right, 0px));
+}
+
+body.touch-active .ef-compass-wrap {
+  top: calc(12px + env(safe-area-inset-top, 0px));
+}
+
+/* Move Telemetry from bottom-left -> top-left beneath Op Card (frees left thumbstick) */
+body.touch-active .ef-telemetry-card {
+  top: calc(108px + env(safe-area-inset-top, 0px));
+  left: calc(16px + env(safe-area-inset-left, 0px));
+  bottom: auto;
+  width: 232px;
+}
+
+/* Keep auto-hiding VHF radio toast cleanly below Telemetry when speaking */
+body.touch-active .ef-radio-toast {
+  position: fixed;
+  top: calc(230px + env(safe-area-inset-top, 0px));
+  left: calc(16px + env(safe-area-inset-left, 0px));
+  width: 232px;
+  max-width: calc(100vw - 32px);
+}
+
+/* Move Tactical Map from bottom-right -> top-right beneath Audio/Settings (frees Drop/Throttle) */
+body.touch-active .ef-map-card {
+  top: calc(60px + env(safe-area-inset-top, 0px));
+  right: calc(16px + env(safe-area-inset-right, 0px));
+  bottom: auto;
+}
+
+body.touch-active .ef-map-canvas {
+  width: 184px;
+  height: 114px;
+}
+
+body.touch-active .ef-jit-wrap {
+  bottom: calc(22px + env(safe-area-inset-bottom, 0px));
+}
+
+/* Comfortable touch targets in Settings Drawer & Overlays */
+body.touch-active .ef-drawer {
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+body.touch-active .ef-drawer-close {
+  width: 34px;
+  height: 34px;
+}
+
+body.touch-active .ef-overlay-card {
+  max-height: calc(100dvh - 28px);
+  overflow-y: auto;
+}
+
+/* ==========================================================================
+   5. Portrait Mobile Ergonomics (e.g. 390x844, 375x667, <= 640px wide)
+   ========================================================================== */
+@media (max-width: 640px) {
+  .ef-left-top-stack {
+    top: calc(8px + env(safe-area-inset-top, 0px));
+    left: calc(10px + env(safe-area-inset-left, 0px));
+    width: 168px;
+    gap: 6px;
+  }
+
+  .ef-op-card {
+    padding: 6px 8px 6px 9px;
+  }
+
+  .ef-op-toprow {
+    margin-bottom: 2px;
+    gap: 4px;
+  }
+
+  .ef-op-code {
+    font-size: 8.5px;
+    letter-spacing: 0.1em;
+  }
+
+  .ef-airspace-chip {
+    padding: 1px 5px;
+    font-size: 8px;
+    gap: 4px;
+  }
+
+  .ef-op-title {
+    font-size: 12px;
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .ef-op-stats {
+    gap: 7px;
+    padding-top: 4px;
+  }
+
+  .ef-op-stat-label {
+    font-size: 7.5px;
+  }
+
+  .ef-op-stat-val {
+    font-size: 10.5px;
+  }
+
+  .ef-toast-anchor {
+    left: calc(100% + 6px);
+  }
+
+  .ef-score-toast {
+    font-size: 9.5px;
+    padding: 2px 6px;
+  }
+
+  .ef-topright-cluster {
+    top: calc(8px + env(safe-area-inset-top, 0px));
+    right: calc(10px + env(safe-area-inset-right, 0px));
+    gap: 5px;
+  }
+
+  .ef-wind-chip {
+    height: 34px;
+    padding: 4px 7px 4px 5px;
+    gap: 5px;
+  }
+
+  .ef-wind-dial {
+    width: 22px;
+    height: 22px;
+  }
+
+  .ef-wind-arrow svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  .ef-wind-label {
+    display: none;
+  }
+
+  .ef-wind-val {
+    font-size: 10px;
+  }
+
+  .ef-icon-btn {
+    width: 34px;
+    height: 34px;
+  }
+
+  .ef-icon-svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  /* Compact Telemetry & Tactical Map tucked in upper corners */
+  body.touch-active .ef-telemetry-card,
+  .ef-telemetry-card {
+    top: calc(74px + env(safe-area-inset-top, 0px));
+    left: calc(10px + env(safe-area-inset-left, 0px));
+    bottom: auto;
+    width: 168px;
+    padding: 5px 8px 6px;
+    gap: 4px;
+  }
+
+  .ef-telem-header {
+    gap: 4px;
+  }
+
+  .ef-telem-badge {
+    font-size: 8.5px;
+    padding: 1px 4px;
+  }
+
+  .ef-telem-nums {
+    gap: 6px;
+  }
+
+  .ef-metric-label {
+    font-size: 7.5px;
+  }
+
+  .ef-metric-val {
+    font-size: 12px;
+  }
+
+  .ef-bar-block {
+    gap: 2px;
+  }
+
+  .ef-bar-label {
+    font-size: 7.5px;
+  }
+
+  .ef-bar-pct {
+    font-size: 9.5px;
+  }
+
+  .ef-seg-bar {
+    height: 6px;
+    gap: 1.5px;
+  }
+
+  body.touch-active .ef-map-card,
+  .ef-map-card {
+    top: calc(48px + env(safe-area-inset-top, 0px));
+    right: calc(10px + env(safe-area-inset-right, 0px));
+    bottom: auto;
+    padding: 4px 5px;
+    gap: 3px;
+  }
+
+  .ef-map-header {
+    font-size: 7.5px;
+  }
+
+  body.touch-active .ef-map-canvas,
+  .ef-map-canvas {
+    width: 132px;
+    height: 78px;
+  }
+
+  .ef-map-legend {
+    display: none;
+  }
+
+  /* Place Slim Compass cleanly below the Top-Left Telemetry & Top-Right Map */
+  body.touch-active .ef-compass-wrap,
+  .ef-compass-wrap {
+    top: calc(154px + env(safe-area-inset-top, 0px));
+    width: 168px;
+  }
+
+  .ef-compass-window {
+    width: 168px;
+    height: 20px;
+  }
+
+  .ef-compass-tick-label {
+    font-size: 8px;
+  }
+
+  .ef-compass-readout {
+    font-size: 9.5px;
+    padding: 1px 6px;
+  }
+
+  .ef-outcome-banner {
+    top: calc(196px + env(safe-area-inset-top, 0px));
+    max-width: calc(100vw - 20px);
+    padding: 6px 12px;
+  }
+
+  .ef-outcome-main {
+    font-size: 10.5px;
+    white-space: normal;
+  }
+
+  .ef-outcome-sub {
+    font-size: 9.5px;
+  }
+
+  body.touch-active .ef-radio-toast,
+  .ef-radio-toast {
+    position: fixed;
+    top: calc(196px + env(safe-area-inset-top, 0px));
+    left: calc(10px + env(safe-area-inset-left, 0px));
+    width: 192px;
+    max-width: calc(100vw - 20px);
+    padding: 5px 8px;
+  }
+
+  .ef-radio-line {
+    font-size: 9.5px;
+  }
+
+  /* Lift JIT Hint Pill cleanly ABOVE bottom touch controls */
+  body.touch-active .ef-jit-wrap {
+    bottom: calc(160px + env(safe-area-inset-bottom, 0px));
+    max-width: calc(100vw - 20px);
+  }
+
+  .ef-jit-pill {
+    font-size: 9.5px;
+    padding: 5px 11px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Portrait Touch Controls: Ergonomic Lower-Left & Lower-Right Thumb Arcs */
+  .ef-touch-left {
+    bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+    left: calc(16px + env(safe-area-inset-left, 0px));
+  }
+
+  .ef-touch-stick-zone {
+    width: 122px;
+    height: 122px;
+  }
+
+  .ef-touch-stick-puck {
+    width: 48px;
+    height: 48px;
+  }
+
+  .ef-touch-puck-svg {
+    width: 26px;
+    height: 26px;
+  }
+
+  .ef-touch-right {
+    bottom: calc(26px + env(safe-area-inset-bottom, 0px));
+    right: calc(16px + env(safe-area-inset-right, 0px));
+    gap: 14px;
+  }
+
+  .ef-touch-throttle {
+    width: 44px;
+    height: 90px;
+    border-radius: 22px;
+  }
+
+  .ef-touch-drop-btn {
+    width: 76px;
+    height: 76px;
+  }
+
+  .ef-drop-icon-svg {
+    width: 32px;
+    height: 32px;
+  }
+}
+
+/* Ultra-narrow portrait safeguard (<= 360px wide) */
+@media (max-width: 360px) {
+  .ef-left-top-stack,
+  body.touch-active .ef-telemetry-card,
+  .ef-telemetry-card {
+    width: 152px;
+  }
+
+  body.touch-active .ef-map-canvas,
+  .ef-map-canvas {
+    width: 118px;
+    height: 72px;
+  }
+
+  .ef-touch-left {
+    left: calc(10px + env(safe-area-inset-left, 0px));
+  }
+
+  .ef-touch-stick-zone {
+    width: 112px;
+    height: 112px;
+  }
+
+  .ef-touch-right {
+    right: calc(10px + env(safe-area-inset-right, 0px));
+    gap: 10px;
+  }
+
+  .ef-touch-throttle {
+    width: 40px;
+    height: 84px;
+  }
+
+  .ef-touch-drop-btn {
+    width: 72px;
+    height: 72px;
+  }
+}
+
+/* ==========================================================================
+   6. Landscape Mobile Ergonomics (e.g. 844x390, 667x375, max-height: 500px)
+   Wide open center sky corridor + top-corner HUD + bottom-corner thumb controls.
+   ========================================================================== */
+@media (max-height: 500px), (orientation: landscape) and (max-height: 540px) {
+  .ef-left-top-stack {
+    top: calc(8px + env(safe-area-inset-top, 0px));
+    left: calc(12px + env(safe-area-inset-left, 0px));
+    width: 184px;
+    gap: 5px;
+  }
+
+  .ef-op-card {
+    padding: 5px 8px 5px 9px;
+  }
+
+  .ef-op-toprow {
+    margin-bottom: 1px;
+  }
+
+  .ef-op-code {
+    font-size: 8.5px;
+  }
+
+  .ef-airspace-chip {
+    padding: 1px 5px;
+    font-size: 8px;
+  }
+
+  .ef-op-title {
+    font-size: 12px;
+    margin-bottom: 4px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .ef-op-stats {
+    gap: 8px;
+    padding-top: 3px;
+  }
+
+  .ef-op-stat-label {
+    font-size: 7.5px;
+  }
+
+  .ef-op-stat-val {
+    font-size: 10.5px;
+  }
+
+  /* Slim Compass stays cleanly at top-center between Left Op Card and Right Buttons */
+  body.touch-active .ef-compass-wrap,
+  .ef-compass-wrap {
+    top: calc(8px + env(safe-area-inset-top, 0px));
+    width: 176px;
+  }
+
+  .ef-compass-window {
+    width: 176px;
+    height: 20px;
+  }
+
+  .ef-compass-tick-label {
+    font-size: 8px;
+  }
+
+  .ef-compass-readout {
+    font-size: 9.5px;
+    padding: 1px 6px;
+    margin-top: 2px;
+  }
+
+  .ef-outcome-banner {
+    top: calc(48px + env(safe-area-inset-top, 0px));
+    max-width: 390px;
+    padding: 5px 12px;
+  }
+
+  .ef-outcome-main {
+    font-size: 10.5px;
+  }
+
+  .ef-outcome-sub {
+    font-size: 9.5px;
+  }
+
+  .ef-topright-cluster {
+    top: calc(8px + env(safe-area-inset-top, 0px));
+    right: calc(12px + env(safe-area-inset-right, 0px));
+    gap: 6px;
+  }
+
+  .ef-wind-chip {
+    height: 34px;
+    padding: 4px 8px 4px 5px;
+    gap: 6px;
+  }
+
+  .ef-wind-dial {
+    width: 22px;
+    height: 22px;
+  }
+
+  .ef-wind-label {
+    font-size: 7px;
+  }
+
+  .ef-wind-val {
+    font-size: 10.5px;
+  }
+
+  .ef-icon-btn {
+    width: 34px;
+    height: 34px;
+  }
+
+  .ef-icon-svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  /* Telemetry tucked cleanly at top-left below Op Card (115px+ vertical gap above thumbstick!) */
+  body.touch-active .ef-telemetry-card,
+  .ef-telemetry-card {
+    top: calc(68px + env(safe-area-inset-top, 0px));
+    left: calc(12px + env(safe-area-inset-left, 0px));
+    bottom: auto;
+    width: 184px;
+    padding: 5px 8px;
+    gap: 4px;
+  }
+
+  .ef-telem-badge {
+    font-size: 8.5px;
+    padding: 1px 5px;
+  }
+
+  .ef-telem-nums {
+    gap: 7px;
+  }
+
+  .ef-metric-label {
+    font-size: 7.5px;
+  }
+
+  .ef-metric-val {
+    font-size: 12px;
+  }
+
+  .ef-bar-block {
+    gap: 2px;
+  }
+
+  .ef-bar-label {
+    font-size: 7.5px;
+  }
+
+  .ef-bar-pct {
+    font-size: 9.5px;
+  }
+
+  .ef-seg-bar {
+    height: 5.5px;
+    gap: 1.5px;
+  }
+
+  /* Tactical Map tucked cleanly at top-right below Audio/Settings (130px+ gap above drop/throttle!) */
+  body.touch-active .ef-map-card,
+  .ef-map-card {
+    top: calc(48px + env(safe-area-inset-top, 0px));
+    right: calc(12px + env(safe-area-inset-right, 0px));
+    bottom: auto;
+    padding: 4px 5px;
+    gap: 3px;
+  }
+
+  .ef-map-header {
+    font-size: 7.5px;
+  }
+
+  body.touch-active .ef-map-canvas,
+  .ef-map-canvas {
+    width: 132px;
+    height: 78px;
+  }
+
+  .ef-map-legend {
+    display: none;
+  }
+
+  body.touch-active .ef-radio-toast,
+  .ef-radio-toast {
+    position: fixed;
+    top: calc(140px + env(safe-area-inset-top, 0px));
+    left: calc(12px + env(safe-area-inset-left, 0px));
+    width: 184px;
+    max-width: calc(100vw - 24px);
+    padding: 5px 7px;
+  }
+
+  .ef-radio-line {
+    font-size: 9.5px;
+  }
+
+  /* JIT Hint Pill sits cleanly in the wide bottom-center corridor between thumb zones */
+  body.touch-active .ef-jit-wrap {
+    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    max-width: calc(100vw - 320px);
+  }
+
+  .ef-jit-pill {
+    font-size: 9.5px;
+    padding: 4px 11px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* Landscape Touch Controls: Sleek Compact Bottom Corners */
+  .ef-touch-left {
+    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+    left: calc(18px + env(safe-area-inset-left, 0px));
+  }
+
+  .ef-touch-stick-zone {
+    width: 118px;
+    height: 118px;
+  }
+
+  .ef-touch-stick-puck {
+    width: 46px;
+    height: 46px;
+  }
+
+  .ef-touch-puck-svg {
+    width: 24px;
+    height: 24px;
+  }
+
+  .ef-touch-right {
+    bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+    right: calc(18px + env(safe-area-inset-right, 0px));
+    gap: 14px;
+  }
+
+  .ef-touch-throttle {
+    width: 44px;
+    height: 88px;
+    border-radius: 22px;
+  }
+
+  .ef-touch-drop-btn {
+    width: 74px;
+    height: 74px;
+  }
+
+  .ef-drop-icon-svg {
+    width: 31px;
+    height: 31px;
+  }
+
+  /* Keep overlays & drawer cleanly scrollable on short landscape viewports */
+  .ef-overlay {
+    padding: 10px;
+  }
+
+  .ef-overlay-card {
+    padding: 14px 16px;
+    gap: 9px;
+    max-height: calc(100dvh - 20px);
+    overflow-y: auto;
+  }
+
+  .ef-overlay-heading {
+    font-size: 18px;
+  }
+
+  .ef-crash-banner {
+    padding: 10px 14px;
+    width: 320px;
+  }
+
+  .ef-crash-title {
+    font-size: 14px;
+  }
+}
+
+/* ==========================================================================
+   7. Keyframe Animations
+   ========================================================================== */
+@keyframes efTouchTargetPulse {
+  0%, 100% {
+    box-shadow:
+      0 8px 26px rgba(0, 0, 0, 0.48),
+      0 0 20px rgba(56, 242, 139, 0.48),
+      inset 0 0 14px rgba(56, 242, 139, 0.18);
+  }
+  50% {
+    box-shadow:
+      0 8px 28px rgba(0, 0, 0, 0.48),
+      0 0 34px rgba(56, 242, 139, 0.82),
+      inset 0 0 22px rgba(56, 242, 139, 0.34);
+  }
+}
+
+@keyframes efTouchScoopPulse {
+  0%, 100% {
+    box-shadow:
+      0 8px 24px rgba(0, 0, 0, 0.45),
+      0 0 14px rgba(102, 217, 255, 0.32);
+  }
+  50% {
+    box-shadow:
+      0 8px 24px rgba(0, 0, 0, 0.45),
+      0 0 26px rgba(102, 217, 255, 0.72);
+  }
+}
+
+@keyframes efTouchTakeoverRipple {
+  0% {
+    opacity: 0.95;
+    transform: scale(0.4);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.75);
+  }
+}

@@ -160,10 +160,10 @@ function getLayoutSpec(layoutKey, halfWorld, seed) {
           { name: 'Redridge Peninsula', x: 10, z: -130, cabinCount: 12, towerCount: 1, padRadius: 145, padHeight: 34 },
         ],
         fireWorldSeeds: [
-          { x: -70, z: 230, radius: 5 },
-          { x: 95, z: 180, radius: 5 },
-          { x: -130, z: 45, radius: 4 },
-          { x: 140, z: -380, radius: 4 },
+          { x: -70, z: 220, radius: 4.5 },
+          { x: 95, z: 170, radius: 4.3 },
+          { x: -125, z: 45, radius: 3.7 },
+          { x: 135, z: -360, radius: 3.4 },
         ],
         targetTrees: 4500,
       };
@@ -191,10 +191,10 @@ function getLayoutSpec(layoutKey, halfWorld, seed) {
           { name: 'Southwest Camp', x: -420, z: 340, cabinCount: 5, towerCount: 0, padRadius: 110, padHeight: 44 },
         ],
         fireWorldSeeds: [
-          { x: -390, z: -260, radius: 5 },
-          { x: 320, z: -340, radius: 5 },
-          { x: 250, z: 390, radius: 5 },
-          { x: -120, z: 460, radius: 4 },
+          { x: -390, z: -260, radius: 4.6 },
+          { x: 320, z: -340, radius: 4.5 },
+          { x: 250, z: 390, radius: 4.3 },
+          { x: -120, z: 460, radius: 3.7 },
         ],
         targetTrees: 4500,
       };
@@ -226,11 +226,11 @@ function getLayoutSpec(layoutKey, halfWorld, seed) {
           { name: 'East Overlook', x: 480, z: -180, cabinCount: 7, towerCount: 0, padRadius: 125, padHeight: 48 },
         ],
         fireWorldSeeds: [
-          { x: 250, z: -430, radius: 5 },
-          { x: -240, z: 410, radius: 5 },
-          { x: 430, z: 190, radius: 5 },
-          { x: -460, z: -260, radius: 4 },
-          { x: -40, z: -110, radius: 3 },
+          { x: 250, z: -430, radius: 4.5 },
+          { x: -240, z: 410, radius: 4.4 },
+          { x: 430, z: 190, radius: 4.2 },
+          { x: -460, z: -260, radius: 3.7 },
+          { x: -40, z: -110, radius: 3.0 },
         ],
         targetTrees: 4500,
       };
@@ -258,11 +258,11 @@ function getLayoutSpec(layoutKey, halfWorld, seed) {
           { name: 'Upper Crown Station', x: 430, z: -140, cabinCount: 9, towerCount: 1, padRadius: 135, padHeight: 56 },
         ],
         fireWorldSeeds: [
-          { x: -90, z: -240, radius: 6 },
-          { x: 130, z: -310, radius: 5 },
-          { x: -70, z: 140, radius: 5 },
-          { x: 260, z: 40, radius: 5 },
-          { x: 470, z: 220, radius: 5 },
+          { x: -90, z: -240, radius: 4.7 },
+          { x: 130, z: -310, radius: 4.4 },
+          { x: -70, z: 140, radius: 4.3 },
+          { x: 260, z: 40, radius: 4.1 },
+          { x: 470, z: 220, radius: 3.8 },
         ],
         targetTrees: 4600,
       };
@@ -307,33 +307,33 @@ function getLayoutSpec(layoutKey, halfWorld, seed) {
         targetTrees: 8500,
       };
 
-    case 'op01': // Cinderpine Basin: long western N-S lake, east burning pine slope + southern pocket, E-NE meadow w/ 10 cabins + 1 tower
+    case 'op01': // Cinderpine Basin: generous central-west N-S lake, crisp eastern pine fire front, E-NE meadow w/ 10 cabins + 1 tower
     default:
       return {
         waterSdf(x, z) {
-          // Slight natural curve for the long western N-S alpine lake
-          const curveX = -370 + 36 * Math.sin(z * 0.0042);
-          const d = distToSegment(x, z, curveX, -480, curveX, 460);
-          const halfW = 132 + 28 * fbm2D(x * 0.004, z * 0.004, seed + 7, 2);
+          // Generous central-west N-S alpine lake for fast ~18-24 s scoop-drop circuits
+          const curveX = -335 + 28 * Math.sin(z * 0.0040);
+          const d = distToSegment(x, z, curveX, -490, curveX, 470);
+          const halfW = 142 + 24 * fbm2D(x * 0.004, z * 0.004, seed + 7, 2);
           return d - halfW;
         },
         elevationMod(x, z) {
           // Gentle rise across eastern pine slope toward E-NE clearing and outer ridges
-          const eastRise = smoothstep(-210, 520, x) * 30;
+          const eastRise = smoothstep(-190, 520, x) * 28;
           const northKnoll = Math.exp(-(((x - 160) ** 2 + (z + 440) ** 2) / (300 ** 2))) * 20;
-          const southSlope = Math.exp(-(((x - 120) ** 2 + (z - 360) ** 2) / (340 ** 2))) * 22;
+          const southSlope = Math.exp(-(((x - 120) ** 2 + (z - 360) ** 2) / (340 ** 2))) * 20;
           return 18 + eastRise + northKnoll + southSlope;
         },
         scoopZones: [
-          { x: -370, z: -10, headingDeg: 0, length: 900, width: 240, name: 'Cinderpine Lake' },
+          { x: -335, z: -10, headingDeg: 0, length: 920, width: 260, name: 'Cinderpine Lake' },
         ],
         settlementDefs: [
           { name: 'Cinderpine Meadow', x: 410, z: -240, cabinCount: 10, towerCount: 1, padRadius: 155, padHeight: 36 },
         ],
         fireWorldSeeds: [
-          { x: 55, z: -120, radius: 6 },  // Main east shore burning pine slope
-          { x: 145, z: 10, radius: 5 },   // Central-east fire head advancing E/ENE
-          { x: 10, z: 320, radius: 5 },   // Southern pine pocket
+          { x: 65, z: -100, radius: 5.3 }, // Main eastern burning pine front heading toward meadow
+          { x: 140, z: 35, radius: 4.7 },  // Connected central-east flank
+          { x: 35, z: 190, radius: 2.8 },  // Compact southern pine pocket
         ],
         targetTrees: 4500,
       };
@@ -780,6 +780,75 @@ export function generateTerrain(opConfig) {
     }
   }
 
+  // 7. Build fast zero-GC CSR spatial hash grid for standing tree collision lookups
+  const treeCellCounts = new Int32Array(cellCount);
+  for (let i = 0; i < trees.length; i++) {
+    const ci = trees[i].cellIdx;
+    if (ci >= 0 && ci < cellCount) treeCellCounts[ci]++;
+  }
+  const treeCellOffsets = new Int32Array(cellCount + 1);
+  for (let i = 0; i < cellCount; i++) {
+    treeCellOffsets[i + 1] = treeCellOffsets[i] + treeCellCounts[i];
+  }
+  const treeCellIndices = new Int32Array(trees.length);
+  const treeCursor = new Int32Array(cellCount);
+  treeCursor.set(treeCellOffsets.subarray(0, cellCount));
+  for (let i = 0; i < trees.length; i++) {
+    const ci = trees[i].cellIdx;
+    if (ci >= 0 && ci < cellCount) {
+      treeCellIndices[treeCursor[ci]++] = i;
+    }
+  }
+
+  /**
+   * O(1) spatial-grid standing-tree collision query against aircraft sphere/wingspan.
+   * Checks the 3x3 cell neighborhood around (x, z) against tapered pine canopies.
+   * @param {number} x
+   * @param {number} y
+   * @param {number} z
+   * @param {number} [aircraftRadius=2.6]
+   * @param {Uint8Array|null} [fireCells=null] Optional FireSim cell array (state 14 = charred snag)
+   * @returns {object|null} The colliding tree record or null.
+   */
+  function findCollidingTree(x, y, z, aircraftRadius = 2.6, fireCells = null) {
+    const cgx = Math.floor((x + halfWorld) / cellSize);
+    const cgz = Math.floor((z + halfWorld) / cellSize);
+    if (cgx < -1 || cgx > gridSize || cgz < -1 || cgz > gridSize) return null;
+
+    const minGz = Math.max(0, cgz - 1);
+    const maxGz = Math.min(gridSize - 1, cgz + 1);
+    const minGx = Math.max(0, cgx - 1);
+    const maxGx = Math.min(gridSize - 1, cgx + 1);
+
+    for (let gz = minGz; gz <= maxGz; gz++) {
+      const rowBase = gz * gridSize;
+      for (let gx = minGx; gx <= maxGx; gx++) {
+        const ci = rowBase + gx;
+        const start = treeCellOffsets[ci];
+        const end = treeCellOffsets[ci + 1];
+        if (start === end) continue;
+
+        const isCharred = fireCells != null && fireCells[ci] === 14;
+        for (let k = start; k < end; k++) {
+          const tr = trees[treeCellIndices[k]];
+          const treeH = (isCharred ? 4.5 : 11.8) * tr.scale;
+          const relY = y - tr.y;
+          if (relY < -1.0 || relY > treeH + 1.0) continue;
+
+          const u = relY <= 0 ? 0 : relY >= treeH ? 1 : relY / treeH;
+          const canopyR = (isCharred ? 0.9 : 3.1 - 1.85 * u) * tr.scale;
+          const hitR = canopyR + aircraftRadius;
+          const dx = x - tr.x;
+          const dz = z - tr.z;
+          if (dx * dx + dz * dz <= hitR * hitR) {
+            return tr;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
   return {
     opConfig,
     gridSize,
@@ -797,10 +866,13 @@ export function generateTerrain(opConfig) {
     cabins,
     towers,
     trees,
+    treeCellOffsets,
+    treeCellIndices,
     initialFireSeeds,
     getHeight,
     isWater,
     worldToGrid,
     gridToWorld,
+    findCollidingTree,
   };
 }

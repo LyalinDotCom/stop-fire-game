@@ -2,22 +2,58 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 
-import { OPERATIONS, MEGA_BASIN_OP, WATER_LEVEL } from '../src/config/operations.js';
+import {
+  OPERATIONS,
+  DEFAULT_OPERATION,
+  MEGA_BASIN_OP,
+  WATER_LEVEL,
+  getOperationById,
+  getOperationByIndex,
+  getNextOperation,
+} from '../src/config/operations.js';
 import { generateTerrain } from '../src/sim/TerrainGen.js';
 import {
   FLIGHT_CONSTANTS,
+  computeSplashRadius,
   createAircraftState,
   stepFlight,
   predictDropImpact,
 } from '../src/sim/FlightModel.js';
 import { Autopilot } from '../src/sim/Autopilot.js';
-import { FireSim, CELL_STATE, SCORE } from '../src/sim/FireSim.js';
+import {
+  FireSim,
+  CELL_STATE,
+  SCORE,
+  WET_COOLDOWN_MIN,
+  WET_COOLDOWN_MAX,
+} from '../src/sim/FireSim.js';
 import { createBackgroundTicker } from '../src/sim/BackgroundWorker.js';
 
 const ALL_OPS = [...OPERATIONS, MEGA_BASIN_OP];
 
+describe('OperationsConfig', () => {
+  it('starts on focused Operation 01 and cleanly wraps Operations 01 -> 05 -> 01', () => {
+    assert.equal(DEFAULT_OPERATION.id, 'op01');
+    assert.equal(DEFAULT_OPERATION.name, 'Cinderpine Basin');
+    assert.equal(OPERATIONS.length, 5);
+    for (let i = 0; i < OPERATIONS.length; i++) {
+      assert.equal(OPERATIONS[i].opIndex, i);
+      assert.equal(OPERATIONS[i].index, i + 1);
+      assert.equal(OPERATIONS[i].maxPilots, 100);
+      assert.equal(getOperationByIndex(i).id, OPERATIONS[i].id);
+      assert.equal(getOperationById(OPERATIONS[i].id).id, OPERATIONS[i].id);
+    }
+    assert.equal(getOperationByIndex(5).id, 'op01');
+    assert.equal(getOperationByIndex(-1).id, 'op05');
+    assert.equal(getNextOperation('op01').id, 'op02');
+    assert.equal(getNextOperation('op05').id, 'op01');
+    assert.equal(getNextOperation(OPERATIONS[4]).id, 'op01');
+    assert.equal(getOperationById('megabasin').id, 'megabasin');
+  });
+});
+
 describe('TerrainGen', () => {
-  it('generates all 5 Solo Operations and Mega-Basin with valid counts and zero cabins/trees in water', () => {
+  it('generates all 5 Operations and Mega-Basin with valid counts, spatial tree hash, and zero cabins/trees in water', () => {
     for (const op of ALL_OPS) {
       const t = generateTerrain(op);
       assert.equal(t.gridSize, op.gridSize, `${op.id} gridSize`);
@@ -28,6 +64,9 @@ describe('TerrainGen', () => {
       assert.equal(t.waterMask.length, op.gridSize * op.gridSize);
       assert.equal(t.fuelMask.length, op.gridSize * op.gridSize);
       assert.equal(t.biomeMask.length, op.gridSize * op.gridSize);
+      assert.equal(t.treeCellOffsets.length, op.gridSize * op.gridSize + 1);
+      assert.equal(t.treeCellIndices.length, t.trees.length);
+      assert.equal(typeof t.findCollidingTree, 'function');
 
       // Exact cabin & tower counts
       assert.equal(t.cabins.length, op.cabinCount, `${op.id} cabinCount`);
@@ -57,6 +96,12 @@ describe('TerrainGen', () => {
         assert.ok(t.trees.length >= 7000 && t.trees.length <= 10500, `megabasin tree count ${t.trees.length}`);
       } else {
         assert.ok(t.trees.length >= 3500 && t.trees.length <= 5800, `${op.id} tree count ${t.trees.length}`);
+        // Initial burning % stays crisp & readable (~2.5%-4.5%)
+        const sim = new FireSim(t);
+        assert.ok(
+          sim.burningPct >= 2.3 && sim.burningPct <= 4.7,
+          `${op.id} initial burningPct ${sim.burningPct.toFixed(2)}% should be ~2.5%-4.5%`
+        );
       }
 
       // Trees never in water and never overlapping cabins
@@ -68,6 +113,18 @@ describe('TerrainGen', () => {
           assert.ok(d >= 17.5, `${op.id} tree ${i} overlaps cabin ${c} (d=${d})`);
         }
       }
+
+      // Spatial tree hash detects direct hit on sample tree and returns null high overhead
+      const sampleTree = t.trees[Math.floor(t.trees.length / 2)];
+      assert.ok(
+        t.findCollidingTree(sampleTree.x, sampleTree.y + 4.0, sampleTree.z) !== null,
+        `${op.id} spatial hash hits standing tree`
+      );
+      assert.equal(
+        t.findCollidingTree(sampleTree.x, sampleTree.y + 30.0, sampleTree.z),
+        null,
+        `${op.id} spatial hash clears high overhead`
+      );
 
       assert.ok(t.initialFireSeeds.length >= 2, `${op.id} has initial fire seeds`);
     }
@@ -87,49 +144,51 @@ describe('FlightModel', () => {
   const terrain = generateTerrain(OPERATIONS[0]);
   const lake = terrain.scoopZones[0];
 
-  it('activates scoop at 4.5 m AGL over water and does NOT activate at 6.0 m AGL', () => {
-    // At 6.0 m AGL -> no scoop
+  it('has forgiving scoop zone (<= 9.0 m enter, >= 11.5 m exit) and zero water-skim damage', () => {
+    // At 10.0 m AGL -> does NOT enter scoop
     const highPlane = createAircraftState({
       x: lake.x,
       z: lake.z,
-      y: terrain.waterLevel + 6.0,
+      y: terrain.waterLevel + 10.0,
       yawDeg: lake.headingDeg,
       pitchDeg: 0,
       tankPct: 0,
     });
     stepFlight(highPlane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, 1 / 60);
-    assert.equal(highPlane.scooping, false, 'should NOT activate scoop at 6.0 m AGL');
+    assert.equal(highPlane.scooping, false, 'should NOT activate scoop at 10.0 m AGL');
 
-    // At 4.5 m AGL -> scoop activates
+    // At 8.5 m AGL -> scoop activates
     const lowPlane = createAircraftState({
       x: lake.x,
       z: lake.z,
-      y: terrain.waterLevel + 4.5,
+      y: terrain.waterLevel + 8.5,
       yawDeg: lake.headingDeg,
       pitchDeg: 0,
       tankPct: 0,
     });
     const { events } = stepFlight(lowPlane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, 1 / 60);
-    assert.equal(lowPlane.scooping, true, 'should activate scoop at 4.5 m AGL');
+    assert.equal(lowPlane.scooping, true, 'should activate scoop at 8.5 m AGL');
     assert.equal(events.scoopStarted, true);
+    assert.equal(lowPlane.hp, 100, 'water skim deals zero hull damage');
+    assert.equal(lowPlane.crashed, false);
 
-    // Hysteresis: stays scooping at 6.0 m AGL, exits at >= 6.5 m AGL
-    lowPlane.y = terrain.waterLevel + 6.0;
+    // Hysteresis: stays scooping at 10.5 m AGL, exits at >= 11.5 m AGL
+    lowPlane.y = terrain.waterLevel + 10.5;
     stepFlight(lowPlane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, 1 / 60);
-    assert.equal(lowPlane.scooping, true, 'hysteresis keeps scoop active below 6.5 m AGL');
+    assert.equal(lowPlane.scooping, true, 'hysteresis keeps scoop active below 11.5 m AGL');
 
-    lowPlane.y = terrain.waterLevel + 6.7;
+    lowPlane.y = terrain.waterLevel + 11.7;
     const resExit = stepFlight(lowPlane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, 1 / 60);
-    assert.equal(lowPlane.scooping, false, 'exits scoop at >= 6.5 m AGL');
+    assert.equal(lowPlane.scooping, false, 'exits scoop at >= 11.5 m AGL');
     assert.equal(resExit.events.scoopEnded, true);
   });
 
-  it('fills tank 0 -> 100% in ~1.92 s with hydrodynamic drag and hydroplane cushion', () => {
+  it('fills tank 0 -> 100% in ~1.43 s with forgiving 3.0 m hydroplane cushion and zero damage', () => {
     const plane = createAircraftState({
       x: lake.x,
       z: lake.z + 250,
-      y: terrain.waterLevel + 4.2,
-      yawDeg: 0, // North along lake
+      y: terrain.waterLevel + 5.0,
+      yawDeg: 0,
       pitchDeg: 0,
       speedKmh: FLIGHT_CONSTANTS.CRUISE_SPEED_KMH,
       tankPct: 0,
@@ -138,29 +197,30 @@ describe('FlightModel', () => {
     const dt = 1 / 60;
     let elapsed = 0;
     let tankFullFired = false;
-    while (plane.tankPct < 100 && elapsed < 3.0) {
-      // Keep nose gently level over the lake
+    while (plane.tankPct < 100 && elapsed < 2.5) {
       const { events } = stepFlight(plane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, dt);
       if (events.tankFull) tankFullFired = true;
-      // Keep aircraft within lake for test duration if it nears end
       if (!terrain.isWater(plane.x, plane.z)) {
         plane.x = lake.x;
         plane.z = lake.z + 200;
       }
-      plane.y = terrain.waterLevel + 4.2;
+      plane.y = terrain.waterLevel + 5.0;
       elapsed += dt;
     }
 
     assert.equal(tankFullFired, true, 'tankFull event must fire');
-    assert.ok(elapsed >= 1.85 && elapsed <= 2.02, `0->100% scoop took ${elapsed.toFixed(3)}s (expected ~1.92s)`);
-    assert.ok(plane.speedKmh < FLIGHT_CONSTANTS.CRUISE_SPEED_KMH - 2.0, `scoop drag reduced speed to ${plane.speedKmh}`);
+    assert.ok(elapsed >= 1.35 && elapsed <= 1.52, `0->100% scoop took ${elapsed.toFixed(3)}s (expected ~1.43s)`);
+    assert.equal(plane.hp, 100, 'full scoop leaves hull at 100 HP');
 
-    // Hydroplane cushion test: diving into lake floors at waterLevel + 3.5 and levels pitch >= +2 deg
-    plane.y = terrain.waterLevel + 2.0;
+    // Forgiving hydroplane floor: diving into lake floors cleanly at waterLevel + 3.0 m with 0 damage and level pitch
+    plane.y = terrain.waterLevel + 1.5;
     plane.pitchDeg = -15;
-    stepFlight(plane, { pitch: -1, roll: 0, throttleDelta: 0, drop: false }, terrain, dt);
-    assert.ok(plane.y >= terrain.waterLevel + 3.5 - 1e-4, 'hydroplane cushion floor');
-    assert.ok(plane.pitchDeg >= 2.0, 'hydroplane cushion levels pitch >= +2 deg');
+    const diveRes = stepFlight(plane, { pitch: -1, roll: 0, throttleDelta: 0, drop: false }, terrain, dt);
+    assert.ok(plane.y >= terrain.waterLevel + FLIGHT_CONSTANTS.HYDROPLANE_FLOOR_AGL - 1e-4, 'hydroplane floor >= 3.0m');
+    assert.ok(plane.pitchDeg >= 0, 'hydroplane levels pitch >= 0 deg without bouncing out');
+    assert.equal(plane.hp, 100, 'water hydroplane cushion takes zero damage');
+    assert.equal(plane.crashed, false);
+    assert.equal(diveRes.events.planeCrash, null);
   });
 
   it('drains tank 100 -> 0% in ~1.25 s and supports 0.25 s (20%) min burst on brief tap', () => {
@@ -181,7 +241,6 @@ describe('FlightModel', () => {
     assert.equal(plane.tankPct, 0);
     assert.ok(elapsed >= 1.2 && elapsed <= 1.32, `100->0% drop took ${elapsed.toFixed(3)}s (expected ~1.25s)`);
 
-    // Minimum burst test on single tap
     const tapPlane = createAircraftState({
       x: 100,
       z: 0,
@@ -196,42 +255,171 @@ describe('FlightModel', () => {
     assert.ok(tapPlane.tankPct >= 78 && tapPlane.tankPct <= 82, `brief tap drained ~20% (left ${tapPlane.tankPct.toFixed(1)}%)`);
   });
 
-  it('deflect-bounces off land without killing aircraft and predicts ballistic impact accurately', () => {
+  it('deals 30 HP hull damage on standing tree strike with 0.9 s cooldown and crashes at 0 HP', () => {
+    const tree = terrain.trees[Math.floor(terrain.trees.length * 0.4)];
+    const plane = createAircraftState({
+      x: tree.x - 1.0,
+      z: tree.z,
+      y: tree.y + 5.5,
+      yawDeg: 90,
+      pitchDeg: 0,
+      speedKmh: 165,
+      tankPct: 80,
+      autopilot: false,
+    });
+
+    const r1 = stepFlight(plane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, 1 / 60);
+    assert.ok(r1.events.treeHit, 'tree_hit event emitted');
+    assert.equal(r1.events.treeHit.type, 'tree_hit');
+    assert.equal(r1.events.treeHit.damage, 30);
+    assert.equal(r1.events.treeHit.hp, 70);
+    assert.equal(plane.hp, 70);
+    assert.equal(plane.crashed, false);
+    assert.ok(plane.speedKmh < 155, 'tree strike causes speed drop');
+
+    // Immediate next frame on same tree does NOT multi-drain (0.9 s cooldown)
+    plane.x = tree.x;
+    plane.z = tree.z;
+    plane.y = tree.y + 5.5;
+    const r2 = stepFlight(plane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, 1 / 60);
+    assert.equal(r2.events.treeHit, null, 'cooldown prevents instant multi-frame drain');
+    assert.equal(plane.hp, 70);
+
+    // Repeat 3 more strikes after cooldown -> hp reaches 0 -> crashes with reason 'trees'
+    for (let k = 0; k < 3; k++) {
+      plane.treeHitCooldown = 0;
+      plane.x = tree.x - 0.5;
+      plane.z = tree.z;
+      plane.y = tree.y + 5.5;
+      const rk = stepFlight(plane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, 1 / 60);
+      if (k === 2) {
+        assert.equal(plane.hp, 0);
+        assert.equal(plane.crashed, true);
+        assert.equal(plane.crashReason, 'trees');
+        assert.equal(plane.tankPct, 0);
+        assert.ok(rk.events.planeCrash && rk.events.planeCrash.reason === 'trees');
+      }
+    }
+  });
+
+  it('instantly crashes on non-water terrain impact and auto-respawns cleanly after 3.5 s preserving manual control', () => {
     const lx = 200;
     const lz = -100;
     const groundY = terrain.getHeight(lx, lz);
     const plane = createAircraftState({
       x: lx,
       z: lz,
-      y: groundY + 3.0,
+      y: groundY + 1.4,
       yawDeg: 90,
       pitchDeg: -10,
       speedKmh: 160,
+      tankPct: 90,
+      autopilot: false,
+      slotId: 3,
     });
-    const { events } = stepFlight(plane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, 1 / 60);
-    assert.equal(events.bounced, true);
-    assert.ok(plane.pitchDeg >= 15, 'bounce pitches nose up >= +15 deg');
-    assert.ok(plane.bounceTimer > 0.35);
-    assert.ok(plane.speedKmh < 145, 'bounce sheds ~15% speed');
 
-    // Ballistic impact prediction at 47 m AGL over flat water
+    const { events } = stepFlight(plane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, 1 / 60);
+    assert.equal(events.bounced, false, 'no land bounce-deflect');
+    assert.ok(events.planeCrash, 'plane_crash event emitted');
+    assert.equal(events.planeCrash.type, 'plane_crash');
+    assert.equal(events.planeCrash.reason, 'terrain');
+    assert.equal(plane.hp, 0);
+    assert.equal(plane.crashed, true);
+    assert.equal(plane.crashReason, 'terrain');
+    assert.equal(plane.tankPct, 0, 'crash dumps tank to 0%');
+    assert.ok(plane.crashTimer >= 3.45 && plane.crashTimer <= 3.5, `crashTimer=${plane.crashTimer}`);
+
+    // Advance 3.0 s -> still crashed
+    const dt = 1 / 60;
+    for (let i = 0; i < 60 * 3; i++) {
+      stepFlight(plane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, dt);
+    }
+    assert.equal(plane.crashed, true, 'still crashed at 3.0 s');
+
+    // Advance remaining 0.6 s -> auto-respawns cleanly
+    let sawRespawn = false;
+    for (let i = 0; i < 40; i++) {
+      const r = stepFlight(plane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, dt);
+      if (r.events.respawned) sawRespawn = true;
+    }
+    assert.equal(sawRespawn, true, 'respawned after 3.5 s');
+    assert.equal(plane.crashed, false);
+    assert.equal(plane.hp, 100, 'respawns at 100 HP');
+    assert.equal(plane.tankPct, 0, 'respawns with 0% tank');
+    assert.equal(plane.autopilot, false, 'manual control preserved on respawn');
+    assert.ok(plane.agl >= 50, `respawns cleanly on elevated air corridor (agl=${plane.agl.toFixed(1)}m)`);
+  });
+
+  it('predictDropImpact() matches actual FireSim parcel impact coordinates within < 1 cell across flat & sloped terrain', () => {
+    const sim = new FireSim(terrain);
+
+    // Check 45 m AGL snappy fall time (~1.3-1.6 s)
     const flatPlane = createAircraftState({
       x: lake.x,
       z: lake.z,
-      y: terrain.waterLevel + 47,
+      y: terrain.waterLevel + 45,
       yawDeg: 0,
       pitchDeg: 0,
       speedKmh: 158,
     });
-    const pred = predictDropImpact(flatPlane, 6.0, 0, terrain);
-    assert.ok(Math.abs(pred.tFall - Math.sqrt((2 * 47) / 15.5)) < 0.08, `tFall=${pred.tFall}`);
-    assert.ok(pred.x > flatPlane.x + 4, 'wind drift shifts impact east');
-    assert.ok(pred.radius >= 23 && pred.radius <= 26, `radius=${pred.radius}`);
+    const flatPred = predictDropImpact(flatPlane, { windVx: 6.0, windVz: 0 }, terrain, sim);
+    assert.ok(
+      flatPred.flightTimeSec >= 1.3 && flatPred.flightTimeSec <= 1.6,
+      `45 m AGL flightTimeSec=${flatPred.flightTimeSec.toFixed(3)}s (expected 1.3-1.6s)`
+    );
+    assert.ok(flatPred.impactX > flatPlane.x + 1.5, 'east wind shifts impact east');
+    assert.equal(flatPred.radiusM, computeSplashRadius(45, terrain.cellSize));
+
+    // Compare predictDropImpact() directly against simulated FireSim parcels in 4 diverse scenarios (sloped hills, wind, climb/dive)
+    const scenarios = [
+      { x: -120, z: -80, yawDeg: 75, pitchDeg: 0, agl: 45, windVx: 5.5, windVz: -2.0 },
+      { x: 180, z: 120, yawDeg: 315, pitchDeg: -8, agl: 52, windVx: -4.0, windVz: 6.0 },
+      { x: 40, z: -200, yawDeg: 145, pitchDeg: 6, agl: 38, windVx: 8.0, windVz: 3.5 },
+      { x: -335, z: 50, yawDeg: 10, pitchDeg: 0, agl: 42, windVx: 0, windVz: -5.0 },
+    ];
+
+    for (const sc of scenarios) {
+      const testSim = new FireSim(terrain);
+      // Lock constant wind for exact comparison
+      const gy = Math.max(terrain.waterLevel, terrain.getHeight(sc.x, sc.z));
+      const p = createAircraftState({
+        x: sc.x,
+        y: gy + sc.agl,
+        z: sc.z,
+        yawDeg: sc.yawDeg,
+        pitchDeg: sc.pitchDeg,
+        speedKmh: 158,
+        tankPct: 100,
+      });
+
+      // Step sim wind once, use exact sim wind vector
+      testSim.windVx = sc.windVx;
+      testSim.windVz = sc.windVz;
+      const pred = predictDropImpact(p, { windVx: sc.windVx, windVz: sc.windVz }, terrain, testSim);
+
+      testSim.spawnWaterParcel(7, p.x, p.y, p.z, p.vx, p.vy, p.vz, sc.agl);
+      let impact = null;
+      for (let step = 0; step < 60 && !impact; step++) {
+        // Hold wind constant while parcel falls to isolate ballistic math comparison
+        testSim.windVx = sc.windVx;
+        testSim.windVz = sc.windVz;
+        const evs = [];
+        testSim._stepParcels(0.1, evs);
+        if (evs.length > 0) impact = evs[0];
+      }
+
+      assert.ok(impact, 'parcel landed');
+      const errM = Math.hypot(impact.x - pred.impactX, impact.z - pred.impactZ);
+      assert.ok(
+        errM < terrain.cellSize,
+        `predictDropImpact error ${errM.toFixed(2)}m must be < 1 cell (${terrain.cellSize}m)`
+      );
+    }
   });
 });
 
 describe('Autopilot', () => {
-  it('completes a full drop + scoop + climb cycle on Cinderpine Basin and scores +70 pts', () => {
+  it('completes a full drop + scoop + climb cycle on Cinderpine Basin with direct hit, 0 tree hits, 0 crashes', () => {
     const terrain = generateTerrain(OPERATIONS[0]);
     const sim = new FireSim(terrain, { isMegaBasin: false });
     const ap = new Autopilot(terrain);
@@ -251,7 +439,9 @@ describe('Autopilot', () => {
     let minTank = 100;
     let scoopedBackToFull = false;
     let climbedAfterScoop = false;
-    let totalBounces = 0;
+    let totalTreeHits = 0;
+    let totalCrashes = 0;
+    const outcomes = [];
 
     const dt = 1 / 60;
     let simAccum = 0;
@@ -262,12 +452,13 @@ describe('Autopilot', () => {
       const input = ap.update(plane, snap, dt);
       visited.add(input.phase);
 
-      const { events } = stepFlight(plane, input, terrain, dt);
-      if (events.bounced) totalBounces++;
+      const { events } = stepFlight(plane, input, terrain, dt, { fireCells: snap.cells });
+      if (events.treeHit) totalTreeHits++;
+      if (events.planeCrash) totalCrashes++;
 
       if (plane.tankPct < minTank) minTank = plane.tankPct;
       if (minTank < 5 && plane.tankPct >= 99) scoopedBackToFull = true;
-      if (scoopedBackToFull && input.phase === 'CLIMB_OUT' && plane.agl >= 40) {
+      if (scoopedBackToFull && input.phase === 'CLIMB_OUT' && plane.agl >= 34) {
         climbedAfterScoop = true;
       }
 
@@ -285,9 +476,10 @@ describe('Autopilot', () => {
       if (simAccum >= 0.1) {
         simAccum -= 0.1;
         sim.step(0.1, 1);
+        outcomes.push(...sim.drainDropOutcomes());
       }
 
-      if (climbedAfterScoop && sim.missionScore >= 70) break;
+      if (climbedAfterScoop && outcomes.some((o) => o.outcome === 'direct')) break;
     }
 
     assert.ok(visited.has('APPROACH_FIRE'), 'visited APPROACH_FIRE');
@@ -298,11 +490,14 @@ describe('Autopilot', () => {
     assert.ok(minTank < 5, `emptied tank during release (minTank=${minTank.toFixed(1)}%)`);
     assert.equal(scoopedBackToFull, true, 'scooped tank back up to ~100%');
     assert.equal(climbedAfterScoop, true, 'climbed out cleanly after scooping');
-    assert.ok(sim.missionScore >= 70, `extinguished fire cells for >= +70 pts (got ${sim.missionScore})`);
-    assert.equal(totalBounces, 0, `autopilot must not hit terrain (bounces=${totalBounces})`);
+    const directHit = outcomes.find((o) => o.outcome === 'direct');
+    assert.ok(directHit && directHit.cellsExtinguished >= 5, `autopilot scored direct hit >= 5 cells (got ${directHit?.cellsExtinguished})`);
+    assert.equal(totalTreeHits, 0, 'autopilot must avoid treetops');
+    assert.equal(totalCrashes, 0, 'autopilot must never crash');
+    assert.equal(plane.hp, 100);
   });
 
-  it('stays safe and never crashes or loops stuck across all 6 maps', () => {
+  it('stays safe with 0 tree hits and 0 crashes across all 6 maps', () => {
     for (const op of ALL_OPS) {
       const terrain = generateTerrain(op);
       const sim = new FireSim(terrain, { isMegaBasin: op.mode === 'megabasin' });
@@ -318,16 +513,19 @@ describe('Autopilot', () => {
         slotId: 0,
       });
 
-      let bounces = 0;
+      let treeHits = 0;
+      let crashes = 0;
       let dropped = false;
       let scooped = false;
       const dt = 1 / 60;
       let simAccum = 0;
 
       for (let s = 0; s < 60 * 75; s++) {
-        const input = ap.update(plane, sim.getSnapshot(), dt);
-        const { events } = stepFlight(plane, input, terrain, dt);
-        if (events.bounced) bounces++;
+        const snap = sim.getSnapshot();
+        const input = ap.update(plane, snap, dt);
+        const { events } = stepFlight(plane, input, terrain, dt, { fireCells: snap.cells });
+        if (events.treeHit) treeHits++;
+        if (events.planeCrash) crashes++;
         if (plane.releasing) dropped = true;
         if (plane.scooping) scooped = true;
         assert.ok(Number.isFinite(plane.x) && Number.isFinite(plane.y) && Number.isFinite(plane.z), `${op.id} finite pose`);
@@ -338,7 +536,9 @@ describe('Autopilot', () => {
         }
       }
 
-      assert.equal(bounces, 0, `${op.id} autopilot zero terrain bounces (got ${bounces})`);
+      assert.equal(treeHits, 0, `${op.id} autopilot zero tree hits (got ${treeHits})`);
+      assert.equal(crashes, 0, `${op.id} autopilot zero crashes (got ${crashes})`);
+      assert.equal(plane.hp, 100, `${op.id} autopilot full HP`);
       assert.equal(dropped, true, `${op.id} autopilot dropped water`);
       assert.equal(scooped, true, `${op.id} autopilot scooped water`);
     }
@@ -346,17 +546,21 @@ describe('Autopilot', () => {
 });
 
 describe('FireSim', () => {
-  it('spreads fire downwind, enforces 15-20 s wet immunity, and ignites ember warnings after 4 s', () => {
+  it('spreads fire downwind, enforces 28-35 s wet firebreak immunity, and ignites ember warnings after 4 s', () => {
     const terrain = generateTerrain(OPERATIONS[0]);
     const sim = new FireSim(terrain);
     const startCount = sim.burningCount;
     assert.ok(startCount > 30, `initial burning cells (${startCount})`);
 
-    // Step 25 seconds without water -> fire must spread
-    for (let i = 0; i < 250; i++) sim.step(0.1, 1);
-    assert.ok(sim.burningCount > startCount, `fire spread (${startCount} -> ${sim.burningCount})`);
+    // Step 45 seconds without water -> fire visibly spreads downwind at calm solo pace
+    for (let i = 0; i < 450; i++) sim.step(0.1, 1);
+    assert.ok(sim.burningCount > startCount, `fire spread downwind (${startCount} -> ${sim.burningCount})`);
+    assert.ok(
+      sim.burningCount < startCount * 1.5,
+      `1-pilot spread stays controlled (${startCount} -> ${sim.burningCount})`
+    );
 
-    // Pick a burning cell, drop direct water parcel on it to extinguish to state 13 (wet)
+    // Pick a burning cell, extinguish to state 13 (WET)
     let targetIdx = -1;
     for (let i = 0; i < sim.cells.length; i++) {
       if (sim.cells[i] >= 2 && sim.cells[i] <= 10) {
@@ -370,20 +574,19 @@ describe('FireSim', () => {
     const pos = terrain.gridToWorld(gx, gz);
     const groundY = terrain.getHeight(pos.x, pos.z);
 
-    // Spawn 4 parcels directly over cell (low height so they land on next step)
-    for (let k = 0; k < 4; k++) {
-      sim.spawnWaterParcel(7, pos.x, groundY + 0.5, pos.z, 0, -20, 0, 25);
+    for (let k = 0; k < 3; k++) {
+      sim.spawnWaterParcel(7, pos.x, groundY + 0.5, pos.z, 0, -20, 0, 35);
     }
     sim.step(0.1, 1);
     assert.equal(sim.cells[targetIdx], CELL_STATE.WET, 'extinguished cell enters WET state 13');
 
-    // Remains wet & immune for at least 14.5 seconds
-    for (let i = 0; i < 140; i++) sim.step(0.1, 1);
-    assert.equal(sim.cells[targetIdx], CELL_STATE.WET, 'remains immune in WET state after 14s');
+    // Remains wet & immune for at least 27.5 seconds (WET_COOLDOWN_MIN = 28 s)
+    for (let i = 0; i < 274; i++) sim.step(0.1, 1);
+    assert.equal(sim.cells[targetIdx], CELL_STATE.WET, `remains immune in WET state after 27.4s (min ${WET_COOLDOWN_MIN}s)`);
 
-    // Returns to INTACT (or CHARRED) by 21 seconds total
-    for (let i = 0; i < 70; i++) sim.step(0.1, 1);
-    assert.notEqual(sim.cells[targetIdx], CELL_STATE.WET, 'wet cooldown expires within 15-20s');
+    // Expires by 36 seconds total (WET_COOLDOWN_MAX = 35 s)
+    for (let i = 0; i < 86; i++) sim.step(0.1, 1);
+    assert.notEqual(sim.cells[targetIdx], CELL_STATE.WET, `wet cooldown expires within ${WET_COOLDOWN_MIN}-${WET_COOLDOWN_MAX}s`);
 
     // Ember warning test (state 15 -> ignites to 3 after 4.0 s)
     let intactIdx = -1;
@@ -402,11 +605,220 @@ describe('FireSim', () => {
     assert.ok(sim.cells[intactIdx] >= 3 && sim.cells[intactIdx] <= 5, 'ignited to >=3 after 4.0s');
   });
 
+  it('extinguishes >= 5 cells in one accurate pass and emits a direct Drop Outcome Event', () => {
+    const terrain = generateTerrain(OPERATIONS[0]);
+    const sim = new FireSim(terrain);
+    const seed = terrain.initialFireSeeds[0];
+    const center = terrain.gridToWorld(seed.gx, seed.gz);
+
+    const gy = terrain.getHeight(center.x - 100, center.z);
+    const plane = createAircraftState({
+      x: center.x - 120,
+      y: gy + 45,
+      z: center.z,
+      yawDeg: 90,
+      speedKmh: 158,
+      tankPct: 100,
+      slotId: 7,
+    });
+
+    let started = false;
+    let pAcc = 0;
+    let sAcc = 0;
+    const outcomes = [];
+    for (let i = 0; i < 60 * 6; i++) {
+      const pred = predictDropImpact(plane, sim, terrain, sim);
+      const shouldDrop = (!started && pred.onTarget && pred.fireCellsInTarget >= 6) || (started && plane.tankPct > 0);
+      if (shouldDrop && !started) started = true;
+      stepFlight(plane, { drop: shouldDrop, dropJustPressed: shouldDrop && !plane.releasing }, terrain, 1 / 60);
+      if (plane.releasing) {
+        pAcc += 1 / 60;
+        if (pAcc >= 0.1) {
+          pAcc -= 0.1;
+          sim.spawnWaterParcel(7, plane.x, plane.y, plane.z, plane.vx, plane.vy, plane.vz, plane.agl);
+        }
+      }
+      sAcc += 1 / 60;
+      if (sAcc >= 0.1) {
+        sAcc -= 0.1;
+        sim.step(0.1, 1);
+        outcomes.push(...sim.drainDropOutcomes());
+      }
+    }
+
+    assert.equal(outcomes.length, 1, 'grouped entire drop pass into 1 outcome event');
+    const out = outcomes[0];
+    assert.equal(out.slotId, 7);
+    assert.equal(out.outcome, 'direct');
+    assert.equal(out.missType, 'none');
+    assert.equal(out.missDirCompass, '');
+    assert.equal(out.missDistM, 0);
+    assert.ok(out.cellsExtinguished >= 10, `single pass extinguished ${out.cellsExtinguished} cells (expected >= 10)`);
+    assert.ok(out.pointsAwarded >= out.cellsExtinguished * SCORE.CELL_PRIMARY);
+  });
+
+  it('classifies off-target drops accurately as miss with overshot / short / wide + compass direction', () => {
+    const terrain = generateTerrain(OPERATIONS[0]);
+    const sim = new FireSim(terrain);
+
+    // Clear grid and place a single crisp fire cell at (0, 0)
+    sim.cells.fill(0);
+    sim.intensityF.fill(0);
+    sim.activePos.fill(-1);
+    sim.activeCount = 0;
+    const centerG = terrain.worldToGrid(0, 0);
+    // Find nearest flammable dry cell near (0, 0)
+    let fx = 0;
+    let fz = 0;
+    let fIdx = -1;
+    for (let rad = 0; rad <= 10 && fIdx < 0; rad++) {
+      for (let dz = -rad; dz <= rad && fIdx < 0; dz++) {
+        for (let dx = -rad; dx <= rad && fIdx < 0; dx++) {
+          const idx = (centerG.gz + dz) * terrain.gridSize + (centerG.gx + dx);
+          if (terrain.fuelMask[idx] === 1) {
+            fIdx = idx;
+            const p = terrain.gridToWorld(centerG.gx + dx, centerG.gz + dz);
+            fx = p.x;
+            fz = p.z;
+          }
+        }
+      }
+    }
+    assert.ok(fIdx >= 0);
+    sim.cells[fIdx] = 10;
+    sim.intensityF[fIdx] = 10;
+    sim._addActive(fIdx);
+
+    // Helper: spawn 2 low parcels flying East (+X) landing at (tx, tz) and wait 0.5 s for outcome
+    const runMissCase = (slotId, tx, tz, vx, vz) => {
+      const gy = terrain.getHeight(tx, tz);
+      sim.spawnWaterParcel(slotId, tx, gy + 0.5, tz, vx, -20, vz, 30);
+      sim.spawnWaterParcel(slotId, tx, gy + 0.5, tz, vx, -20, vz, 30);
+      const found = [];
+      for (let i = 0; i < 6; i++) {
+        sim.step(0.1, 1);
+        found.push(...sim.drainDropOutcomes());
+      }
+      return found.find((o) => o.slotId === slotId);
+    };
+
+    // 1. Flying East (+X): water lands 110 m EAST (ahead of fire) -> overshot, E
+    const overshot = runMissCase(1, fx + 110, fz, 44, 0);
+    assert.ok(overshot);
+    assert.equal(overshot.outcome, 'miss');
+    assert.equal(overshot.missType, 'overshot');
+    assert.equal(overshot.missDirCompass, 'E');
+    assert.ok(overshot.missDistM >= 95 && overshot.missDistM <= 125);
+
+    // 2. Flying East (+X): water lands 110 m WEST (behind fire) -> short, W
+    const shortDrop = runMissCase(2, fx - 110, fz, 44, 0);
+    assert.ok(shortDrop);
+    assert.equal(shortDrop.outcome, 'miss');
+    assert.equal(shortDrop.missType, 'short');
+    assert.equal(shortDrop.missDirCompass, 'W');
+    assert.ok(shortDrop.missDistM >= 95 && shortDrop.missDistM <= 125);
+
+    // 3. Flying East (+X): water lands 110 m NORTH (lateral flank) -> wide, N
+    const wideDrop = runMissCase(3, fx + 5, fz - 110, 44, 0);
+    assert.ok(wideDrop);
+    assert.equal(wideDrop.outcome, 'miss');
+    assert.equal(wideDrop.missType, 'wide');
+    assert.equal(wideDrop.missDirCompass, 'N');
+    assert.ok(wideDrop.missDistM >= 95 && wideDrop.missDistM <= 125);
+  });
+
+  it('allows 1 solo pilot to genuinely contain Operation 01 within 4 minutes and emits fire_contained world event', () => {
+    const terrain = generateTerrain(OPERATIONS[0]);
+    const sim = new FireSim(terrain);
+
+    let dropCount = 0;
+    let victorySec = -1;
+    const worldEvents = [];
+
+    for (let sec = 0; sec < 240; sec++) {
+      // Simulate 1 solo pilot making one well-aimed pass every 20 seconds
+      if (sec > 0 && sec % 20 === 8 && sim.burningCount > 0) {
+        dropCount++;
+        let bestX = sim.fireHead.x;
+        let bestZ = sim.fireHead.z;
+        let bestCnt = -1;
+        for (let a = 0; a < sim.activeCount; a++) {
+          const idx = sim.activeList[a];
+          if (sim.cells[idx] < 1 || sim.cells[idx] > 12) continue;
+          const gx = idx % terrain.gridSize;
+          const gz = (idx - gx) / terrain.gridSize;
+          let cnt = 0;
+          for (let dz = -2; dz <= 2; dz++) {
+            for (let dx = -2; dx <= 2; dx++) {
+              const nx = gx + dx;
+              const nz = gz + dz;
+              if (nx >= 0 && nx < terrain.gridSize && nz >= 0 && nz < terrain.gridSize) {
+                const st = sim.cells[nz * terrain.gridSize + nx];
+                if (st >= 1 && st <= 12) cnt++;
+              }
+            }
+          }
+          if (cnt > bestCnt) {
+            bestCnt = cnt;
+            const p = terrain.gridToWorld(gx, gz);
+            bestX = p.x;
+            bestZ = p.z;
+          }
+        }
+        const gy = terrain.getHeight(bestX, bestZ);
+        const plane = createAircraftState({
+          x: bestX,
+          y: gy + 45,
+          z: bestZ + 115,
+          yawDeg: 0,
+          speedKmh: 158,
+          tankPct: 100,
+          slotId: 7,
+        });
+        let dropped = 0;
+        for (let step = 0; step < 60; step++) {
+          const pred = predictDropImpact(plane, sim, terrain, sim);
+          if (dropped > 0 || pred.impactZ <= bestZ + 22) {
+            sim.spawnWaterParcel(
+              7,
+              plane.x,
+              plane.y,
+              plane.z,
+              plane.vx,
+              plane.vy,
+              plane.vz,
+              Math.max(10, plane.y - terrain.getHeight(plane.x, plane.z)),
+              dropCount
+            );
+            dropped++;
+            if (dropped >= 12) break;
+          }
+          plane.x += plane.vx * 0.1;
+          plane.z += plane.vz * 0.1;
+          plane.y = Math.max(terrain.waterLevel, terrain.getHeight(plane.x, plane.z)) + 45;
+        }
+      }
+
+      for (let tick = 0; tick < 10; tick++) {
+        sim.step(0.1, 1);
+        worldEvents.push(...sim.drainWorldEvents());
+      }
+      if (sim.status === 'victory') {
+        victorySec = sec;
+        break;
+      }
+    }
+
+    assert.equal(sim.status, 'victory', `1 solo pilot must contain op01 within 4 min (burnLeft=${sim.burningCount})`);
+    assert.ok(victorySec > 0 && victorySec < 240, `solo victory achieved in ${victorySec}s`);
+    assert.equal(sim.cabinsAlive, sim.cabinsTotal, 'all cabins protected during solo victory');
+    assert.ok(worldEvents.some((e) => e.type === 'fire_contained'), 'fire_contained world event emitted');
+  });
+
   it('awards +70 primary and +35 co-bomber assist (>= 15% share) within 3 s window', () => {
     const terrain = generateTerrain(OPERATIONS[0]);
     const sim = new FireSim(terrain);
 
-    // Isolate a single high-intensity burning cell
     sim.cells.fill(0);
     sim.intensityF.fill(0);
     sim.activePos.fill(-1);
@@ -422,7 +834,6 @@ describe('FireSim', () => {
     sim.intensityF[targetIdx] = 10.0;
     sim._addActive(targetIdx);
 
-    // Slot 1 drops 2 parcels (majority), Slot 2 drops 1 parcel (~33% >= 15%)
     sim.spawnWaterParcel(1, pos.x, groundY + 0.5, pos.z, 0, -20, 0, 30);
     sim.spawnWaterParcel(1, pos.x, groundY + 0.5, pos.z, 0, -20, 0, 30);
     sim.spawnWaterParcel(2, pos.x, groundY + 0.5, pos.z, 0, -20, 0, 30);
@@ -436,19 +847,18 @@ describe('FireSim', () => {
     assert.ok(assistEv && assistEv.pts === SCORE.CELL_ASSIST, 'co-bomber receives +35 assist');
   });
 
-  it('detects CABIN AT RISK within 48 m, damages within 24 m, and awards +500 Cabin Saved with 30 s cooldown', () => {
+  it('detects CABIN AT RISK within 48 m, emits cabin_at_risk world event, damages within 24 m, and awards +500 Cabin Saved', () => {
     const terrain = generateTerrain(OPERATIONS[0]);
     const sim = new FireSim(terrain);
 
-    // Clear all fires and ignite one cell right next to cabin 0 (within 24 m)
     sim.cells.fill(0);
     sim.intensityF.fill(0);
     sim.activePos.fill(-1);
     sim.activeCount = 0;
+    sim.drainWorldEvents();
 
     const cab = terrain.cabins[0];
     const { gx, gz } = terrain.worldToGrid(cab.x, cab.z);
-    // Find an adjacent flammable cell within 24 m
     let fireIdx = -1;
     let firePos = null;
     for (let dz = -1; dz <= 1 && fireIdx < 0; dz++) {
@@ -470,21 +880,22 @@ describe('FireSim', () => {
     sim.intensityF[fireIdx] = 10.0;
     sim._addActive(fireIdx);
 
-    // Run 3.5 seconds so cabin is at risk >= 3 s and takes damage
-    for (let i = 0; i < 35; i++) sim.step(0.1, 1);
+    const wEvents = [];
+    for (let i = 0; i < 35; i++) {
+      sim.step(0.1, 1);
+      wEvents.push(...sim.drainWorldEvents());
+    }
     assert.equal(sim.cabinAtRisk[0], 1, 'cabin 0 marked AT RISK');
+    assert.ok(wEvents.some((e) => e.type === 'cabin_at_risk'), 'cabin_at_risk world event emitted');
     assert.ok(sim.cabinHp[0] < 100, `cabin 0 took fire damage (hp=${sim.cabinHp[0]})`);
 
-    // Now extinguish all fires near cabin 0 with pilot slot 7
     const groundY = terrain.getHeight(firePos.x, firePos.z);
-    for (let k = 0; k < 5; k++) {
+    for (let k = 0; k < 4; k++) {
       sim.spawnWaterParcel(7, firePos.x, groundY + 0.5, firePos.z, 0, -20, 0, 28);
     }
-    // Also extinguish any adjacent cells that ignited during the 3.5 s window
     for (let i = 0; i < sim.cells.length; i++) {
       if (sim.cells[i] >= 1 && sim.cells[i] <= 12 && i !== fireIdx) {
         const p = terrain.gridToWorld(i % terrain.gridSize, Math.floor(i / terrain.gridSize));
-        sim.spawnWaterParcel(7, p.x, terrain.getHeight(p.x, p.z) + 0.5, p.z, 0, -20, 0, 24);
         sim.spawnWaterParcel(7, p.x, terrain.getHeight(p.x, p.z) + 0.5, p.z, 0, -20, 0, 24);
       }
     }
@@ -495,49 +906,61 @@ describe('FireSim', () => {
     assert.equal(sim.cabinAtRisk[0], 0);
   });
 
-  it('round-trips MP fireKey + fireRing delta and handles Mega-Basin 15 s rolling intermission', () => {
+  it('round-trips MP fireKey + fireRing delta (including mirrored dropOutcomes) and handles 15 s rolling intermission + operation_advance', () => {
     const terrain = generateTerrain(MEGA_BASIN_OP);
     const hostSim = new FireSim(terrain, { isMegaBasin: true });
     const replicaSim = new FireSim(terrain, { isMegaBasin: true });
 
-    // Advance host slightly and hydrate replica via encodeFullState / applyExternalKey
     for (let i = 0; i < 10; i++) hostSim.step(0.1, 10);
     const fullKey = hostSim.encodeFullState();
     replicaSim.applyExternalKey(fullKey);
     assert.deepEqual(replicaSim.cells, hostSim.cells);
     assert.equal(replicaSim.burningCount, hostSim.burningCount);
 
-    // Apply delta
+    // Apply delta + compact mirrored remote drop outcome tuple `o`
     const delta = hostSim.step(0.1, 10);
     assert.equal(delta.fullReset, false, 'normal step sets fullReset: false');
+    delta.o = [[7, 120, -45, 14, 980, 0, 0, 0, 0, 1]];
     replicaSim.applyExternalDelta(delta);
     assert.deepEqual(replicaSim.cells, hostSim.cells);
+    const mirrored = replicaSim.drainDropOutcomes();
+    assert.equal(mirrored.length, 1);
+    assert.equal(mirrored[0].slotId, 7);
+    assert.equal(mirrored[0].outcome, 'direct');
+    assert.equal(mirrored[0].cellsExtinguished, 14);
+    assert.equal(mirrored[0].cabinSaved, true);
 
-    // Damage cabin 0 so we verify full cabin restore is emitted on Wave 2 transition
     hostSim.cabinHp[0] = 40;
     hostSim.cabinHpF[0] = 40;
 
-    // Extinguish all fires on host -> enters 15 s intermission with +1000 bonus -> rolls into wave 2
+    // Extinguish all fires on host -> enters 15 s intermission -> emits fire_contained & operation_advance
     hostSim.cells.fill(0);
     hostSim.intensityF.fill(0);
     hostSim.activePos.fill(-1);
     hostSim.activeCount = 0;
+    hostSim.drainWorldEvents();
+
     const preScore = hostSim.missionScore;
     const enterIntermission = hostSim.step(0.1, 10);
     assert.equal(enterIntermission.fullReset, false);
     assert.equal(hostSim.status, 'intermission');
     assert.equal(hostSim.missionScore, preScore + SCORE.WAVE_CONTAINED);
     assert.ok(hostSim.intermissionTimer > 14.5);
+    assert.ok(hostSim.drainWorldEvents().some((e) => e.type === 'fire_contained'));
 
     let resetDelta = null;
+    const advEvents = [];
     for (let i = 0; i < 155; i++) {
       const d = hostSim.step(0.1, 10);
+      advEvents.push(...hostSim.drainWorldEvents());
       if (d.fullReset) {
         assert.equal(resetDelta, null, 'fullReset fires exactly once on wave transition');
         resetDelta = d;
       }
     }
     assert.ok(resetDelta, 'Wave 2 transition emitted fullReset: true');
+    assert.equal(resetDelta.advanceOperation, true, 'contained intermission sets advanceOperation: true');
+    assert.ok(advEvents.some((e) => e.type === 'operation_advance'), 'operation_advance world event emitted');
     assert.equal(resetDelta.wave, 2);
     assert.equal(resetDelta.cabinChanges.length, hostSim.cabinsTotal, 'fullReset includes all cabin HPs');
     assert.equal(resetDelta.cabinChanges[0].hp, 100, 'cabin 0 restored to 100 HP');
@@ -551,7 +974,6 @@ describe('FireSim', () => {
     const hostSim = new FireSim(terrain);
     const replicaSim = new FireSim(terrain);
 
-    // Ignite one cell right next to cabin 0
     hostSim.cells.fill(0);
     hostSim.intensityF.fill(0);
     hostSim.activePos.fill(-1);
@@ -575,7 +997,6 @@ describe('FireSim', () => {
     hostSim.intensityF[fireIdx] = 8;
     hostSim._addActive(fireIdx);
 
-    // Build wire-like fireKey payload WITHOUT cabinAtRisk field (matching decodeFireKey)
     const wireKey = hostSim.encodeFullState();
     delete wireKey.cabinAtRisk;
 
@@ -588,7 +1009,6 @@ describe('FireSim', () => {
     const terrain = generateTerrain(OPERATIONS[0]);
     const sim = new FireSim(terrain);
 
-    // Clear all fires and place a single nearly-exhausted burning cell near cabin 0
     sim.cells.fill(0);
     sim.intensityF.fill(0);
     sim.activePos.fill(-1);
@@ -609,14 +1029,12 @@ describe('FireSim', () => {
     }
     assert.ok(fireIdx >= 0);
 
-    // Make fuel exhaust in ~3.5 s so cabin is at risk >= 3 s, then burns out naturally with zero pilot water
     sim.cells[fireIdx] = 6;
     sim.intensityF[fireIdx] = 6.0;
     sim.burnDuration[fireIdx] = 4.0;
     sim.fuelRemaining[fireIdx] = 0.72;
     sim._addActive(fireIdx);
 
-    // Ensure no neighbor ignites while testing natural burnout
     const origFuel = new Uint8Array(terrain.fuelMask);
     terrain.fuelMask.fill(0);
     terrain.fuelMask[fireIdx] = 1;
@@ -646,7 +1064,6 @@ describe('FireSim', () => {
     const terrain = generateTerrain(MEGA_BASIN_OP);
     const sim = new FireSim(terrain, { isMegaBasin: true });
 
-    // Warm up JIT with realistic parcels & steady-state fire
     const clusters = sim.hotClusters.length > 0 ? sim.hotClusters : [{ x: 0, z: 0, y: 40 }];
     for (let i = 0; i < 40; i++) {
       for (let p = 0; p < 30; p++) {
@@ -654,12 +1071,12 @@ describe('FireSim', () => {
         sim.spawnWaterParcel((i * 7 + p) % 100, cl.x + ((p * 17) % 80) - 40, cl.y + 42, cl.z + ((p * 23) % 80) - 40, 20, -2, -15, 42);
       }
       sim.step(0.1, 100);
+      sim.drainDropOutcomes();
     }
 
     const timesMs = [];
 
     for (let tick = 0; tick < 200; tick++) {
-      // Simulate 100 concurrent pilots (30 releasing simultaneously at 10 Hz -> ~300-750 parcels in flight)
       for (let p = 0; p < 30; p++) {
         const slotId = (tick * 7 + p) % 100;
         const cl = clusters[p % clusters.length];
@@ -672,6 +1089,7 @@ describe('FireSim', () => {
       sim.step(0.1, 100);
       const elapsed = performance.now() - t0;
       timesMs.push(elapsed);
+      sim.drainDropOutcomes();
     }
 
     timesMs.sort((a, b) => a - b);

@@ -1,5 +1,6 @@
-// Main Native-Resolution Tactical HUD Orchestrator for EMBER FRONT
+// Minimal, Streamlined Native-Resolution Tactical HUD Orchestrator for EMBER FRONT
 // Strictly uses DOM APIs and textContent (zero innerHTML, zero inline scripts).
+// Zero permanent keybind bars or Solo/MP mode splits — corner widgets + JIT hints + auto-hiding VHF radio.
 
 import { LIVERIES } from '../config/liveries.js';
 import { TacticalMap } from './TacticalMap.js';
@@ -23,9 +24,14 @@ const COMPASS_CARDINALS = {
 };
 
 const COMPASS_SPAN_DEG = 120; // ±60°
-const COMPASS_BASE_WIDTH = 320;
+const COMPASS_BASE_WIDTH = 280;
 const PX_PER_DEG = COMPASS_BASE_WIDTH / COMPASS_SPAN_DEG;
-const MAX_ACTIVE_TOASTS = 6;
+const MAX_ACTIVE_TOASTS = 5;
+const BAR_SEGMENTS = 16;
+const MANUAL_HINT_DURATION_MS = 8200;
+const OUTCOME_DISPLAY_MS = 3200;
+const RADIO_LINGER_MS = 2500;
+const RADIO_SAFETY_END_MS = 5600;
 
 function el(tag, className, text) {
   const node = document.createElement(tag);
@@ -42,16 +48,6 @@ function svgEl(tag, attrs = {}) {
   return node;
 }
 
-function createAircraftIconSvg() {
-  const svg = svgEl('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true' });
-  svg.appendChild(
-    svgEl('path', {
-      d: 'M12 2L13.7 8.4L21 11.2V13.2L13.7 11.8L13.3 17.8L16.4 19.8V21.3L12 20.1L7.6 21.3V19.8L10.7 17.8L10.3 11.8L3 13.2V11.2L10.3 8.4L12 2Z',
-    })
-  );
-  return svg;
-}
-
 function createWindArrowSvg() {
   const svg = svgEl('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true' });
   svg.appendChild(
@@ -63,7 +59,7 @@ function createWindArrowSvg() {
 }
 
 function createSpeakerSvg(muted) {
-  const svg = svgEl('svg', { viewBox: '0 0 24 24', class: 'ef-top-btn-icon', 'aria-hidden': 'true' });
+  const svg = svgEl('svg', { viewBox: '0 0 24 24', class: 'ef-icon-svg', 'aria-hidden': 'true' });
   svg.appendChild(svgEl('path', { d: 'M3 9v6h4l5 4V5L7 9H3z' }));
   if (muted) {
     svg.appendChild(
@@ -89,6 +85,16 @@ function createSpeakerSvg(muted) {
   return svg;
 }
 
+function createGearSvg() {
+  const svg = svgEl('svg', { viewBox: '0 0 24 24', class: 'ef-icon-svg', 'aria-hidden': 'true' });
+  svg.appendChild(
+    svgEl('path', {
+      d: 'M19.4 13a7.9 7.9 0 0 0 .06-1 7.9 7.9 0 0 0-.06-1l2.1-1.64a.5.5 0 0 0 .12-.64l-2-3.46a.5.5 0 0 0-.6-.22l-2.48 1a7.4 7.4 0 0 0-1.72-1l-.38-2.64a.5.5 0 0 0-.5-.42h-4a.5.5 0 0 0-.5.42l-.38 2.64a7.4 7.4 0 0 0-1.72 1l-2.48-1a.5.5 0 0 0-.6.22l-2 3.46a.5.5 0 0 0 .12.64L4.6 11a7.9 7.9 0 0 0-.06 1 7.9 7.9 0 0 0 .06 1l-2.1 1.64a.5.5 0 0 0-.12.64l2 3.46a.5.5 0 0 0 .6.22l2.48-1a7.4 7.4 0 0 0 1.72 1l.38 2.64a.5.5 0 0 0 .5.42h4a.5.5 0 0 0 .5-.42l.38-2.64a7.4 7.4 0 0 0 1.72-1l2.48 1a.5.5 0 0 0 .6-.22l2-3.46a.5.5 0 0 0-.12-.64L19.4 13zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z',
+    })
+  );
+  return svg;
+}
+
 function degToCardinal16(deg) {
   const norm = ((deg % 360) + 360) % 360;
   return CARDINALS_16[Math.round(norm / 22.5) % 16];
@@ -104,12 +110,55 @@ function shortestAngleStep(current, target) {
   return current + diff;
 }
 
+function resolveRadioAccent(urgency, category) {
+  const u = String(urgency || '').toLowerCase();
+  const c = String(category || '').toLowerCase();
+  if (
+    u === 'urgent' ||
+    u === 'critical' ||
+    u === 'high' ||
+    u === 'help_cabin' ||
+    c === 'help_cabin' ||
+    c === 'cabin_at_risk' ||
+    c === 'damage_hit' ||
+    c === 'crash_respawn'
+  ) {
+    return 'is-urgent';
+  }
+  if (u === 'success' || u === 'hit_direct' || c === 'hit_direct' || c === 'fire_contained') {
+    return 'is-direct';
+  }
+  if (
+    u === 'warn' ||
+    u === 'warning' ||
+    u.startsWith('miss') ||
+    c.startsWith('miss') ||
+    c === 'hit_partial'
+  ) {
+    return 'is-warn';
+  }
+  if (
+    u === 'info' ||
+    u === 'mp_join' ||
+    c === 'mp_join' ||
+    c === 'scoop_full' ||
+    c === 'operation_advance'
+  ) {
+    return 'is-info';
+  }
+  return 'is-neutral';
+}
+
+function formatFreq(freq) {
+  if (!freq) return '122.925 MHz';
+  const s = String(freq).trim();
+  return /mhz/i.test(s) ? s : `${s} MHz`;
+}
+
 export class HudController {
   constructor({
     onToggleAudio,
     onOpenDrawer,
-    onSelectOperation,
-    onSwitchMode,
     onSettingChange,
     onNextOperation,
     onReplay,
@@ -118,8 +167,6 @@ export class HudController {
     this._callbacks = {
       onToggleAudio,
       onOpenDrawer,
-      onSelectOperation,
-      onSwitchMode,
       onSettingChange,
       onNextOperation,
       onReplay,
@@ -138,56 +185,73 @@ export class HudController {
     this._overlayCountdownEl = null;
     this._toastTimers = new Set();
 
-    // 1. 3D-Projected World Callouts Layer (behind cards)
+    // JIT hint state
+    this._wasAutopilot = true;
+    this._manualHintUntilMs = 0;
+    this._lastHullHp = 100;
+
+    // Outcome toast & peripheral flash timers
+    this._outcomeHideTimer = null;
+    this._flashTimer = null;
+
+    // Auto-hiding VHF radio state
+    this._radioEntries = [];
+    this._radioHideTimer = null;
+    this._radioSafetyTimer = null;
+
+    // 1. 3D-Projected World Callouts Layer (behind HUD widgets)
     this._callouts = new WorldCallouts();
     this._root.appendChild(this._callouts.el);
 
-    // 2. Top Header Bar
-    this._buildTopBar();
+    // 2. Peripheral Edge Flash Layer (direct hit emerald glow / damage red flash)
+    this._flashEl = el('div', 'ef-hud-flash');
+    this._root.appendChild(this._flashEl);
 
-    // 3. Operation Briefing Card (top-left)
-    this._buildOpCard();
+    // 3. Top-Left Stack: Compact Mission/Airspace Pill + Auto-Hiding VHF Radio Comms Toast
+    this._buildLeftTopStack();
 
-    // 4. Scrolling Top-Center Compass Ribbon
+    // 4. Top-Center Slim Compass Ribbon + Post-Drop Outcome Banner below it
     this._buildCompass();
+    this._buildOutcomeBanner();
 
-    // 5. Top-Right Wind Vector Card
-    this._buildWindCard();
+    // 5. Top-Right Compact Wind Chip + Audio Mute Icon + Settings Gear Icon
+    this._buildTopRightCluster();
 
-    // 6. Bottom-Left Flight Telemetry Card
+    // 6. Bottom-Left Compact Flight Telemetry Card (SPD, ALT, TANK, HULL)
     this._buildTelemetryCard();
 
-    // 7. Bottom-Center Demo Flight & Status Stack
-    this._buildCenterStack();
+    // 7. Bottom-Center Single Just-in-Time (JIT) Contextual Hint Pill
+    this._buildJitHint();
 
-    // 8. Bottom-Right Tactical Map
+    // 8. Bottom-Right North-Up Tactical Map (with drop preview & 6.5s impact ripples)
     this._tacticalMap = new TacticalMap();
     this._root.appendChild(this._tacticalMap.el);
 
-    // 9. Bottom Controls & Mission Score Strip
-    this._buildBottomBar();
+    // 9. Non-blocking Crash Respawn Banner Overlay
+    this._buildCrashOverlay();
 
-    // 10. Slide-Over [?] Settings & Squadron Drawer
+    // 10. Slide-Over Settings, Audio Mixer, Controls & Live Squadron Drawer
     this._drawer = new SettingsDrawer({
-      onSelectOperation: (opId) => {
-        if (this._callbacks.onSelectOperation) this._callbacks.onSelectOperation(opId);
-      },
-      onSwitchMode: (mode) => {
-        if (this._callbacks.onSwitchMode) this._callbacks.onSwitchMode(mode);
-      },
       onSettingChange: (key, val) => {
+        if (key === 'audioMuted') {
+          this.setAudioMuted(Boolean(val));
+        }
         if (this._callbacks.onSettingChange) this._callbacks.onSettingChange(key, val);
       },
       onClose: () => {
-        this._helpBtn.classList.remove('is-active');
+        this._settingsBtn.classList.remove('is-active');
       },
     });
     this._root.appendChild(this._drawer.backdropEl);
     this._root.appendChild(this._drawer.drawerEl);
 
-    // 11. Mission Overlay container (Victory / Defeat / Intermission / Offline)
+    // 11. Full Mission Overlay container (Victory / Defeat / Intermission / Offline)
     this._overlayEl = el('div', 'ef-overlay ef-hidden');
     this._root.appendChild(this._overlayEl);
+  }
+
+  get tacticalMap() {
+    return this._tacticalMap;
   }
 
   _createFallbackRoot() {
@@ -197,108 +261,89 @@ export class HudController {
     return div;
   }
 
-  _buildTopBar() {
-    const bar = el('header', 'ef-topbar');
+  _buildLeftTopStack() {
+    const stack = el('div', 'ef-left-top-stack');
 
-    // Left brand cluster
-    const brand = el('div', 'ef-brand');
-    const badge = el('div', 'ef-brand-badge');
-    badge.appendChild(createAircraftIconSvg());
-    brand.appendChild(badge);
-
-    const title = el('div', 'ef-brand-title');
-    title.appendChild(el('span', 'ef-brand-ember', 'EMBER'));
-    title.appendChild(el('span', 'ef-brand-front', 'FRONT'));
-    brand.appendChild(title);
-
-    brand.appendChild(el('div', 'ef-brand-divider'));
-
-    const unit = el('div', 'ef-brand-unit');
-    unit.appendChild(el('span', null, 'AERIAL FIRE'));
-    unit.appendChild(el('span', null, 'RESPONSE UNIT'));
-    brand.appendChild(unit);
-
-    bar.appendChild(brand);
-
-    // Right status & action cluster
-    const right = el('div', 'ef-topbar-right');
-
-    this._statusPill = el('div', 'ef-status-pill');
-    this._statusDot = el('span', 'ef-status-dot');
-    this._statusText = el('span', null, 'LIVE SIMULATION');
-    this._statusPill.appendChild(this._statusDot);
-    this._statusPill.appendChild(this._statusText);
-    right.appendChild(this._statusPill);
-
-    this._pilotsPill = el('div', 'ef-pilots-pill ef-hidden', 'PILOTS 1/100');
-    right.appendChild(this._pilotsPill);
-
-    this._audioBtn = el('button', 'ef-top-btn');
-    this._audioBtn.type = 'button';
-    this._audioBtn.setAttribute('aria-label', 'Toggle Audio');
-    this._audioIconWrap = el('span');
-    this._audioIconWrap.style.display = 'inline-flex';
-    this._audioIconWrap.appendChild(createSpeakerSvg(false));
-    this._audioLabel = el('span', null, 'AUDIO ON');
-    this._audioBtn.appendChild(this._audioIconWrap);
-    this._audioBtn.appendChild(this._audioLabel);
-    this._audioBtn.addEventListener('click', () => {
-      if (this._callbacks.onToggleAudio) this._callbacks.onToggleAudio();
-    });
-    right.appendChild(this._audioBtn);
-
-    this._helpBtn = el('button', 'ef-top-btn ef-help-btn', '?');
-    this._helpBtn.type = 'button';
-    this._helpBtn.setAttribute('aria-label', 'Operations, Controls and Squadron Menu');
-    this._helpBtn.addEventListener('click', () => {
-      const open = this.toggleDrawer();
-      if (this._callbacks.onOpenDrawer) this._callbacks.onOpenDrawer(open);
-    });
-    right.appendChild(this._helpBtn);
-
-    bar.appendChild(right);
-    this._root.appendChild(bar);
-  }
-
-  _buildOpCard() {
+    // Compact Operation, Fire, Cabin, Score & Live Pilots Pill
     const card = el('section', 'ef-card ef-op-card');
-    card.setAttribute('aria-label', 'Operation Briefing');
+    card.setAttribute('aria-label', 'Active Operation and Live Airspace');
 
-    const kicker = el('div', 'ef-op-kicker');
-    const dots = el('div', 'ef-op-dots');
-    dots.appendChild(el('span'));
-    dots.appendChild(el('span'));
-    dots.appendChild(el('span'));
-    kicker.appendChild(dots);
+    const topRow = el('div', 'ef-op-toprow');
+    this._opCodeEl = el('span', 'ef-op-code', 'OP 01/05');
+    topRow.appendChild(this._opCodeEl);
 
-    this._opCodeEl = el('div', 'ef-op-code', 'OPERATION 01 / 05');
-    kicker.appendChild(this._opCodeEl);
-    card.appendChild(kicker);
+    this._airspacePill = el('span', 'ef-airspace-chip');
+    this._airspaceDot = el('span', 'ef-status-dot');
+    this._airspaceText = el('span', null, 'LIVE · 1/100');
+    this._airspacePill.appendChild(this._airspaceDot);
+    this._airspacePill.appendChild(this._airspaceText);
+    topRow.appendChild(this._airspacePill);
+    card.appendChild(topRow);
 
     this._opTitleEl = el('div', 'ef-op-title', 'Cinderpine Basin');
     card.appendChild(this._opTitleEl);
-
-    this._opSubtitleEl = el('div', 'ef-op-subtitle', 'Scoop the lake. Drop on the fire head.');
-    card.appendChild(this._opSubtitleEl);
-
-    card.appendChild(el('div', 'ef-op-divider'));
 
     const stats = el('div', 'ef-op-stats');
 
     const cabinStat = el('div', 'ef-op-stat');
     cabinStat.appendChild(el('span', 'ef-op-stat-label', 'CABINS'));
-    this._opCabinsEl = el('span', 'ef-op-stat-val', '10 / 10');
+    this._opCabinsEl = el('span', 'ef-op-stat-val', '10/10');
     cabinStat.appendChild(this._opCabinsEl);
     stats.appendChild(cabinStat);
 
     const fireStat = el('div', 'ef-op-stat');
-    fireStat.appendChild(el('span', 'ef-op-stat-label', 'BURNING'));
-    this._opBurningEl = el('span', 'ef-op-stat-val is-fire', '8.0%');
+    fireStat.appendChild(el('span', 'ef-op-stat-label', 'FIRE'));
+    this._opBurningEl = el('span', 'ef-op-stat-val is-fire', '3.5%');
     fireStat.appendChild(this._opBurningEl);
     stats.appendChild(fireStat);
 
+    const scoreStat = el('div', 'ef-op-stat ef-op-stat-score');
+    scoreStat.appendChild(el('span', 'ef-op-stat-label', 'SCORE'));
+    this._missionScoreValEl = el('span', 'ef-op-stat-val is-score', '000000');
+    scoreStat.appendChild(this._missionScoreValEl);
+    stats.appendChild(scoreStat);
+
     card.appendChild(stats);
-    this._root.appendChild(card);
+
+    // Floating score micro-toasts anchored cleanly to the compact mission pill
+    this._toastAnchor = el('div', 'ef-toast-anchor');
+    card.appendChild(this._toastAnchor);
+
+    stack.appendChild(card);
+
+    // Auto-hiding VHF Aviation Radio Comms Toast Strip (hidden when silent!)
+    const radio = el('section', 'ef-card ef-radio-toast is-hidden');
+    radio.setAttribute('aria-label', 'VHF Radio Comms');
+    radio.setAttribute('aria-live', 'polite');
+
+    const radioHead = el('div', 'ef-radio-head');
+    const leftMeta = el('div', 'ef-radio-meta');
+    leftMeta.appendChild(el('span', 'ef-radio-tag', 'VHF'));
+    this._radioFreqEl = el('span', 'ef-radio-freq', '122.925 MHz');
+    leftMeta.appendChild(this._radioFreqEl);
+    radioHead.appendChild(leftMeta);
+
+    const txBadge = el('div', 'ef-radio-tx');
+    txBadge.appendChild(el('span', 'ef-radio-led'));
+    const wave = el('span', 'ef-radio-wave');
+    for (let i = 0; i < 4; i++) {
+      wave.appendChild(el('span', `ef-radio-bar b${i + 1}`));
+    }
+    txBadge.appendChild(wave);
+    this._radioTxLabel = el('span', 'ef-radio-tx-text', 'TX');
+    txBadge.appendChild(this._radioTxLabel);
+    this._radioTxEl = txBadge;
+    radioHead.appendChild(txBadge);
+
+    radio.appendChild(radioHead);
+
+    this._radioFeedEl = el('div', 'ef-radio-feed');
+    radio.appendChild(this._radioFeedEl);
+
+    this._radioEl = radio;
+    stack.appendChild(radio);
+
+    this._root.appendChild(stack);
   }
 
   _buildCompass() {
@@ -309,7 +354,6 @@ export class HudController {
     win.appendChild(el('div', 'ef-compass-pointer'));
 
     const tape = el('div', 'ef-compass-tape');
-    // Cover -180 to +540 deg so 0..360 headings never run off tape edges
     for (let deg = -180; deg <= 540; deg += 5) {
       const norm = normalizeDeg(deg);
       const isCardinal = Object.prototype.hasOwnProperty.call(COMPASS_CARDINALS, norm);
@@ -342,23 +386,64 @@ export class HudController {
     this._root.appendChild(wrap);
   }
 
-  _buildWindCard() {
-    const card = el('section', 'ef-card ef-wind-card');
-    card.setAttribute('aria-label', 'Wind Vector');
+  _buildOutcomeBanner() {
+    this._outcomeBannerEl = el('div', 'ef-outcome-banner is-hidden');
+    this._outcomeBannerEl.setAttribute('aria-live', 'assertive');
+    this._outcomeMainEl = el('div', 'ef-outcome-main', '');
+    this._outcomeSubEl = el('div', 'ef-outcome-sub ef-hidden', '');
+    this._outcomeBannerEl.appendChild(this._outcomeMainEl);
+    this._outcomeBannerEl.appendChild(this._outcomeSubEl);
+    this._root.appendChild(this._outcomeBannerEl);
+  }
+
+  _buildTopRightCluster() {
+    const cluster = el('div', 'ef-topright-cluster');
+
+    // Compact Wind Chip
+    const wind = el('section', 'ef-card ef-wind-chip');
+    wind.setAttribute('aria-label', 'Wind Vector');
 
     const dial = el('div', 'ef-wind-dial');
     this._windArrowEl = el('div', 'ef-wind-arrow');
     this._windArrowEl.appendChild(createWindArrowSvg());
     dial.appendChild(this._windArrowEl);
-    card.appendChild(dial);
+    wind.appendChild(dial);
 
     const meta = el('div', 'ef-wind-meta');
-    meta.appendChild(el('div', 'ef-wind-label', 'WIND VECTOR'));
+    meta.appendChild(el('div', 'ef-wind-label', 'WIND'));
     this._windValEl = el('div', 'ef-wind-val', 'E 12 KT');
     meta.appendChild(this._windValEl);
-    card.appendChild(meta);
+    wind.appendChild(meta);
+    cluster.appendChild(wind);
 
-    this._root.appendChild(card);
+    // Quick Audio Mute Icon Button
+    this._audioBtn = el('button', 'ef-card ef-icon-btn');
+    this._audioBtn.type = 'button';
+    this._audioBtn.title = 'Toggle Audio (M)';
+    this._audioBtn.setAttribute('aria-label', 'Toggle Audio');
+    this._audioIconWrap = el('span', 'ef-icon-wrap');
+    this._audioIconWrap.appendChild(createSpeakerSvg(false));
+    this._audioBtn.appendChild(this._audioIconWrap);
+    this._audioBtn.addEventListener('click', () => {
+      if (this._callbacks.onToggleAudio) this._callbacks.onToggleAudio();
+    });
+    cluster.appendChild(this._audioBtn);
+
+    // Quick Settings Gear Button
+    this._settingsBtn = el('button', 'ef-card ef-icon-btn');
+    this._settingsBtn.type = 'button';
+    this._settingsBtn.title = 'Settings, Audio & Controls (ESC / ?)';
+    this._settingsBtn.setAttribute('aria-label', 'Settings, Audio and Controls');
+    const gearWrap = el('span', 'ef-icon-wrap');
+    gearWrap.appendChild(createGearSvg());
+    this._settingsBtn.appendChild(gearWrap);
+    this._settingsBtn.addEventListener('click', () => {
+      const open = this.toggleDrawer();
+      if (this._callbacks.onOpenDrawer) this._callbacks.onOpenDrawer(open);
+    });
+    cluster.appendChild(this._settingsBtn);
+
+    this._root.appendChild(cluster);
   }
 
   _buildTelemetryCard() {
@@ -366,116 +451,312 @@ export class HudController {
     card.setAttribute('aria-label', 'Flight Telemetry');
 
     const header = el('div', 'ef-telem-header');
-    header.appendChild(el('span', 'ef-telem-title', 'FLIGHT TELEMETRY'));
     this._telemBadgeEl = el('span', 'ef-telem-badge', 'EF-07');
     header.appendChild(this._telemBadgeEl);
+
+    const nums = el('div', 'ef-telem-nums');
+    const spdWrap = el('span', 'ef-telem-inline');
+    spdWrap.appendChild(el('span', 'ef-metric-label', 'SPD'));
+    this._airspeedValEl = el('span', 'ef-metric-val', '158');
+    spdWrap.appendChild(this._airspeedValEl);
+    nums.appendChild(spdWrap);
+
+    const altWrap = el('span', 'ef-telem-inline');
+    altWrap.appendChild(el('span', 'ef-metric-label', 'ALT'));
+    this._altitudeValEl = el('span', 'ef-metric-val', '047');
+    altWrap.appendChild(this._altitudeValEl);
+    altWrap.appendChild(el('span', 'ef-metric-unit', 'm'));
+    nums.appendChild(altWrap);
+
+    header.appendChild(nums);
     card.appendChild(header);
 
-    const grid = el('div', 'ef-telem-grid');
+    // Water Tank Bar
+    const tankRow = el('div', 'ef-bar-block');
+    const tankHead = el('div', 'ef-bar-head');
+    tankHead.appendChild(el('span', 'ef-bar-label', 'WATER TANK'));
+    this._tankPctEl = el('span', 'ef-bar-pct is-tank', '100%');
+    tankHead.appendChild(this._tankPctEl);
+    tankRow.appendChild(tankHead);
 
-    const speedMetric = el('div', 'ef-metric');
-    speedMetric.appendChild(el('span', 'ef-metric-label', 'AIRSPEED'));
-    const speedRow = el('div', 'ef-metric-readout');
-    this._airspeedValEl = el('span', 'ef-metric-val', '158');
-    speedRow.appendChild(this._airspeedValEl);
-    speedRow.appendChild(el('span', 'ef-metric-unit', 'KM/H'));
-    speedMetric.appendChild(speedRow);
-    grid.appendChild(speedMetric);
-
-    const altMetric = el('div', 'ef-metric');
-    altMetric.appendChild(el('span', 'ef-metric-label', 'ALTITUDE'));
-    const altRow = el('div', 'ef-metric-readout');
-    this._altitudeValEl = el('span', 'ef-metric-val', '047');
-    altRow.appendChild(this._altitudeValEl);
-    altRow.appendChild(el('span', 'ef-metric-unit', 'M AGL'));
-    altMetric.appendChild(altRow);
-    grid.appendChild(altMetric);
-
-    card.appendChild(grid);
-
-    const tankHeader = el('div', 'ef-tank-header');
-    tankHeader.appendChild(el('span', 'ef-tank-label', 'WATER TANK'));
-    this._tankPctEl = el('span', 'ef-tank-pct', '100%');
-    tankHeader.appendChild(this._tankPctEl);
-    card.appendChild(tankHeader);
-
-    this._tankBarEl = el('div', 'ef-tank-bar');
+    this._tankBarEl = el('div', 'ef-seg-bar is-tank');
     this._tankSegments = [];
-    for (let i = 0; i < 20; i++) {
-      const seg = el('div', 'ef-tank-seg is-filled');
+    for (let i = 0; i < BAR_SEGMENTS; i++) {
+      const seg = el('div', 'ef-seg is-filled');
       this._tankBarEl.appendChild(seg);
       this._tankSegments.push(seg);
     }
-    card.appendChild(this._tankBarEl);
+    tankRow.appendChild(this._tankBarEl);
+    card.appendChild(tankRow);
+
+    // Hull Integrity Bar (emerald -> amber <60% -> flashing red <30%)
+    const hullRow = el('div', 'ef-bar-block');
+    const hullHead = el('div', 'ef-bar-head');
+    hullHead.appendChild(el('span', 'ef-bar-label', 'HULL'));
+    this._hullPctEl = el('span', 'ef-bar-pct is-hull-ok', '100%');
+    hullHead.appendChild(this._hullPctEl);
+    hullRow.appendChild(hullHead);
+
+    this._hullBarEl = el('div', 'ef-seg-bar is-hull-ok');
+    this._hullSegments = [];
+    for (let i = 0; i < BAR_SEGMENTS; i++) {
+      const seg = el('div', 'ef-seg is-filled');
+      this._hullBarEl.appendChild(seg);
+      this._hullSegments.push(seg);
+    }
+    hullRow.appendChild(this._hullBarEl);
+    card.appendChild(hullRow);
 
     this._root.appendChild(card);
   }
 
-  _buildCenterStack() {
-    const stack = el('div', 'ef-center-stack');
-
-    this._boundaryNoticeEl = el('div', 'ef-notice-pill is-boundary ef-hidden', 'RETURNING TO BASIN');
-    stack.appendChild(this._boundaryNoticeEl);
-
-    this._queueNoticeEl = el('div', 'ef-notice-pill ef-hidden', '');
-    stack.appendChild(this._queueNoticeEl);
-
-    this._idleNoticeEl = el('div', 'ef-notice-pill ef-hidden', '');
-    stack.appendChild(this._idleNoticeEl);
-
-    this._demoBannerEl = el('div', 'ef-demo-banner');
-    const pill = el('div', 'ef-demo-pill');
-    pill.appendChild(el('span', 'ef-demo-dot'));
-    pill.appendChild(el('span', null, 'DEMO FLIGHT'));
-    this._demoBannerEl.appendChild(pill);
-    this._demoBannerEl.appendChild(el('div', 'ef-demo-hint', 'Press any key to take control'));
-    stack.appendChild(this._demoBannerEl);
-
-    this._root.appendChild(stack);
+  _buildJitHint() {
+    this._jitWrapEl = el('div', 'ef-jit-wrap');
+    this._jitPillEl = el('div', 'ef-jit-pill is-hidden');
+    this._jitDotEl = el('span', 'ef-jit-dot ef-hidden');
+    this._jitTextEl = el('span', 'ef-jit-text', '');
+    this._jitPillEl.appendChild(this._jitDotEl);
+    this._jitPillEl.appendChild(this._jitTextEl);
+    this._jitWrapEl.appendChild(this._jitPillEl);
+    this._root.appendChild(this._jitWrapEl);
   }
 
-  _buildBottomBar() {
-    const bar = el('footer', 'ef-bottombar');
+  _buildCrashOverlay() {
+    this._crashEl = el('div', 'ef-crash-banner ef-hidden');
+    this._crashEl.setAttribute('aria-live', 'assertive');
+    this._crashKickerEl = el('div', 'ef-crash-kicker', 'MAYDAY · EMERGENCY RESPAWN');
+    this._crashTitleEl = el('div', 'ef-crash-title', 'AIRFRAME LOST — TERRAIN IMPACT');
+    this._crashSubEl = el('div', 'ef-crash-sub', 'RESERVE TANKER INBOUND IN 3.5S');
+    const barTrack = el('div', 'ef-crash-track');
+    this._crashFillEl = el('div', 'ef-crash-fill');
+    barTrack.appendChild(this._crashFillEl);
 
-    const controls = el('div', 'ef-controls-strip');
-    const bindings = [
-      [['W', 'S'], 'Pitch'],
-      [['A', 'D'], 'Bank'],
-      [['Q', 'E'], 'Throttle'],
-      [['SPACE'], 'Drop water'],
-    ];
-    for (const [keys, label] of bindings) {
-      const group = el('span', 'ef-ctrl-group');
-      for (const k of keys) {
-        group.appendChild(el('span', 'ef-key', k));
-      }
-      group.appendChild(el('span', null, label));
-      controls.appendChild(group);
+    this._crashEl.appendChild(this._crashKickerEl);
+    this._crashEl.appendChild(this._crashTitleEl);
+    this._crashEl.appendChild(this._crashSubEl);
+    this._crashEl.appendChild(barTrack);
+    this._root.appendChild(this._crashEl);
+  }
+
+  _triggerEdgeFlash(cls, durationMs = 700) {
+    if (!this._flashEl) return;
+    if (this._flashTimer) {
+      clearTimeout(this._flashTimer);
+      this._flashTimer = null;
     }
-    bar.appendChild(controls);
+    this._flashEl.classList.remove('is-direct', 'is-partial', 'is-miss', 'is-damage', 'is-active');
+    // Force clean restart if repeated rapidly
+    void this._flashEl.offsetWidth;
+    this._flashEl.classList.add(cls, 'is-active');
+    this._flashTimer = setTimeout(() => {
+      this._flashTimer = null;
+      this._flashEl.classList.remove('is-active', 'is-direct', 'is-partial', 'is-miss', 'is-damage');
+    }, durationMs);
+  }
 
-    const scoreCluster = el('div', 'ef-score-cluster');
+  _showCenterBanner(kindClass, mainText, subText = '', durationMs = OUTCOME_DISPLAY_MS) {
+    if (this._outcomeHideTimer) {
+      clearTimeout(this._outcomeHideTimer);
+      this._outcomeHideTimer = null;
+    }
+    this._outcomeBannerEl.classList.remove(
+      'is-hidden',
+      'is-direct',
+      'is-partial',
+      'is-miss',
+      'is-damage'
+    );
+    this._outcomeBannerEl.classList.add(kindClass);
+    this._outcomeMainEl.textContent = mainText;
+    if (subText) {
+      this._outcomeSubEl.textContent = subText;
+      this._outcomeSubEl.classList.remove('ef-hidden');
+    } else {
+      this._outcomeSubEl.textContent = '';
+      this._outcomeSubEl.classList.add('ef-hidden');
+    }
 
-    this._personalScoreBlock = el('div', 'ef-score-block ef-hidden');
-    this._personalScoreBlock.appendChild(el('span', 'ef-score-label', 'YOU'));
-    this._personalScoreValEl = el('span', 'ef-score-value is-personal', '000000');
-    this._personalScoreBlock.appendChild(this._personalScoreValEl);
-    scoreCluster.appendChild(this._personalScoreBlock);
+    this._outcomeHideTimer = setTimeout(() => {
+      this._outcomeHideTimer = null;
+      this._outcomeBannerEl.classList.add('is-hidden');
+    }, durationMs);
+  }
 
-    this._scoreDividerEl = el('div', 'ef-score-divider ef-hidden');
-    scoreCluster.appendChild(this._scoreDividerEl);
+  /**
+   * Displays the crisp post-drop Hit / Partial / Miss tactical feedback toast below the compass
+   * for ~3.2s with subtle peripheral HUD glow.
+   */
+  showDropOutcome(outcomeObj) {
+    if (!outcomeObj) return;
+    const norm = String(outcomeObj.outcome || 'miss').toLowerCase();
+    const cells = Math.max(0, Math.round(outcomeObj.cellsExtinguished ?? outcomeObj.cells ?? 0));
+    const cooled = Math.max(0, Math.round(outcomeObj.cellsCooled ?? 0));
+    const pts = Math.max(0, Math.round(outcomeObj.pointsAwarded ?? outcomeObj.pts ?? 0));
 
-    const missionBlock = el('div', 'ef-score-block');
-    missionBlock.appendChild(el('span', 'ef-score-label', 'MISSION SCORE'));
-    this._missionScoreValEl = el('span', 'ef-score-value', '000000');
-    missionBlock.appendChild(this._missionScoreValEl);
-    scoreCluster.appendChild(missionBlock);
+    if (norm === 'direct' || norm === 'hit') {
+      const cellWord = cells === 1 ? 'FIRE CELL' : 'FIRE CELLS';
+      const impactText = cells > 0 ? `−${cells} ${cellWord}` : cooled > 0 ? `${cooled} COOLED` : 'TARGET HIT';
+      const cabinSuffix = outcomeObj.cabinSaved ? '  •  CABIN SAVED' : '';
+      const main = `✓ DIRECT HIT!  ${impactText}  •  +${pts} PTS${cabinSuffix}`;
+      this._showCenterBanner('is-direct', main, '', OUTCOME_DISPLAY_MS);
+      this._triggerEdgeFlash('is-direct', 780);
+    } else if (norm === 'partial') {
+      const cellWord = cells === 1 ? 'CELL' : 'CELLS';
+      const impactText = cells > 0 ? `−${cells} ${cellWord}` : cooled > 0 ? `${cooled} COOLED` : 'EDGE HIT';
+      const main = `◐ PARTIAL HIT  ${impactText}  •  +${pts} PTS`;
+      this._showCenterBanner('is-partial', main, 'Adjust closer to the active fire head next pass', OUTCOME_DISPLAY_MS);
+      this._triggerEdgeFlash('is-partial', 560);
+    } else {
+      const missType = String(outcomeObj.missType || 'none').toLowerCase();
+      const distM = Number.isFinite(outcomeObj.missDistM) ? Math.round(outcomeObj.missDistM) : 0;
+      const dir = outcomeObj.missDirCompass ? String(outcomeObj.missDirCompass).toUpperCase() : '';
+      const loc = distM > 0 && dir
+        ? ` (${distM}m ${dir})`
+        : distM > 0
+          ? ` (${distM}m)`
+          : '';
 
-    this._toastAnchor = el('div', 'ef-toast-anchor');
-    scoreCluster.appendChild(this._toastAnchor);
+      let headline = `✕ DROP MISSED — OFF TARGET${loc}`;
+      let hint = 'Wait for green ON TARGET ground lock before dropping';
+      if (missType === 'overshot' || missType === 'overshoot') {
+        headline = `✕ DROP MISSED — OVERSHOT FIRE HEAD${loc}`;
+        hint = 'Release a beat earlier on your next pass';
+      } else if (missType === 'short') {
+        headline = `✕ DROP MISSED — SHORT OF FIRE HEAD${loc}`;
+        hint = 'Hold release a beat longer over the flames';
+      } else if (missType === 'wide') {
+        headline = `✕ DROP MISSED — WIDE OF FIRE HEAD${loc}`;
+        hint = 'Lead slightly upwind to compensate for drift';
+      }
+      this._showCenterBanner('is-miss', headline, hint, OUTCOME_DISPLAY_MS);
+      this._triggerEdgeFlash('is-miss', 520);
+    }
+  }
 
-    bar.appendChild(scoreCluster);
-    this._root.appendChild(bar);
+  /**
+   * Convenience passthrough to plot a lingering 6.5s Hit/Partial/Miss marker on the Tactical Map.
+   */
+  recordDropImpact(x, z, outcome, cellsExtinguished = 0) {
+    if (this._tacticalMap) {
+      this._tacticalMap.recordDropImpact(x, z, outcome, cellsExtinguished);
+    }
+  }
+
+  /**
+   * Triggers brief red damage flash + tree strike caution toast when the plane takes hull damage.
+   */
+  showDamageFlash(damage = 30, hp = 70) {
+    const safeHp = Math.max(0, Math.round(hp));
+    const dmg = Math.max(0, Math.round(damage));
+    this._triggerEdgeFlash('is-damage', 680);
+    if (safeHp > 0) {
+      this._showCenterBanner(
+        'is-damage',
+        `⚠ TREE STRIKE  −${dmg}% HULL  •  INTEGRITY ${safeHp}%`,
+        'Pull up — clear the alpine treetops!',
+        2000
+      );
+    }
+  }
+
+  /**
+   * Shows or updates the non-blocking crash respawn banner.
+   */
+  showCrashOverlay({ reason = 'terrain', crashTimer = 3.5, maxTimer = 3.5 } = {}) {
+    const r = String(reason || 'terrain').toLowerCase();
+    const label = r.includes('tree') ? 'TREE STRIKE' : 'TERRAIN IMPACT';
+    const rem = Math.max(0, Number.isFinite(crashTimer) ? crashTimer : 0);
+    const pct = Math.max(0, Math.min(100, (1 - rem / Math.max(0.1, maxTimer)) * 100));
+    this._crashTitleEl.textContent = `AIRFRAME LOST — ${label}`;
+    this._crashSubEl.textContent = `RESERVE TANKER INBOUND IN ${rem.toFixed(1)}S`;
+    this._crashFillEl.style.width = `${pct.toFixed(1)}%`;
+    this._crashEl.classList.remove('ef-hidden');
+  }
+
+  /**
+   * Updates the auto-hiding VHF Aviation Radio Comms strip.
+   * Shown ONLY while a transmission is active, then fades smoothly out ~2.5s after ending.
+   */
+  pushRadioTranscript({ speaker, freq, text, urgency, category, active = true, id, durationMs } = {}) {
+    if (!this._radioEl) return;
+
+    const accentClass = resolveRadioAccent(urgency, category);
+    const isActive = active !== false;
+
+    if (this._radioHideTimer) {
+      clearTimeout(this._radioHideTimer);
+      this._radioHideTimer = null;
+    }
+    if (this._radioSafetyTimer) {
+      clearTimeout(this._radioSafetyTimer);
+      this._radioSafetyTimer = null;
+    }
+
+    // Check if updating an existing active transmission by id (e.g. end event active: false)
+    if (id && this._radioEntries.length > 0 && this._radioEntries[0].id === id) {
+      this._radioEntries[0].active = isActive;
+      if (text) this._radioEntries[0].text = String(text);
+    } else if (text) {
+      const entry = {
+        id: id || `tx-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        speaker: speaker ? String(speaker).toUpperCase() : 'AIR ATTACK 1',
+        freq: formatFreq(freq),
+        text: String(text),
+        accentClass,
+        active: isActive,
+      };
+      this._radioEntries.unshift(entry);
+      if (this._radioEntries.length > 2) {
+        this._radioEntries.length = 2;
+      }
+    }
+
+    if (freq) {
+      this._radioFreqEl.textContent = formatFreq(freq);
+    } else if (this._radioEntries[0]) {
+      this._radioFreqEl.textContent = this._radioEntries[0].freq;
+    }
+
+    this._radioEl.classList.remove('is-hidden', 'is-urgent', 'is-direct', 'is-warn', 'is-info', 'is-neutral');
+    const topAccent = this._radioEntries[0] ? this._radioEntries[0].accentClass : accentClass;
+    this._radioEl.classList.add(topAccent);
+    this._radioTxEl.classList.toggle('is-active', isActive);
+    this._radioTxLabel.textContent = isActive ? 'TX' : 'END';
+
+    this._renderRadioFeed();
+
+    if (isActive) {
+      // Safety auto-end in case caller sends only active:true without a closing event
+      const maxWait = Math.max(3200, Math.min(9000, Number(durationMs) || RADIO_SAFETY_END_MS));
+      this._radioSafetyTimer = setTimeout(() => {
+        this._radioSafetyTimer = null;
+        this._radioTxEl.classList.remove('is-active');
+        this._radioTxLabel.textContent = 'END';
+        this._scheduleRadioFadeOut();
+      }, maxWait);
+    } else {
+      this._scheduleRadioFadeOut();
+    }
+  }
+
+  _scheduleRadioFadeOut() {
+    if (this._radioHideTimer) clearTimeout(this._radioHideTimer);
+    this._radioHideTimer = setTimeout(() => {
+      this._radioHideTimer = null;
+      this._radioEl.classList.add('is-hidden');
+      this._radioTxEl.classList.remove('is-active');
+    }, RADIO_LINGER_MS);
+  }
+
+  _renderRadioFeed() {
+    this._radioFeedEl.replaceChildren();
+    for (let i = 0; i < this._radioEntries.length; i++) {
+      const entry = this._radioEntries[i];
+      const line = el('div', `ef-radio-line ${entry.accentClass}${i > 0 ? ' is-prev' : ''}`);
+      line.appendChild(el('span', 'ef-radio-speaker', `[${entry.speaker}] `));
+      line.appendChild(el('span', 'ef-radio-text', entry.text));
+      this._radioFeedEl.appendChild(line);
+    }
   }
 
   _spawnScoreToast(ev) {
@@ -504,6 +785,37 @@ export class HudController {
     this._toastTimers.add(timer);
   }
 
+  _isTouchUiActive() {
+    if (typeof document !== 'undefined' && document.body && document.body.classList.contains('touch-active')) {
+      return true;
+    }
+    if (typeof window !== 'undefined') {
+      if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) return true;
+      if (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0) return true;
+    }
+    return false;
+  }
+
+  _setJitHint(variant, text, showDot = false) {
+    this._jitPillEl.classList.remove(
+      'is-hidden',
+      'is-demo',
+      'is-locked',
+      'is-empty',
+      'is-scoop',
+      'is-warn',
+      'is-controls',
+      'is-danger'
+    );
+    if (!variant || !text) {
+      this._jitPillEl.classList.add('is-hidden');
+      return;
+    }
+    this._jitPillEl.classList.add(variant);
+    this._jitDotEl.classList.toggle('ef-hidden', !showDot);
+    this._jitTextEl.textContent = text;
+  }
+
   update({
     aircraft,
     fireSnapshot,
@@ -514,67 +826,56 @@ export class HudController {
     projectFn,
     remotePlanes,
     settings,
+    dropPreview,
   } = {}) {
-    // 1. Top Bar Status & Pilot Count
-    const mode = (netState && netState.mode) || 'solo';
-    const status = (netState && netState.status) || 'solo';
-    const isMp = mode === 'mp' || mode === 'loopback';
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
-    this._statusPill.classList.remove('status-host', 'status-syncing', 'status-offline');
+    // 1. Compact Top-Left Operation & Shared Live Airspace Pill
+    const status = (netState && netState.status) || 'live';
+    const pilotsCount = Math.max(1, netState && typeof netState.pilotsCount === 'number' ? netState.pilotsCount : 1);
+    const pilotsCap = (netState && netState.pilotsCap) || 100;
+
+    this._airspacePill.classList.remove('status-host', 'status-syncing', 'status-offline');
     if (status === 'host') {
-      this._statusPill.classList.add('status-host');
-      this._statusText.textContent = 'COMMAND HOST';
+      this._airspacePill.classList.add('status-host');
+      this._airspaceText.textContent = `LIVE · ${pilotsCount}/${pilotsCap}`;
     } else if (status === 'syncing') {
-      this._statusPill.classList.add('status-syncing');
-      this._statusText.textContent = 'SYNCING COMMAND...';
+      this._airspacePill.classList.add('status-syncing');
+      this._airspaceText.textContent = `SYNCING · ${pilotsCount}/${pilotsCap}`;
     } else if (status === 'offline') {
-      this._statusPill.classList.add('status-offline');
-      this._statusText.textContent = 'OFFLINE SOLO';
+      this._airspacePill.classList.add('status-offline');
+      this._airspaceText.textContent = 'RECONNECTING';
     } else {
-      this._statusText.textContent = 'LIVE SIMULATION';
+      this._airspaceText.textContent = `LIVE · ${pilotsCount}/${pilotsCap}`;
     }
 
-    if (isMp) {
-      this._pilotsPill.classList.remove('ef-hidden');
-      const count = netState.pilotsCount ?? 1;
-      const cap = netState.pilotsCap ?? 100;
-      this._pilotsPill.textContent = `PILOTS ${count}/${cap}`;
-    } else {
-      this._pilotsPill.classList.add('ef-hidden');
-    }
-
-    // 2. Operation Briefing Card
     if (opConfig) {
-      const wave = (fireSnapshot && fireSnapshot.wave) || 1;
-      if (opConfig.mode === 'megabasin' || isMp) {
-        this._opCodeEl.textContent = `MEGA-BASIN · WAVE ${String(wave).padStart(2, '0')}`;
-      } else {
-        const idx = String(opConfig.index || 1).padStart(2, '0');
-        const tot = String(opConfig.total || 5).padStart(2, '0');
-        this._opCodeEl.textContent = `OPERATION ${idx} / ${tot}`;
-      }
+      const idx = String(opConfig.index || 1).padStart(2, '0');
+      const tot = String(opConfig.total || 5).padStart(2, '0');
+      this._opCodeEl.textContent = `OP ${idx}/${tot}`;
       this._opTitleEl.textContent = opConfig.name || 'Cinderpine Basin';
-      this._opSubtitleEl.textContent = opConfig.subtitle || '';
     }
 
     if (fireSnapshot) {
       const alive = fireSnapshot.cabinsAlive ?? 0;
       const total = fireSnapshot.cabinsTotal ?? 0;
       const hasRisk = Boolean(fireSnapshot.atRiskTarget);
-      this._opCabinsEl.textContent = `${alive} / ${total}`;
+      this._opCabinsEl.textContent = `${alive}/${total}`;
       this._opCabinsEl.classList.toggle('is-risk', hasRisk);
 
       const burnPct = Number.isFinite(fireSnapshot.burningPct) ? fireSnapshot.burningPct : 0;
       this._opBurningEl.textContent = `${burnPct.toFixed(1)}%`;
 
-      // Live countdown update if intermission overlay is currently shown
+      const scoreVal = Math.max(0, Math.floor(fireSnapshot.missionScore || 0));
+      this._missionScoreValEl.textContent = String(scoreVal).padStart(6, '0');
+
       if (this._overlayType === 'intermission' && this._overlayCountdownEl) {
         const secs = Math.max(0, Math.ceil(fireSnapshot.intermissionTimer || 0));
-        this._overlayCountdownEl.textContent = `NEXT WAVE IN ${secs}S`;
+        this._overlayCountdownEl.textContent = `NEXT OPERATION IN ${secs}S`;
       }
     }
 
-    // 3. Compass Ribbon
+    // 2. Slim Compass Ribbon
     if (aircraft) {
       const hdg = normalizeDeg(aircraft.yawDeg || 0);
       const winHalf = (this._compassWindow.clientWidth || COMPASS_BASE_WIDTH) * 0.5;
@@ -584,7 +885,7 @@ export class HudController {
       this._compassReadout.textContent = `${String(displayHdg).padStart(3, '0')}°`;
     }
 
-    // 4. Wind Vector Card (aircraft-relative: windHeadingDeg - planeHeadingDeg, UP = tailwind)
+    // 3. Compact Wind Vector Chip
     if (fireSnapshot) {
       const windDeg = fireSnapshot.windDirDeg ?? 90;
       const windKt = fireSnapshot.windSpeedKt ?? 12;
@@ -600,14 +901,25 @@ export class HudController {
       this._windValEl.textContent = `${degToCardinal16(windDeg)} ${Math.round(windKt)} KT`;
     }
 
-    // 5. Flight Telemetry Card
+    // 4. Compact Flight Telemetry (SPD, ALT, TANK, HULL) + Crash Overlay + JIT Contextual Hint
     if (aircraft) {
-      this._telemBadgeEl.classList.remove('is-releasing', 'is-scoop');
-      if (aircraft.scooping) {
-        this._telemBadgeEl.textContent = 'SCOOP ACTIVE';
+      // Detect transition from Demo Flight -> Manual Flight to trigger brief 8s control hint
+      const isAuto = Boolean(aircraft.autopilot);
+      if (this._wasAutopilot && !isAuto) {
+        this._manualHintUntilMs = nowMs + MANUAL_HINT_DURATION_MS;
+      }
+      this._wasAutopilot = isAuto;
+
+      // Badge state
+      this._telemBadgeEl.classList.remove('is-releasing', 'is-scoop', 'is-crashed');
+      if (aircraft.crashed) {
+        this._telemBadgeEl.textContent = 'DOWN';
+        this._telemBadgeEl.classList.add('is-crashed');
+      } else if (aircraft.scooping) {
+        this._telemBadgeEl.textContent = 'SCOOPING';
         this._telemBadgeEl.classList.add('is-scoop');
       } else if (aircraft.releasing) {
-        this._telemBadgeEl.textContent = 'RELEASING';
+        this._telemBadgeEl.textContent = 'DROPPING';
         this._telemBadgeEl.classList.add('is-releasing');
       } else {
         const slotId =
@@ -620,6 +932,7 @@ export class HudController {
           slotId !== null ? `EF-${String(slotId).padStart(2, '0')}` : 'EF-07';
       }
 
+      // Airspeed & AGL
       const spd = Math.max(0, Math.round(aircraft.speedKmh || 0));
       this._airspeedValEl.textContent = String(spd);
       this._airspeedValEl.classList.toggle('is-warn', Boolean(aircraft.stallWarn));
@@ -627,73 +940,115 @@ export class HudController {
       const agl = Math.max(0, Math.round(aircraft.agl || 0));
       this._altitudeValEl.textContent = String(agl).padStart(3, '0');
       this._altitudeValEl.classList.toggle('is-scoop', Boolean(aircraft.scooping));
-      this._altitudeValEl.classList.toggle('is-warn', (aircraft.bounceTimer || 0) > 0);
+      this._altitudeValEl.classList.toggle('is-warn', agl < 14 && !aircraft.scooping && !aircraft.crashed);
 
-      const tank = Math.max(0, Math.min(100, aircraft.tankPct || 0));
+      // Tank bar
+      const tank = Math.max(0, Math.min(100, aircraft.tankPct ?? 0));
       this._tankPctEl.textContent = `${Math.round(tank)}%`;
-      const filled = Math.round(tank / 5);
+      const tankFilled = Math.round((tank / 100) * BAR_SEGMENTS);
       this._tankBarEl.classList.toggle('is-releasing', Boolean(aircraft.releasing));
       this._tankBarEl.classList.toggle('is-scoop', Boolean(aircraft.scooping));
-      for (let i = 0; i < 20; i++) {
-        this._tankSegments[i].classList.toggle('is-filled', i < filled);
+      this._tankBarEl.classList.toggle('is-empty', tank <= 0.5);
+      for (let i = 0; i < BAR_SEGMENTS; i++) {
+        this._tankSegments[i].classList.toggle('is-filled', i < tankFilled);
       }
 
-      // 6. Demo Flight & Center Notices
-      this._demoBannerEl.classList.toggle('ef-hidden', !aircraft.autopilot);
-      this._boundaryNoticeEl.classList.toggle('ef-hidden', !aircraft.outOfBounds);
+      // Hull integrity bar (emerald >=60% -> amber <60% -> flashing red <30%)
+      const maxHp = Math.max(1, aircraft.maxHp ?? 100);
+      const hpRaw = aircraft.crashed ? 0 : (aircraft.hp ?? maxHp);
+      const hullPct = Math.max(0, Math.min(100, (hpRaw / maxHp) * 100));
+
+      // Auto-trigger brief red flash if HP dropped unexpectedly without explicit showDamageFlash call
+      if (!aircraft.crashed && hullPct < this._lastHullHp - 5) {
+        this._triggerEdgeFlash('is-damage', 600);
+      }
+      this._lastHullHp = hullPct;
+
+      const hullState = hullPct < 30 ? 'is-hull-crit' : hullPct < 60 ? 'is-hull-warn' : 'is-hull-ok';
+      this._hullPctEl.textContent = `${Math.round(hullPct)}%`;
+      this._hullPctEl.classList.remove('is-hull-ok', 'is-hull-warn', 'is-hull-crit');
+      this._hullPctEl.classList.add(hullState);
+      this._hullBarEl.classList.remove('is-hull-ok', 'is-hull-warn', 'is-hull-crit');
+      this._hullBarEl.classList.add(hullState);
+
+      const hullFilled = Math.round((hullPct / 100) * BAR_SEGMENTS);
+      for (let i = 0; i < BAR_SEGMENTS; i++) {
+        this._hullSegments[i].classList.toggle('is-filled', i < hullFilled);
+      }
+
+      // Crash Respawn Overlay (auto-managed from aircraft.crashed)
+      if (aircraft.crashed) {
+        this.showCrashOverlay({
+          reason: aircraft.crashReason || 'terrain',
+          crashTimer: aircraft.crashTimer ?? 0,
+          maxTimer: 3.5,
+        });
+      } else {
+        this._crashEl.classList.add('ef-hidden');
+      }
+
+      // Single Prioritized Just-in-Time (JIT) Contextual Hint Pill
+      const queueBanner = netState && netState.queueBanner ? netState.queueBanner : null;
+      const idleCountdown = netState && netState.idleCountdown > 0 ? netState.idleCountdown : null;
+      const onTarget = Boolean(dropPreview && (dropPreview.onTarget || (dropPreview.fireCellsInTarget > 0)));
+      const isTouch = this._isTouchUiActive();
+
+      if (aircraft.crashed) {
+        this._setJitHint(null, '');
+      } else if (aircraft.outOfBounds) {
+        this._setJitHint('is-warn', 'RETURNING TO BASIN AIRSPACE');
+      } else if (queueBanner) {
+        this._setJitHint('is-warn', queueBanner);
+      } else if (idleCountdown !== null) {
+        this._setJitHint('is-warn', `IDLE — RETURNING TO DEMO FLIGHT IN ${Math.ceil(idleCountdown)}S`);
+      } else if (aircraft.autopilot) {
+        this._setJitHint(
+          'is-demo',
+          isTouch ? 'DEMO FLIGHT — Tap to take control' : 'DEMO FLIGHT — Press any key to take control',
+          true
+        );
+      } else if (aircraft.scooping) {
+        this._setJitHint('is-scoop', `≈ SCOOPING LAKE — TANK ${Math.round(tank)}%`);
+      } else if (tank <= 0.5) {
+        this._setJitHint('is-empty', '▼ TANK EMPTY — Skim the lake (< 9m AGL) to scoop water');
+      } else if (onTarget && tank > 0.5) {
+        this._setJitHint('is-locked', isTouch ? '◉ ON TARGET — TAP DROP' : '◉ ON TARGET — PRESS SPACE');
+      } else if (hullPct < 40) {
+        this._setJitHint('is-danger', '⚠ HULL LOW — CLEAR TREETOPS');
+      } else if (nowMs < this._manualHintUntilMs) {
+        this._setJitHint(
+          'is-controls',
+          isTouch
+            ? 'Left stick Steer · Right buttons Drop & Speed'
+            : 'W/S Pitch · A/D Bank · Q/E Speed · SPACE Drop'
+        );
+      } else {
+        this._setJitHint(null, '');
+      }
     }
 
-    const queueBanner = netState && netState.queueBanner ? netState.queueBanner : null;
-    if (queueBanner) {
-      this._queueNoticeEl.textContent = queueBanner;
-      this._queueNoticeEl.classList.remove('ef-hidden');
-    } else {
-      this._queueNoticeEl.classList.add('ef-hidden');
-    }
-
-    const idleCountdown = netState && netState.idleCountdown > 0 ? netState.idleCountdown : null;
-    if (idleCountdown !== null) {
-      this._idleNoticeEl.textContent = `IDLE — RETURNING TO DEMO FLIGHT IN ${Math.ceil(idleCountdown)}S`;
-      this._idleNoticeEl.classList.remove('ef-hidden');
-    } else {
-      this._idleNoticeEl.classList.add('ef-hidden');
-    }
-
-    // 7. Bottom Strip Scores & Micro-Toasts
-    const missionScore = fireSnapshot ? Math.max(0, Math.floor(fireSnapshot.missionScore || 0)) : 0;
-    this._missionScoreValEl.textContent = String(missionScore).padStart(6, '0');
-
-    if (isMp) {
-      this._personalScoreBlock.classList.remove('ef-hidden');
-      this._scoreDividerEl.classList.remove('ef-hidden');
-      const personal = Math.max(0, Math.floor(netState.personalScore || 0));
-      this._personalScoreValEl.textContent = String(personal).padStart(6, '0');
-    } else {
-      this._personalScoreBlock.classList.add('ef-hidden');
-      this._scoreDividerEl.classList.add('ef-hidden');
-    }
-
+    // 5. Score Micro-Toasts
     if (Array.isArray(scoreEvents) && scoreEvents.length > 0) {
       const localSlot = netState && typeof netState.localSlotId === 'number' ? netState.localSlotId : null;
       for (let i = 0; i < scoreEvents.length; i++) {
         const ev = scoreEvents[i];
-        if (!isMp || localSlot === null || ev.slotId === localSlot) {
+        if (localSlot === null || ev.slotId === localSlot) {
           this._spawnScoreToast(ev);
         }
       }
     }
 
-    // 8. Tactical Map
+    // 6. Tactical Map (with live drop footprint + lingering hit/miss ripples)
     if (terrain) {
-      this._tacticalMap.update({ terrain, aircraft, fireSnapshot, remotePlanes });
+      this._tacticalMap.update({ terrain, aircraft, fireSnapshot, remotePlanes, dropPreview });
     }
 
-    // 9. World Callout Pins
+    // 7. World Callout Pins
     if (terrain && projectFn) {
       this._callouts.update({ terrain, aircraft, fireSnapshot, projectFn });
     }
 
-    // 10. Drawer live state
+    // 8. Drawer live state
     this._drawer.update({ opConfig, netState, settings });
   }
 
@@ -736,7 +1091,7 @@ export class HudController {
       card.appendChild(starsRow);
 
       const stats = el('div', 'ef-overlay-stats');
-      this._appendOverlayStat(stats, 'MISSION SCORE', score);
+      this._appendOverlayStat(stats, 'SQUADRON SCORE', score);
       this._appendOverlayStat(stats, 'CABINS SAVED', `${cabinsAlive} / ${cabinsTotal}`);
       this._appendOverlayStat(stats, 'ACTIVE FIRE', '0.0%');
       card.appendChild(stats);
@@ -763,18 +1118,18 @@ export class HudController {
       const score = String(Math.max(0, Math.floor(data.missionScore || 0))).padStart(6, '0');
       const burnPct = Number.isFinite(data.burningPct) ? `${data.burningPct.toFixed(1)}%` : '—';
 
-      card.appendChild(el('div', 'ef-overlay-kicker', 'OPERATION FAILED'));
-      card.appendChild(el('h2', 'ef-overlay-heading', 'SETTLEMENT LOST'));
-      card.appendChild(el('p', 'ef-overlay-sub', `All timber cabins in ${opName} were consumed by wildfire.`));
+      card.appendChild(el('div', 'ef-overlay-kicker', 'SECTOR LOST'));
+      card.appendChild(el('h2', 'ef-overlay-heading', 'SETTLEMENT OVERRUN'));
+      card.appendChild(el('p', 'ef-overlay-sub', `All timber cabins in ${opName} were lost to wildfire.`));
 
       const stats = el('div', 'ef-overlay-stats');
-      this._appendOverlayStat(stats, 'MISSION SCORE', score);
+      this._appendOverlayStat(stats, 'SQUADRON SCORE', score);
       this._appendOverlayStat(stats, 'CABINS INTACT', `0 / ${data.cabinsTotal ?? 10}`);
       this._appendOverlayStat(stats, 'BURNING', burnPct);
       card.appendChild(stats);
 
       const actions = el('div', 'ef-overlay-actions');
-      const retryBtn = el('button', 'ef-btn-primary', 'RETRY OPERATION');
+      const retryBtn = el('button', 'ef-btn-primary', 'REDEPLOY');
       retryBtn.type = 'button';
       retryBtn.addEventListener('click', () => {
         if (this._callbacks.onReplay) this._callbacks.onReplay();
@@ -783,21 +1138,21 @@ export class HudController {
       card.appendChild(actions);
     } else if (type === 'intermission') {
       const contained = data.contained !== false;
-      const wave = data.wave || 1;
-      const countdown = Math.max(0, Math.ceil(data.intermissionTimer ?? 15));
+      const opName = data.opName || 'Active Sector';
+      const countdown = Math.max(0, Math.ceil(data.intermissionTimer ?? 12));
       const score = String(Math.max(0, Math.floor(data.missionScore || 0))).padStart(6, '0');
 
-      card.appendChild(el('div', 'ef-overlay-kicker', `CASCADIA MEGA-BASIN · WAVE ${String(wave).padStart(2, '0')}`));
       card.appendChild(
-        el('h2', 'ef-overlay-heading', contained ? 'BASIN CONTAINED' : 'BASIN OVERRUN — REGROUPING')
+        el('div', 'ef-overlay-kicker', contained ? 'FIRE CONTAINED · ADVANCING SECTOR' : 'SECTOR OVERRUN · REDEPLOYING')
       );
-      this._overlayCountdownEl = el('p', 'ef-overlay-sub', `NEXT WAVE IN ${countdown}S`);
+      card.appendChild(el('h2', 'ef-overlay-heading', opName));
+      this._overlayCountdownEl = el('p', 'ef-overlay-sub', `NEXT OPERATION IN ${countdown}S`);
       card.appendChild(this._overlayCountdownEl);
 
       const stats = el('div', 'ef-overlay-stats');
       this._appendOverlayStat(stats, 'SQUADRON SCORE', score);
-      this._appendOverlayStat(stats, 'WAVE BONUS', contained ? '+1000' : '+0');
-      this._appendOverlayStat(stats, 'CABINS INTACT', `${data.cabinsAlive ?? 0} / ${data.cabinsTotal ?? 44}`);
+      this._appendOverlayStat(stats, 'BONUS', contained ? '+1000' : '+0');
+      this._appendOverlayStat(stats, 'CABINS INTACT', `${data.cabinsAlive ?? 0} / ${data.cabinsTotal ?? 10}`);
       card.appendChild(stats);
 
       const top10 = Array.isArray(data.top10) ? data.top10 : [];
@@ -824,8 +1179,8 @@ export class HudController {
         card.appendChild(contribWrap);
       }
     } else if (type === 'offline') {
-      card.appendChild(el('div', 'ef-overlay-kicker', 'SOCKET-SAVE MODE · CONNECTION PAUSED'));
-      card.appendChild(el('h2', 'ef-overlay-heading', 'LIVE BASIN DISCONNECTED'));
+      card.appendChild(el('div', 'ef-overlay-kicker', 'AIRSPACE LINK PAUSED'));
+      card.appendChild(el('h2', 'ef-overlay-heading', 'LIVE AIRSPACE DISCONNECTED'));
       card.appendChild(
         el(
           'p',
@@ -835,7 +1190,7 @@ export class HudController {
       );
 
       const actions = el('div', 'ef-overlay-actions');
-      const resumeBtn = el('button', 'ef-btn-primary', 'RESUME LIVE BASIN');
+      const resumeBtn = el('button', 'ef-btn-primary', 'RECONNECT AIRSPACE');
       resumeBtn.type = 'button';
       resumeBtn.addEventListener('click', () => {
         if (this._callbacks.onResumeLive) this._callbacks.onResumeLive();
@@ -857,7 +1212,7 @@ export class HudController {
 
   toggleDrawer(force) {
     const open = this._drawer.toggle(force);
-    this._helpBtn.classList.toggle('is-active', open);
+    this._settingsBtn.classList.toggle('is-active', open);
     return open;
   }
 
@@ -868,8 +1223,9 @@ export class HudController {
   setAudioMuted(muted) {
     this._audioMuted = Boolean(muted);
     this._audioBtn.classList.toggle('is-muted', this._audioMuted);
-    this._audioLabel.textContent = this._audioMuted ? 'AUDIO OFF' : 'AUDIO ON';
+    this._audioBtn.setAttribute('aria-label', this._audioMuted ? 'Unmute Audio' : 'Mute Audio');
     this._audioIconWrap.replaceChildren(createSpeakerSvg(this._audioMuted));
+    this._drawer.setAudioMuted(this._audioMuted);
   }
 
   dispose() {
@@ -877,6 +1233,10 @@ export class HudController {
       clearTimeout(timer);
     }
     this._toastTimers.clear();
+    if (this._outcomeHideTimer) clearTimeout(this._outcomeHideTimer);
+    if (this._flashTimer) clearTimeout(this._flashTimer);
+    if (this._radioHideTimer) clearTimeout(this._radioHideTimer);
+    if (this._radioSafetyTimer) clearTimeout(this._radioSafetyTimer);
     this._tacticalMap.dispose();
     this._callouts.dispose();
     this._drawer.dispose();

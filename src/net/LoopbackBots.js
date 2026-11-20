@@ -33,11 +33,17 @@ export function createLoopbackSession({
   terrain,
   fireSim,
   opConfig,
+  opIndex = null,
   worldId = DEFAULT_WORLD_ID,
   callsign = 'EF-07',
   colorIdx = 0,
   onStatusChange = null,
   onScoreEvents = null,
+  onDropOutcomes = null,
+  onWorldEvents = null,
+  onOperationChange = null,
+  onOperationAdvance = null,
+  onPilotJoined = null,
   onMetaUpdate = null,
   onFireSync = null,
   useRealClock = true,
@@ -45,6 +51,7 @@ export function createLoopbackSession({
   const count = Math.max(1, Math.min(MAX_SLOTS - 1, Math.floor(botCount)));
   const hub = new MockRtdbHub({ useRealClock });
   const buildHash = getBuildHash();
+  const resolvedOpIndex = opIndex ?? opConfig?.opIndex ?? 0;
 
   const hostFireSim = new FireSim(terrain, { isMegaBasin: true });
 
@@ -54,6 +61,7 @@ export function createLoopbackSession({
     terrain,
     fireSim,
     opConfig,
+    opIndex: resolvedOpIndex,
     worldId,
     buildHash,
     callsign,
@@ -61,6 +69,11 @@ export function createLoopbackSession({
     mode: 'loopback',
     onStatusChange,
     onScoreEvents,
+    onDropOutcomes,
+    onWorldEvents,
+    onOperationChange,
+    onOperationAdvance,
+    onPilotJoined,
     onMetaUpdate,
     onFireSync,
     disableRealTimers: !useRealClock,
@@ -122,6 +135,7 @@ export function createLoopbackSession({
         colorIdx: botColor,
         connId: presence.connId,
         buildHash,
+        mapId: opConfig?.id || 'op01',
       });
       if (stopped) {
         await allocator.vacate().catch(() => {});
@@ -171,7 +185,9 @@ export function createLoopbackSession({
           terrain,
           fireSim: hostFireSim,
           epoch: 1,
+          opIndex: resolvedOpIndex,
           buildHash,
+          worldName: opConfig?.name || 'Cinderpine Basin',
           localSlotId: slotId,
           enableBackgroundTicker: false,
         });

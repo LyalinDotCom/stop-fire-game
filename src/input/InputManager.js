@@ -1,12 +1,12 @@
 /**
- * InputManager — Unified Keyboard, Gamepad API, and opt-in Mouse-Yoke input
+ * InputManager — Unified Keyboard, Gamepad API, Multi-Touch, and opt-in Mouse-Yoke input
  * for EMBER FRONT — Aerial Fire Response Unit.
  *
  * Polarity matches docs/INTERFACES.md §3 & docs/gamespec.md §2:
  *   pitch: -1 (nose down) .. +1 (nose up)  [default: W = -1, S = +1; flipped when invertPitch=true]
  *   roll:  -1 (bank left) .. +1 (bank right) [A = -1, D = +1]
- *   throttleDelta: -1 (Q / LT) .. +1 (E / RT)
- *   drop: boolean (SPACE / A / RB / Mouse-Yoke LMB)
+ *   throttleDelta: -1 (Q / LT / Touch -) .. +1 (E / RT / Touch +)
+ *   drop: boolean (SPACE / A / RB / Touch Drop / Mouse-Yoke LMB)
  *   dropJustPressed: boolean (rising edge consumed each sample())
  */
 
@@ -78,9 +78,16 @@ export class InputManager {
     this._overrideDrop = false;
     this._overrideDropTimer = 0;
 
+    // Multi-touch flight control inputs (driven by TouchControls)
+    this._touchPitch = 0;
+    this._touchBank = 0;
+    this._touchThrottle = 0;
+    this._touchDrop = false;
+
     this._handleKeyDown = this._handleKeyDown.bind(this);
     this._handleKeyUp = this._handleKeyUp.bind(this);
     this._handleBlur = this._handleBlur.bind(this);
+    this._handleVisibilityChange = this._handleVisibilityChange.bind(this);
     this._handlePointerDown = this._handlePointerDown.bind(this);
     this._handlePointerUp = this._handlePointerUp.bind(this);
     this._handlePointerMove = this._handlePointerMove.bind(this);
@@ -89,14 +96,26 @@ export class InputManager {
     window.addEventListener('keydown', this._handleKeyDown, { passive: false });
     window.addEventListener('keyup', this._handleKeyUp);
     window.addEventListener('blur', this._handleBlur);
+    document.addEventListener('visibilitychange', this._handleVisibilityChange);
     window.addEventListener('pointerdown', this._handlePointerDown, { passive: true });
     window.addEventListener('pointerup', this._handlePointerUp, { passive: true });
     window.addEventListener('pointermove', this._handlePointerMove, { passive: true });
     document.addEventListener('pointerleave', this._handlePointerLeave);
   }
 
-  setOptions({ invertPitch, mouseYoke, drawerOpen } = {}) {
-    if (typeof invertPitch === 'boolean') this._invertPitch = invertPitch;
+  _clearTouchState() {
+    this._touchPitch = 0;
+    this._touchBank = 0;
+    this._touchThrottle = 0;
+    this._touchDrop = false;
+  }
+
+  setOptions({ invertPitch, invertY, mouseYoke, drawerOpen } = {}) {
+    if (typeof invertPitch === 'boolean') {
+      this._invertPitch = invertPitch;
+    } else if (typeof invertY === 'boolean') {
+      this._invertPitch = invertY;
+    }
     if (typeof mouseYoke === 'boolean') {
       this._mouseYoke = mouseYoke;
       if (!mouseYoke) this._mouseDown = false;
@@ -106,6 +125,7 @@ export class InputManager {
       if (drawerOpen) {
         this._keys.clear();
         this._mouseDown = false;
+        this._clearTouchState();
       }
     }
   }
@@ -116,6 +136,66 @@ export class InputManager {
 
   markActivity() {
     this._lastActivityMs = performance.now();
+  }
+
+  /**
+   * Set continuous analog touch flight-yoke axes (-1..+1).
+   * pitch: -1 (thumb pushed up / nose down default) .. +1 (thumb pulled down / nose up default).
+   *        Honors invertPitch / invertY identically to keyboard & gamepad.
+   * bank:  -1 (bank left) .. +1 (bank right).
+   */
+  setTouchAxis(pitch, bank) {
+    const p = Number.isFinite(pitch) ? Math.max(-1, Math.min(1, pitch)) : 0;
+    const b = Number.isFinite(bank) ? Math.max(-1, Math.min(1, bank)) : 0;
+    this._touchPitch = p;
+    this._touchBank = b;
+    if (Math.abs(p) > 0.01 || Math.abs(b) > 0.01) {
+      this._fireFirstGesture();
+      this._lastActivityMs = performance.now();
+    }
+  }
+
+  /**
+   * Set touch throttle rocker delta (-1, 0, +1).
+   */
+  setTouchThrottle(delta) {
+    const d = Number.isFinite(delta) ? Math.max(-1, Math.min(1, delta)) : 0;
+    this._touchThrottle = d;
+    if (Math.abs(d) > 0.01) {
+      this._fireFirstGesture();
+      this._lastActivityMs = performance.now();
+    }
+  }
+
+  /**
+   * Set touch water drop active state (boolean).
+   * Fires the exact same rising edge (dropJustPressed) as pressing SPACE.
+   */
+  setTouchDrop(active) {
+    const next = Boolean(active);
+    if (next && !this._touchDrop) {
+      this._dropJustPressedPending = true;
+      this._fireFirstGesture();
+      this._lastActivityMs = performance.now();
+      if (!this._drawerOpen && this._onFlightKey) {
+        this._onFlightKey('TouchDrop');
+      }
+    } else if (next) {
+      this._lastActivityMs = performance.now();
+    }
+    this._touchDrop = next;
+  }
+
+  /**
+   * Trigger manual-control takeover from DEMO FLIGHT (same callback as pressing a flight key)
+   * and unlock audio on first user gesture.
+   */
+  triggerTakeover() {
+    this._fireFirstGesture();
+    this._lastActivityMs = performance.now();
+    if (!this._drawerOpen && this._onFlightKey) {
+      this._onFlightKey('TouchTakeover');
+    }
   }
 
   /**
@@ -193,10 +273,20 @@ export class InputManager {
   _handleBlur() {
     this._keys.clear();
     this._mouseDown = false;
+    this._clearTouchState();
+  }
+
+  _handleVisibilityChange() {
+    if (document.hidden) {
+      this._keys.clear();
+      this._mouseDown = false;
+      this._clearTouchState();
+    }
   }
 
   _handlePointerDown(e) {
     this._fireFirstGesture();
+    if (e.pointerType === 'touch') return;
     if (!this._mouseYoke || this._drawerOpen) return;
     if (e.button !== 0) return;
     // Only capture drop clicks directly on the game canvas (not HUD buttons)
@@ -210,12 +300,14 @@ export class InputManager {
   }
 
   _handlePointerUp(e) {
+    if (e.pointerType === 'touch') return;
     if (e.button === 0) {
       this._mouseDown = false;
     }
   }
 
   _handlePointerMove(e) {
+    if (e.pointerType === 'touch') return;
     if (!this._mouseYoke || this._drawerOpen) return;
     const w = window.innerWidth || 1;
     const h = window.innerHeight || 1;
@@ -230,7 +322,7 @@ export class InputManager {
   }
 
   /**
-   * Sample combined keyboard + gamepad + optional mouse-yoke state for one physics step.
+   * Sample combined keyboard + gamepad + multi-touch + optional mouse-yoke state for one physics step.
    * @param {number} [dt=1/60]
    * @returns {{ pitch: number, roll: number, throttleDelta: number, drop: boolean, dropJustPressed: boolean, anyManualInput: boolean }}
    */
@@ -275,6 +367,25 @@ export class InputManager {
         if (Math.abs(mx) > Math.abs(roll)) roll = mx;
         if (Math.abs(my) > Math.abs(pitch)) pitch = my;
         if (this._mouseDown) drop = true;
+      }
+
+      // Multi-touch virtual flight yoke, throttle rocker, and drop button
+      const touchActive =
+        Math.abs(this._touchPitch) > 0.01 ||
+        Math.abs(this._touchBank) > 0.01 ||
+        Math.abs(this._touchThrottle) > 0.01 ||
+        this._touchDrop;
+      if (touchActive) {
+        this._lastActivityMs = performance.now();
+        const tBank = this._touchBank;
+        let tPitch = this._touchPitch;
+        if (this._invertPitch) tPitch = -tPitch;
+        if (Math.abs(tBank) > Math.abs(roll)) roll = tBank;
+        if (Math.abs(tPitch) > Math.abs(pitch)) pitch = tPitch;
+        if (Math.abs(this._touchThrottle) > Math.abs(throttleDelta)) {
+          throttleDelta = this._touchThrottle;
+        }
+        if (this._touchDrop) drop = true;
       }
 
       // Gamepad API (standard mapping: left stick axes 0/1, LT btn 6, RT btn 7, A btn 0, RB btn 5)
@@ -344,10 +455,12 @@ export class InputManager {
     window.removeEventListener('keydown', this._handleKeyDown);
     window.removeEventListener('keyup', this._handleKeyUp);
     window.removeEventListener('blur', this._handleBlur);
+    document.removeEventListener('visibilitychange', this._handleVisibilityChange);
     window.removeEventListener('pointerdown', this._handlePointerDown);
     window.removeEventListener('pointerup', this._handlePointerUp);
     window.removeEventListener('pointermove', this._handlePointerMove);
     document.removeEventListener('pointerleave', this._handlePointerLeave);
     this._keys.clear();
+    this._clearTouchState();
   }
 }

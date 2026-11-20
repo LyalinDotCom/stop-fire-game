@@ -125,10 +125,7 @@ export function parseNetQuery(search = globalThis.location?.search ?? '') {
     }
   }
 
-  const rawMode = (params.get('mode') ?? '').trim().toLowerCase();
-  const mode = loopback > 0
-    ? 'loopback'
-    : (rawMode === 'mp' || rawMode === 'megabasin' ? 'mp' : (rawMode === 'solo' ? 'solo' : null));
+  const mode = loopback > 0 ? 'loopback' : 'mp';
 
   return {
     emu,

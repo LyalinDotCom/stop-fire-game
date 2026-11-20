@@ -82,31 +82,52 @@ async function main() {
         slotId: claim.slotId, x: 0, y: 60, z: 0, yawDeg: 0, pitchDeg: 0, rollDeg: 0, speedKmh: 158, tankPct: 100,
       }]);
       await adapter.set(`worlds/${WORLD_ID}/planes`, { e: ep, q: 1, t: adapter.serverTimestamp(), p: pStr });
+      const oldRing = await adapter.get(`worlds/${WORLD_ID}/fireRing/1`).catch(() => null);
+      const ringQ = oldRing && oldRing.e === ep ? (oldRing.q + 16) : 1;
       await adapter.set(`worlds/${WORLD_ID}/fireRing/1`, {
-        e: ep, q: 1, t: adapter.serverTimestamp(),
-        d: encodeFireDelta({ windDirDeg: 90, windSpeedKt: 12, missionScore: 0, wave: 1 }),
+        e: ep, q: ringQ, t: adapter.serverTimestamp(),
+        d: encodeFireDelta({
+          windDirDeg: 90,
+          windSpeedKt: 12,
+          missionScore: 0,
+          wave: 1,
+          opIndex: 0,
+          dropOutcomes: [{
+            slotId: claim.slotId,
+            impactX: 100,
+            impactZ: -50,
+            cellsExtinguished: 5,
+            cellsCooled: 2,
+            pointsAwarded: 350,
+            outcome: 'direct',
+            missType: 'none',
+            missDirCompass: '',
+            missDistM: 0,
+            cabinSaved: false,
+          }],
+        }),
       });
 
       const oldKey = await adapter.get(`worlds/${WORLD_ID}/fireKey`).catch(() => null);
-      if (!oldKey || adapter.now() - (oldKey.t || 0) >= 4500) {
+      if (!oldKey || ep > (oldKey.e || 0) || adapter.now() - (oldKey.t || 0) >= 4500) {
         await adapter.set(`worlds/${WORLD_ID}/fireKey`, {
-          e: ep, q: 1, t: adapter.serverTimestamp(),
-          d: encodeFireKey({ gridSize: 4, cells: new Uint8Array(16), cabinHp: new Uint8Array(1), windDirDeg: 90, windSpeedKt: 12, wave: 1, missionScore: 0 }),
+          e: ep, q: ringQ, t: adapter.serverTimestamp(),
+          d: encodeFireKey({ gridSize: 4, cells: new Uint8Array(16), cabinHp: new Uint8Array(1), windDirDeg: 90, windSpeedKt: 12, wave: 1, opIndex: 0, missionScore: 0 }),
         });
       }
 
       const oldMeta = await adapter.get(`worlds/${WORLD_ID}/meta`).catch(() => null);
-      if (!oldMeta || adapter.now() - (oldMeta.t || 0) >= 1000) {
+      if (!oldMeta || ep > (oldMeta.e || 0) || adapter.now() - (oldMeta.t || 0) >= 1000) {
         await adapter.set(`worlds/${WORLD_ID}/meta`, {
           e: ep, t: adapter.serverTimestamp(),
-          d: encodeMeta({ wave: 1, missionScore: 0, burningPct: 0, cabinsAlive: 1, cabinsTotal: 1, status: 'active', pilotsCount: 1, top10: [] }),
+          d: encodeMeta({ wave: 1, opIndex: 0, missionScore: 0, burningPct: 0, cabinsAlive: 1, cabinsTotal: 1, status: 'active', pilotsCount: 1, top10: [] }),
         });
       }
 
       const oldIdx = await adapter.get(`worldsIndex/${WORLD_ID}`).catch(() => null);
       if (cfg && (!oldIdx || adapter.now() - (oldIdx.updatedAt || 0) >= 5500)) {
         await adapter.set(`worldsIndex/${WORLD_ID}`, {
-          name: 'Cascadia Mega-Basin',
+          name: 'Cinderpine Basin',
           mode: 'megabasin',
           players: 1,
           cap: cfg.cap,

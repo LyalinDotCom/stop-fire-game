@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { MEGA_BASIN_OP } from '../src/config/operations.js';
+import { MEGA_BASIN_OP, OPERATIONS } from '../src/config/operations.js';
 import { FireSim } from '../src/sim/FireSim.js';
 import { generateTerrain } from '../src/sim/TerrainGen.js';
 
@@ -1133,4 +1133,328 @@ test('Audit #9: LoopbackBots rapid stop() during async boot leaks 0 bots and 0 h
 
   assert.equal(loopback.bots.length, 0, 'rapid stop() mid-boot must leak 0 bots');
   assert.equal(loopback.hub._listeners.size, 0, 'rapid stop() mid-boot must leak 0 hub listeners');
+});
+
+// ============================================================================
+// 8. LIVE OPERATION ROLLOVER, DROP OUTCOME SYNC, CRASH RESPAWN & FAILOVER RULES
+// ============================================================================
+test('Live MP wire codecs: dropOutcomes + opIndex round-trip strictly within RTDB caps', () => {
+  const outcomes = [
+    {
+      slotId: 7,
+      impactX: 342,
+      impactZ: -128,
+      cellsExtinguished: 14,
+      cellsCooled: 6,
+      pointsAwarded: 980,
+      outcome: 'direct',
+      missType: 'none',
+      missDirCompass: '',
+      missDistM: 0,
+      cabinSaved: true,
+    },
+    {
+      slotId: 12,
+      impactX: -210,
+      impactZ: 88,
+      cellsExtinguished: 2,
+      cellsCooled: 4,
+      pointsAwarded: 140,
+      outcome: 'partial',
+      missType: 'short',
+      missDirCompass: 'NE',
+      missDistM: 42,
+      cabinSaved: false,
+    },
+    {
+      slotId: 33,
+      impactX: 500,
+      impactZ: 220,
+      cellsExtinguished: 0,
+      cellsCooled: 0,
+      pointsAwarded: 0,
+      outcome: 'miss',
+      missType: 'overshot',
+      missDirCompass: 'SW',
+      missDistM: 118,
+      cabinSaved: false,
+    },
+  ];
+
+  const deltaWire = encodeFireDelta({
+    windDirDeg: 90,
+    windSpeedKt: 12,
+    changedCells: [{ idx: 420, state: 13, phase: 4 }],
+    dropOutcomes: outcomes,
+    missionScore: 5400,
+    wave: 1,
+    opIndex: 3,
+    status: 'active',
+  });
+  assert.ok(deltaWire.length <= 2048);
+  const decDelta = decodeFireDelta(deltaWire);
+  assert.equal(decDelta.opIndex, 3);
+  assert.equal(decDelta.dropOutcomes.length, 3);
+  assert.deepEqual(decDelta.dropOutcomes[0], outcomes[0]);
+  assert.deepEqual(decDelta.dropOutcomes[1], outcomes[1]);
+  assert.deepEqual(decDelta.dropOutcomes[2], outcomes[2]);
+
+  const keyWire = encodeFireKey({
+    gridSize: 128,
+    cells: new Uint8Array(128 * 128),
+    cabinHp: new Uint8Array(10).fill(100),
+    windDirDeg: 45,
+    windSpeedKt: 14,
+    wave: 1,
+    opIndex: 2,
+    missionScore: 1200,
+    status: 'active',
+    intermissionTimer: 0,
+    slotScores: new Map([[7, 1200]]),
+  });
+  assert.ok(keyWire.length <= 12288);
+  const decKey = decodeFireKey(keyWire);
+  assert.equal(decKey.opIndex, 2);
+  assert.equal(decKey.gridSize, 128);
+
+  const metaWire = encodeMeta({
+    wave: 1,
+    opIndex: 4,
+    missionScore: 9900,
+    burningPct: 3.4,
+    cabinsAlive: 9,
+    cabinsTotal: 10,
+    status: 'active',
+    intermissionTimer: 0,
+    pilotsCount: 4,
+    top10: [{ slotId: 7, score: 9900 }],
+  });
+  assert.ok(metaWire.length <= 1024);
+  const decMeta = decodeMeta(metaWire);
+  assert.equal(decMeta.opIndex, 4);
+  assert.equal(decMeta.pilotsCount, 4);
+});
+
+test('Live shared Operation 01->02 rollover, dropOutcome sync, and new-joiner detection', async () => {
+  const op0 = OPERATIONS[0];
+  const op1 = OPERATIONS[1];
+  let hostTerrain = generateTerrain(op0);
+  let hostSim = new FireSim(hostTerrain, { isMegaBasin: false });
+  let repTerrain = generateTerrain(op0);
+  let repSim = new FireSim(repTerrain, { isMegaBasin: false });
+
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const hostAdapter = hub.createClient('op-host');
+  const repAdapter = hub.createClient('op-rep');
+  const lateAdapter = hub.createClient('op-late');
+
+  const repOutcomes = [];
+  const repJoinedPilots = [];
+  const repEventsOrder = [];
+
+  const hostSess = new WorldSession({
+    adapter: hostAdapter,
+    terrain: hostTerrain,
+    fireSim: hostSim,
+    opConfig: op0,
+    worldId: WORLD_ID,
+    buildHash: BUILD_HASH,
+    callsign: 'HOST-01',
+    colorIdx: 0,
+    disableRealTimers: true,
+  });
+
+  const repSess = new WorldSession({
+    adapter: repAdapter,
+    terrain: repTerrain,
+    fireSim: repSim,
+    opConfig: op0,
+    worldId: WORLD_ID,
+    buildHash: BUILD_HASH,
+    callsign: 'REP-02',
+    colorIdx: 1,
+    disableRealTimers: true,
+    onDropOutcomes: (list) => repOutcomes.push(...list),
+    onPilotJoined: (p) => repJoinedPilots.push(p),
+    onOperationChange: (nextIdx) => {
+      repEventsOrder.push(`opChange:${nextIdx}`);
+      const nextOp = OPERATIONS[nextIdx];
+      repTerrain = generateTerrain(nextOp);
+      repSim = new FireSim(repTerrain, { isMegaBasin: false });
+      repSess.setWorld({ terrain: repTerrain, fireSim: repSim, opConfig: nextOp, opIndex: nextIdx, publishNow: false });
+    },
+    onFireSync: ({ full }) => {
+      if (full) repEventsOrder.push(`fireKey:${repSess.opIndex}`);
+    },
+  });
+
+  await hostSess.start();
+  await hostSess.requestManualControl();
+  await new Promise((r) => setTimeout(r, 10));
+  await repSess.start();
+  await repSess.requestManualControl();
+  await new Promise((r) => setTimeout(r, 10));
+
+  // Initial roster already had HOST-01; REP-02 joining itself must NOT fire onPilotJoined.
+  assert.equal(repJoinedPilots.length, 0, 'initial roster and self must not trigger mp_join');
+
+  // Latecomer joins -> triggers onPilotJoined on replica!
+  const lateSess = new WorldSession({
+    adapter: lateAdapter,
+    terrain: generateTerrain(op0),
+    fireSim: new FireSim(generateTerrain(op0), { isMegaBasin: false }),
+    opConfig: op0,
+    worldId: WORLD_ID,
+    buildHash: BUILD_HASH,
+    callsign: 'WING-03',
+    colorIdx: 5,
+    disableRealTimers: true,
+  });
+  await lateSess.start();
+  await lateSess.requestManualControl();
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(repJoinedPilots.length, 1, 'new joiner must trigger onPilotJoined once');
+  assert.equal(repJoinedPilots[0].name, 'WING-03');
+
+  // Inject a drop outcome on Host and step so fireRing publishes it -> Replica receives it!
+  hostSess.host._pendingDropOutcomes.push({
+    slotId: repSess.localSlotId,
+    impactX: 120,
+    impactZ: -45,
+    cellsExtinguished: 9,
+    cellsCooled: 3,
+    pointsAwarded: 630,
+    outcome: 'direct',
+    missType: 'none',
+    missDirCompass: '',
+    missDistM: 0,
+    cabinSaved: false,
+  });
+  hub.advanceTime(600);
+  hostSess.step(0.1, hub.now());
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(repOutcomes.length, 1, 'Replica must receive synced dropOutcomes from fireRing');
+  assert.equal(repOutcomes[0].outcome, 'direct');
+  assert.equal(repOutcomes[0].cellsExtinguished, 9);
+
+  // Host rolls Operation 0 -> Operation 1 via setWorld!
+  hub.advanceTime(5000);
+  hostTerrain = generateTerrain(op1);
+  hostSim = new FireSim(hostTerrain, { isMegaBasin: false });
+  hostSess.setWorld({ terrain: hostTerrain, fireSim: hostSim, opConfig: op1, opIndex: 1 });
+  for (let i = 0; i < 15; i++) {
+    hub.advanceTime(200);
+    hostSess.step(0.1, hub.now());
+    repSess.step(0.1, hub.now());
+    await new Promise((r) => setTimeout(r, 5));
+  }
+
+  assert.equal(repSess.opIndex, 1, 'Replica must sync to Operation 02 (opIndex 1)');
+  const opChangeIdx = repEventsOrder.indexOf('opChange:1');
+  const fireKeyIdx = repEventsOrder.indexOf('fireKey:1');
+  assert.ok(opChangeIdx >= 0 && fireKeyIdx > opChangeIdx, `onOperationChange must fire before onFireKey (${repEventsOrder.join(', ')})`);
+
+  await lateSess.stop();
+  await repSess.stop();
+  await hostSess.stop();
+});
+
+test('Remote pilot crash/respawn preserves slot, zeroes tank while crashed, and snaps on respawn', async () => {
+  const op0 = OPERATIONS[0];
+  const terrain = generateTerrain(op0);
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const { host } = await bootstrapWorld(hub, 'host-1');
+  const { client: p1, conn: p1Conn } = await seatClient(hub, 'crash-pilot', 4, 'ConnCrash001');
+
+  const sim = new FireSim(terrain, { isMegaBasin: false });
+  const hb = new HostBroadcaster(host, WORLD_ID, {
+    terrain, fireSim: sim, epoch: 1, opIndex: 0, buildHash: BUILD_HASH, localSlotId: 0, enableBackgroundTicker: false,
+  });
+  await hb.start();
+
+  // Normal flight at (0, 60, 0)
+  await p1.set(`worlds/${WORLD_ID}/in/crash-pilot`, {
+    s: 1, t: p1.serverTimestamp(), c: p1Conn,
+    d: encodeInput({ x: 0, y: 60, z: 0, yawDeg: 90, pitchDeg: 0, rollDeg: 0, speedKmh: 158, releasing: false }, 0),
+  });
+  hb.step(0.1);
+  assert.equal(hb.getPilotTank(4), 100);
+
+  // Pilot crashes -> WorldSession sends speedKmh = 0 heartbeat
+  hub.advanceTime(250);
+  await p1.set(`worlds/${WORLD_ID}/in/crash-pilot`, {
+    s: 2, t: p1.serverTimestamp(), c: p1Conn,
+    d: encodeInput({ x: 5, y: 20, z: 0, yawDeg: 90, pitchDeg: -20, rollDeg: 0, speedKmh: 0, releasing: false, crashed: true }, 0),
+  });
+  hb.step(0.1);
+  assert.equal(hb.getPilotTank(4), 0, 'crashed pilot tank must drop to 0');
+
+  // 3.5 s later pilot respawns 700 m away on perimeter corridor -> must snap immediately!
+  hub.advanceTime(3500);
+  await p1.set(`worlds/${WORLD_ID}/in/crash-pilot`, {
+    s: 3, t: p1.serverTimestamp(), c: p1Conn,
+    d: encodeInput({ x: -700, y: 80, z: 400, yawDeg: 45, pitchDeg: 0, rollDeg: 0, speedKmh: 158, releasing: false }, 0),
+  });
+  hb.step(0.1);
+  const p = hb._pilots.get(4);
+  assert.ok(p, 'crashed pilot slot must remain active through respawn');
+  assert.ok(Math.abs(p.x - (-700)) < 1 && Math.abs(p.z - 400) < 1, `respawn must snap without teleport drag (got ${p.x}, ${p.z})`);
+  assert.equal(p.tankPct, 0, 'respawned pilot starts with 0% tank');
+  hb.stop();
+});
+
+test('Reconciled RTDB rules: fireKey/meta allow immediate failover on epoch bump while pacing same-epoch spam', async () => {
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const { host: h1 } = await bootstrapWorld(hub, 'host-1');
+  const { client: h2 } = await seatClient(hub, 'host-2', 1, 'ConnHost0002');
+
+  const keyStr = encodeFireKey({
+    gridSize: 128,
+    cells: new Uint8Array(128 * 128),
+    cabinHp: new Uint8Array(10).fill(100),
+    windDirDeg: 90,
+    windSpeedKt: 12,
+    wave: 1,
+    opIndex: 0,
+    missionScore: 0,
+    status: 'active',
+    intermissionTimer: 0,
+    slotScores: new Map(),
+  });
+  const metaStr = encodeMeta({
+    wave: 1, opIndex: 0, missionScore: 0, burningPct: 1.0, cabinsAlive: 10, cabinsTotal: 10,
+    status: 'active', intermissionTimer: 0, pilotsCount: 2, top10: [],
+  });
+
+  // Epoch 1 Host writes fireKey & meta
+  await h1.set(`worlds/${WORLD_ID}/fireKey`, { e: 1, q: 1, t: h1.serverTimestamp(), d: keyStr });
+  await h1.set(`worlds/${WORLD_ID}/meta`, { e: 1, t: h1.serverTimestamp(), d: metaStr });
+
+  // Same-epoch rapid spam (< 4 s / < 0.8 s) MUST still be rejected!
+  hub.advanceTime(200);
+  await assert.rejects(
+    h1.set(`worlds/${WORLD_ID}/fireKey`, { e: 1, q: 2, t: h1.serverTimestamp(), d: keyStr }),
+    /PERMISSION_DENIED/
+  );
+  await assert.rejects(
+    h1.set(`worlds/${WORLD_ID}/meta`, { e: 1, t: h1.serverTimestamp(), d: metaStr }),
+    /PERMISSION_DENIED/
+  );
+
+  // Epoch 2 Host takes over after voluntary abdication -> immediate fireKey & meta publish MUST succeed!
+  await h1.set(`worlds/${WORLD_ID}/authority`, { uid: 'host-1', epoch: 1, rev: 1, leaseUntil: h1.serverTimestamp() });
+  hub.advanceTime(1);
+  const tx = await h2.runTransaction(`worlds/${WORLD_ID}/authority`, (cur) => ({
+    uid: 'host-2',
+    epoch: cur.epoch + 1,
+    rev: cur.rev + 1,
+    leaseUntil: hub.now() + 8000,
+  }));
+  assert.equal(tx.committed, true);
+  assert.equal(tx.value.epoch, 2);
+
+  await h2.set(`worlds/${WORLD_ID}/fireKey`, { e: 2, q: 2, t: h2.serverTimestamp(), d: keyStr });
+  await h2.set(`worlds/${WORLD_ID}/meta`, { e: 2, t: h2.serverTimestamp(), d: metaStr });
+  assert.equal(hub.inspect(`worlds/${WORLD_ID}/fireKey/e`), 2);
+  assert.equal(hub.inspect(`worlds/${WORLD_ID}/meta/e`), 2);
 });

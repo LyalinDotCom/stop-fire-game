@@ -465,6 +465,11 @@ const fireRing = {
       "newData.hasChildren(['e', 'q', 't', 'd'])",
       "newData.child('t').val() === now",
       `newData.child('q').val() % ${RING_SIZE} + '' === $slot`,
+      any([
+        '!data.exists()',
+        "newData.child('e').val() > data.child('e').val()",
+        "newData.child('q').val() > data.child('q').val()",
+      ]),
     ]),
     e: val(int('newData', 1, 1e9)),
     q: val(int('newData', 1, 1e9)),
@@ -482,7 +487,11 @@ const fireKey = {
     'newData.exists()',
     isLiveHost,
     hostEpochMatches,
-    any(['!data.exists()', "now - data.child('t').val() >= 4000"]),
+    any([
+      '!data.exists()',
+      "newData.child('e').val() > data.child('e').val()",
+      "now - data.child('t').val() >= 4000",
+    ]),
   ]),
   '.validate': all([
     "newData.hasChildren(['e', 'q', 't', 'd'])",
@@ -503,7 +512,11 @@ const meta = {
     'newData.exists()',
     isLiveHost,
     hostEpochMatches,
-    any(['!data.exists()', "now - data.child('t').val() >= 800"]),
+    any([
+      '!data.exists()',
+      "newData.child('e').val() > data.child('e').val()",
+      "now - data.child('t').val() >= 800",
+    ]),
   ]),
   '.validate': all([
     "newData.hasChildren(['e', 't', 'd'])",

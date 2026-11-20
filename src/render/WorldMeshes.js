@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { createForestSystem } from './TreeMesh.js';
 
 const COL_WATER_BED = new THREE.Color('#1d3d48');
 const COL_SHORE = new THREE.Color('#94815a');
@@ -10,23 +11,107 @@ const COL_RIDGE_HIGH = new THREE.Color('#78637f');
 const COL_PEAK_MID = new THREE.Color('#7f6585');
 const COL_PEAK_HIGH = new THREE.Color('#9c788e');
 
-const COL_CHARRED_GROUND = new THREE.Color('#2b2421');
-const COL_BURNING_GROUND = new THREE.Color('#4a2417');
-const COL_WET_TINT = new THREE.Color('#23505f');
+const COL_CHARRED_GROUND = new THREE.Color('#211c1a');
+const COL_BURNING_GROUND = new THREE.Color('#78280e');
+const COL_BURNING_HOT = new THREE.Color('#bf4814');
+const COL_WET_TINT = new THREE.Color('#165a6e');
 
-const COL_PINE_LIGHT = new THREE.Color('#4d684f');
-const COL_PINE_DARK = new THREE.Color('#2b433d');
-const COL_PINE_CHARRED = new THREE.Color('#262324');
-const COL_PINE_BURNING = new THREE.Color('#4b3022');
-const COL_PINE_WET = new THREE.Color('#284c4c');
-
+// Bright neutral tint colors for textured cabins so cabin-wood.png keeps full weathered contrast
+const COL_CABIN_WALL_TEX = new THREE.Color('#f4ece2');
+const COL_CABIN_WALL_SHADE = new THREE.Color('#d2c8be');
+const COL_CABIN_ROOF_TEX = new THREE.Color('#eef2f6');
+const COL_CABIN_ROOF_SHADE = new THREE.Color('#c8ced6');
 const COL_CABIN_LOG = new THREE.Color('#6d4c38');
 const COL_CABIN_LOG_DARK = new THREE.Color('#543929');
 const COL_CABIN_ROOF = new THREE.Color('#807e88');
 const COL_CABIN_ROOF_DARK = new THREE.Color('#676570');
-const COL_CABIN_CHIMNEY = new THREE.Color('#5a5862');
+const COL_CABIN_CHIMNEY = new THREE.Color('#8f8d96');
 const COL_CABIN_RUIN = new THREE.Color('#262324');
 const COL_CABIN_EMBER = new THREE.Color('#3a251d');
+
+function resolveAssetUrl(relPath) {
+  const base =
+    typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.BASE_URL
+      ? import.meta.env.BASE_URL
+      : './';
+  return `${base.replace(/\/?$/, '/')}${relPath.replace(/^\/+/, '')}`;
+}
+
+function makeSolidDataTexture(r, g, b) {
+  const data = new Uint8Array([r, g, b, 255]);
+  const tex = new THREE.DataTexture(data, 1, 1, THREE.RGBAFormat);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+const _sharedWorldTextures = {
+  initialized: false,
+  terrain: null,
+  cabin: null,
+  listeners: [],
+};
+
+function getSharedWorldTextures(onLoaded) {
+  if (!_sharedWorldTextures.initialized) {
+    _sharedWorldTextures.initialized = true;
+    _sharedWorldTextures.terrain = makeSolidDataTexture(232, 232, 230);
+    _sharedWorldTextures.cabin = makeSolidDataTexture(168, 138, 114);
+
+    if (typeof window !== 'undefined' && typeof Image !== 'undefined') {
+      const loader = new THREE.TextureLoader();
+
+      loader.load(
+        resolveAssetUrl('textures/terrain-detail.png'),
+        (tex) => {
+          tex.colorSpace = THREE.SRGBColorSpace;
+          tex.wrapS = THREE.RepeatWrapping;
+          tex.wrapT = THREE.RepeatWrapping;
+          tex.minFilter = THREE.LinearMipmapLinearFilter;
+          tex.magFilter = THREE.LinearFilter;
+          tex.anisotropy = 4;
+          tex.needsUpdate = true;
+          _sharedWorldTextures.terrain = tex;
+          for (const cb of _sharedWorldTextures.listeners) cb('terrain', tex);
+        },
+        undefined,
+        () => {}
+      );
+
+      loader.load(
+        resolveAssetUrl('textures/cabin-wood.png'),
+        (tex) => {
+          tex.colorSpace = THREE.SRGBColorSpace;
+          tex.wrapS = THREE.RepeatWrapping;
+          tex.wrapT = THREE.ClampToEdgeWrapping;
+          tex.minFilter = THREE.LinearMipmapLinearFilter;
+          tex.magFilter = THREE.LinearFilter;
+          tex.anisotropy = 4;
+          tex.needsUpdate = true;
+          _sharedWorldTextures.cabin = tex;
+          for (const cb of _sharedWorldTextures.listeners) cb('cabin', tex);
+        },
+        undefined,
+        () => {}
+      );
+    }
+  }
+
+  if (onLoaded) {
+    _sharedWorldTextures.listeners.push(onLoaded);
+  }
+  return {
+    terrain: _sharedWorldTextures.terrain,
+    cabin: _sharedWorldTextures.cabin,
+    unsubscribe() {
+      if (!onLoaded) return;
+      const idx = _sharedWorldTextures.listeners.indexOf(onLoaded);
+      if (idx !== -1) _sharedWorldTextures.listeners.splice(idx, 1);
+    },
+  };
+}
 
 function hash2(x, z) {
   const n = Math.sin(x * 127.1 + z * 311.7) * 43758.5453123;
@@ -40,23 +125,26 @@ class ColoredPolyBuilder {
   constructor() {
     this.positions = [];
     this.colors = [];
+    this.uvs = [];
   }
 
-  addTri(ax, ay, az, bx, by, bz, cx, cy, cz, color) {
+  addTri(ax, ay, az, bx, by, bz, cx, cy, cz, color, uvA = [0, 0], uvB = [1, 0], uvC = [0.5, 1]) {
     this.positions.push(ax, ay, az, bx, by, bz, cx, cy, cz);
     this.colors.push(
       color.r, color.g, color.b,
       color.r, color.g, color.b,
       color.r, color.g, color.b
     );
+    this.uvs.push(uvA[0], uvA[1], uvB[0], uvB[1], uvC[0], uvC[1]);
   }
 
-  addQuad(a, b, c, d, color) {
-    this.addTri(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], color);
-    this.addTri(a[0], a[1], a[2], c[0], c[1], c[2], d[0], d[1], d[2], color);
+  addQuad(a, b, c, d, color, u0 = 0, v0 = 0, u1 = 1, v1 = 1) {
+    // Standard upright quad UVs: a=top-left (u0,v1), b=top-right (u1,v1), c=bot-right (u1,v0), d=bot-left (u0,v0)
+    this.addTri(a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], color, [u0, v1], [u1, v1], [u1, v0]);
+    this.addTri(a[0], a[1], a[2], c[0], c[1], c[2], d[0], d[1], d[2], color, [u0, v1], [u1, v0], [u0, v0]);
   }
 
-  addBox(cx, cy, cz, sx, sy, sz, color, topColor = color, sideDark = color) {
+  addBox(cx, cy, cz, sx, sy, sz, color, topColor = color, sideDark = color, u0 = 0, v0 = 0, u1 = 1, v1 = 1) {
     const x0 = cx - sx * 0.5;
     const x1 = cx + sx * 0.5;
     const y0 = cy - sy * 0.5;
@@ -65,17 +153,17 @@ class ColoredPolyBuilder {
     const z1 = cz + sz * 0.5;
 
     // Top (+Y)
-    this.addQuad([x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0], topColor);
+    this.addQuad([x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0], topColor, u0, v0, u1, v1);
     // Bottom (-Y)
-    this.addQuad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1], sideDark);
+    this.addQuad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1], sideDark, u0, v0, u1, v1);
     // Front (-Z)
-    this.addQuad([x0, y1, z0], [x1, y1, z0], [x1, y0, z0], [x0, y0, z0], color);
+    this.addQuad([x0, y1, z0], [x1, y1, z0], [x1, y0, z0], [x0, y0, z0], color, u0, v0, u1, v1);
     // Back (+Z)
-    this.addQuad([x1, y1, z1], [x0, y1, z1], [x0, y0, z1], [x1, y0, z1], color);
+    this.addQuad([x1, y1, z1], [x0, y1, z1], [x0, y0, z1], [x1, y0, z1], color, u0, v0, u1, v1);
     // Right (+X)
-    this.addQuad([x1, y1, z0], [x1, y1, z1], [x1, y0, z1], [x1, y0, z0], sideDark);
+    this.addQuad([x1, y1, z0], [x1, y1, z1], [x1, y0, z1], [x1, y0, z0], sideDark, u0, v0, u1, v1);
     // Left (-X)
-    this.addQuad([x0, y1, z1], [x0, y1, z0], [x0, y0, z0], [x0, y0, z1], sideDark);
+    this.addQuad([x0, y1, z1], [x0, y1, z0], [x0, y0, z0], [x0, y0, z1], sideDark, u0, v0, u1, v1);
   }
 
   addCone(cx, yBase, cz, radius, height, segs, color) {
@@ -143,34 +231,16 @@ class ColoredPolyBuilder {
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.Float32BufferAttribute(this.positions, 3));
     geom.setAttribute('color', new THREE.Float32BufferAttribute(this.colors, 3));
+    geom.setAttribute('uv', new THREE.Float32BufferAttribute(this.uvs, 2));
     geom.computeVertexNormals();
     return geom;
   }
 }
 
 /**
- * Builds 3-tier conical low-poly pine tree geometry with neutral vertex shades
- * so InstancedMesh instanceColor cleanly tints intact/burning/charred/wet states.
- */
-function buildPineGeometry() {
-  const b = new ColoredPolyBuilder();
-  const trunkCol = new THREE.Color(0.50, 0.36, 0.28);
-  const tier1Col = new THREE.Color(0.76, 0.78, 0.76);
-  const tier2Col = new THREE.Color(0.90, 0.92, 0.90);
-  const tier3Col = new THREE.Color(1.00, 1.00, 1.00);
-
-  // Trunk
-  b.addCylinder(0, -0.4, 0, 0.45, 0.30, 3.0, 5, trunkCol);
-  // 3 stacked conical foliage tiers
-  b.addCone(0, 2.2, 0, 3.15, 4.6, 6, tier1Col);
-  b.addCone(0, 5.2, 0, 2.45, 4.3, 6, tier2Col);
-  b.addCone(0, 8.0, 0, 1.65, 3.8, 6, tier3Col);
-
-  return b.build();
-}
-
-/**
- * Builds an intact timber cabin (log walls #6d4c38, gabled gray roof #807e88, chimney).
+ * Builds an intact weathered timber cabin mapped cleanly onto cabin-wood.png:
+ * - Bottom half (v = 0.04..0.46): horizontal hand-hewn timber logs (walls + gables)
+ * - Top half (v = 0.54..0.96): weathered corrugated slate-tin roof & stone chimney
  */
 function buildCabinGeometry() {
   const b = new ColoredPolyBuilder();
@@ -179,31 +249,39 @@ function buildCabinGeometry() {
   const h = 4.2;
   const ridgeH = 2.9;
 
-  // Foundation plinth + log walls
-  b.addBox(0, h * 0.5 - 0.3, 0, w, h + 0.6, d, COL_CABIN_LOG, COL_CABIN_LOG, COL_CABIN_LOG_DARK);
+  // Foundation plinth + weathered log walls (mapped to lower log atlas band v = 0.04..0.46)
+  b.addBox(
+    0, h * 0.5 - 0.3, 0, w, h + 0.6, d,
+    COL_CABIN_WALL_TEX, COL_CABIN_WALL_SHADE, COL_CABIN_WALL_SHADE,
+    0, 0.04, 1.4, 0.46
+  );
 
-  // Gable triangles on left (-X) and right (+X) ends
+  // Gable triangles on left (-X) and right (+X) ends (horizontal log band)
   const hx = w * 0.5;
   const hz = d * 0.5;
-  b.addTri(hx, h, -hz, hx, h, hz, hx, h + ridgeH, 0, COL_CABIN_LOG_DARK);
-  b.addTri(-hx, h, hz, -hx, h, -hz, -hx, h + ridgeH, 0, COL_CABIN_LOG_DARK);
+  b.addTri(hx, h, -hz, hx, h, hz, hx, h + ridgeH, 0, COL_CABIN_WALL_SHADE, [0, 0.06], [1.0, 0.06], [0.5, 0.42]);
+  b.addTri(-hx, h, hz, -hx, h, -hz, -hx, h + ridgeH, 0, COL_CABIN_WALL_SHADE, [0, 0.06], [1.0, 0.06], [0.5, 0.42]);
 
-  // Overhanging gabled gray roof panels (#807e88)
+  // Overhanging gabled corrugated roof panels (mapped to upper slate-tin atlas band v = 0.54..0.96)
   const rx = hx + 0.65;
   const rz = hz + 0.75;
   const eaveY = h - 0.35;
   const peakY = h + ridgeH + 0.2;
 
   // North slope (-Z)
-  b.addQuad([-rx, peakY, 0], [rx, peakY, 0], [rx, eaveY, -rz], [-rx, eaveY, -rz], COL_CABIN_ROOF);
+  b.addQuad([-rx, peakY, 0], [rx, peakY, 0], [rx, eaveY, -rz], [-rx, eaveY, -rz], COL_CABIN_ROOF_TEX, 0, 0.54, 1.6, 0.96);
   // South slope (+Z)
-  b.addQuad([rx, peakY, 0], [-rx, peakY, 0], [-rx, eaveY, rz], [rx, eaveY, rz], COL_CABIN_ROOF_DARK);
+  b.addQuad([rx, peakY, 0], [-rx, peakY, 0], [-rx, eaveY, rz], [rx, eaveY, rz], COL_CABIN_ROOF_SHADE, 0, 0.54, 1.6, 0.96);
   // Roof underside / soffit caps so viewing from below stays solid
-  b.addQuad([rx, peakY, 0], [-rx, peakY, 0], [-rx, eaveY, -rz], [rx, eaveY, -rz], COL_CABIN_ROOF_DARK);
-  b.addQuad([-rx, peakY, 0], [rx, peakY, 0], [rx, eaveY, rz], [-rx, eaveY, rz], COL_CABIN_ROOF_DARK);
+  b.addQuad([rx, peakY, 0], [-rx, peakY, 0], [-rx, eaveY, -rz], [rx, eaveY, -rz], COL_CABIN_ROOF_SHADE, 0, 0.54, 1.0, 0.72);
+  b.addQuad([-rx, peakY, 0], [rx, peakY, 0], [rx, eaveY, rz], [-rx, eaveY, rz], COL_CABIN_ROOF_SHADE, 0, 0.54, 1.0, 0.72);
 
-  // Stone chimney rising through roof
-  b.addBox(2.2, h + ridgeH * 0.65, -1.2, 1.35, 3.6, 1.35, COL_CABIN_CHIMNEY, COL_CABIN_ROOF_DARK, COL_CABIN_CHIMNEY);
+  // Stone/slate chimney rising through roof
+  b.addBox(
+    2.2, h + ridgeH * 0.65, -1.2, 1.35, 3.6, 1.35,
+    COL_CABIN_CHIMNEY, COL_CABIN_ROOF_SHADE, COL_CABIN_CHIMNEY,
+    0.1, 0.56, 0.45, 0.92
+  );
 
   return b.build();
 }
@@ -459,6 +537,16 @@ export class WorldMeshes {
     this._upAxis = new THREE.Vector3(0, 1, 0);
     this._zeroMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
 
+    this._texHandle = getSharedWorldTextures((kind, tex) => {
+      if (kind === 'terrain' && this._terrainMat) {
+        this._terrainMat.map = tex;
+        this._terrainMat.needsUpdate = true;
+      } else if (kind === 'cabin' && this._cabinMat) {
+        this._cabinMat.map = tex;
+        this._cabinMat.needsUpdate = true;
+      }
+    });
+
     this._buildTerrain(terrain);
     this._buildPines(terrain);
     this._buildCabins(terrain);
@@ -474,12 +562,18 @@ export class WorldMeshes {
     const stride = gs + 1;
     const cellCount = gs * gs;
 
+    this._gridSize = gs;
     this._cellCount = cellCount;
     this._cellBaseColors = new Float32Array(cellCount * 3);
+    this._cellCurrentColors = new Float32Array(cellCount * 3);
     this._cellStates = new Uint8Array(cellCount);
+    this._dirtySmoothStamp = new Uint32Array(cellCount);
+    this._smoothPassId = 0;
 
     const positions = [];
     const colors = [];
+    const uvs = [];
+    const uvScale = 0.035;
     const tmpCol = this._tmpColor;
 
     for (let gz = 0; gz < gs; gz++) {
@@ -500,6 +594,9 @@ export class WorldMeshes {
         this._cellBaseColors[idx * 3] = tmpCol.r;
         this._cellBaseColors[idx * 3 + 1] = tmpCol.g;
         this._cellBaseColors[idx * 3 + 2] = tmpCol.b;
+        this._cellCurrentColors[idx * 3] = tmpCol.r;
+        this._cellCurrentColors[idx * 3 + 1] = tmpCol.g;
+        this._cellCurrentColors[idx * 3 + 2] = tmpCol.b;
 
         // Alternate quad diagonal for organic alpine low-poly triangulation
         // Outward (+Y) winding:
@@ -508,10 +605,18 @@ export class WorldMeshes {
             x0, h00, z0, x0, h01, z1, x1, h10, z0,
             x1, h10, z0, x0, h01, z1, x1, h11, z1
           );
+          uvs.push(
+            x0 * uvScale, z0 * uvScale, x0 * uvScale, z1 * uvScale, x1 * uvScale, z0 * uvScale,
+            x1 * uvScale, z0 * uvScale, x0 * uvScale, z1 * uvScale, x1 * uvScale, z1 * uvScale
+          );
         } else {
           positions.push(
             x0, h00, z0, x0, h01, z1, x1, h11, z1,
             x0, h00, z0, x1, h11, z1, x1, h10, z0
+          );
+          uvs.push(
+            x0 * uvScale, z0 * uvScale, x0 * uvScale, z1 * uvScale, x1 * uvScale, z1 * uvScale,
+            x0 * uvScale, z0 * uvScale, x1 * uvScale, z1 * uvScale, x1 * uvScale, z0 * uvScale
           );
         }
 
@@ -522,18 +627,26 @@ export class WorldMeshes {
     }
 
     // Stitch dramatic outer alpine mountain ring into same single-draw-call geometry
+    const outerStartPosIdx = positions.length;
     appendOuterMountainRing(terrain, positions, colors);
+    for (let i = outerStartPosIdx; i < positions.length; i += 3) {
+      uvs.push(positions[i] * uvScale * 0.5, positions[i + 2] * uvScale * 0.5);
+    }
 
     const geom = new THREE.BufferGeometry();
     geom.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geom.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
     this._terrainColorAttr = new THREE.Float32BufferAttribute(colors, 3);
     geom.setAttribute('color', this._terrainColorAttr);
     geom.computeVertexNormals();
 
     this._terrainGeo = geom;
-    this._terrainMat = new THREE.MeshLambertMaterial({
+    this._terrainMat = new THREE.MeshStandardMaterial({
       flatShading: true,
       vertexColors: true,
+      map: this._texHandle.terrain,
+      roughness: 0.94,
+      metalness: 0.0,
     });
     this.terrainMesh = new THREE.Mesh(geom, this._terrainMat);
     this.terrainMesh.name = 'AlpineTerrain';
@@ -541,70 +654,12 @@ export class WorldMeshes {
   }
 
   _buildPines(terrain) {
-    const trees = terrain.trees || [];
-    this._trees = trees;
-    const count = trees.length;
-    this._treeCount = count;
-
-    // Fast linked-list lookup: cellIdx -> trees in that cell
-    this._cellTreeHead = new Int32Array(this._cellCount);
-    this._cellTreeHead.fill(-1);
-    this._treeNext = new Int32Array(count);
-    this._treeBaseColors = new Float32Array(count * 3);
-    this._treeBaseScales = new Float32Array(count);
-    this._treeYaws = new Float32Array(count);
-    this._treeCharred = new Uint8Array(count);
-
-    this._pineGeo = buildPineGeometry();
-    this._pineMat = new THREE.MeshLambertMaterial({
-      flatShading: true,
-      vertexColors: true,
+    this._forest = createForestSystem(terrain, this.group, {
+      cellCount: this._cellCount,
     });
-
-    if (count === 0) {
-      this.pineMesh = null;
-      return;
-    }
-
-    this.pineMesh = new THREE.InstancedMesh(this._pineGeo, this._pineMat, count);
-    this.pineMesh.name = 'AlpinePines';
-    this.pineMesh.frustumCulled = false;
-
-    const tmpCol = this._tmpColor;
-    for (let i = 0; i < count; i++) {
-      const t = trees[i];
-      const cellIdx = t.cellIdx;
-      if (cellIdx >= 0 && cellIdx < this._cellCount) {
-        this._treeNext[i] = this._cellTreeHead[cellIdx];
-        this._cellTreeHead[cellIdx] = i;
-      } else {
-        this._treeNext[i] = -1;
-      }
-
-      const scale = t.scale || 1.0;
-      const yaw = hash2(t.x * 0.13, t.z * 0.17) * Math.PI * 2;
-      this._treeBaseScales[i] = scale;
-      this._treeYaws[i] = yaw;
-
-      this._tmpPos.set(t.x, t.y - 0.15, t.z);
-      this._tmpQuat.setFromAxisAngle(this._upAxis, yaw);
-      this._tmpScale.set(scale, scale, scale);
-      this._tmpMat.compose(this._tmpPos, this._tmpQuat, this._tmpScale);
-      this.pineMesh.setMatrixAt(i, this._tmpMat);
-
-      const tint = t.tint !== undefined ? t.tint : hash2(t.x, t.z);
-      tmpCol.copy(COL_PINE_DARK).lerp(COL_PINE_LIGHT, tint);
-      this._treeBaseColors[i * 3] = tmpCol.r;
-      this._treeBaseColors[i * 3 + 1] = tmpCol.g;
-      this._treeBaseColors[i * 3 + 2] = tmpCol.b;
-      this.pineMesh.setColorAt(i, tmpCol);
-    }
-
-    this.pineMesh.instanceMatrix.needsUpdate = true;
-    if (this.pineMesh.instanceColor) {
-      this.pineMesh.instanceColor.needsUpdate = true;
-    }
-    this.group.add(this.pineMesh);
+    this.pineMesh = this._forest && this._forest.meshes && this._forest.meshes[0]
+      ? this._forest.meshes[0]
+      : null;
   }
 
   _buildCabins(terrain) {
@@ -617,9 +672,12 @@ export class WorldMeshes {
     this._cabinLastHp.fill(100);
 
     this._cabinGeo = buildCabinGeometry();
-    this._cabinMat = new THREE.MeshLambertMaterial({
+    this._cabinMat = new THREE.MeshStandardMaterial({
       flatShading: true,
       vertexColors: true,
+      map: this._texHandle.cabin,
+      roughness: 0.90,
+      metalness: 0.05,
     });
 
     this._windowGeo = buildCabinWindowsGeometry();
@@ -716,17 +774,90 @@ export class WorldMeshes {
   }
 
   /**
-   * Fast partial update of terrain vertex colors, pine charring, and cabin states
+   * Computes smoothly blended corner RGB color at vertex corner (vx, vz)
+   * by averaging the up to 4 neighboring cells around that vertex (eliminates blocky square cells).
+   */
+  _writeSmoothCellVertices(gx, gz) {
+    const gs = this._gridSize;
+    const curr = this._cellCurrentColors;
+    const colorArr = this._terrainColorAttr.array;
+
+    const sampleCorner = (vx, vz, outOffset) => {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let count = 0;
+      for (let dz = -1; dz <= 0; dz++) {
+        const cz = vz + dz;
+        if (cz < 0 || cz >= gs) continue;
+        const rowOff = cz * gs;
+        for (let dx = -1; dx <= 0; dx++) {
+          const cx = vx + dx;
+          if (cx < 0 || cx >= gs) continue;
+          const o = (rowOff + cx) * 3;
+          r += curr[o];
+          g += curr[o + 1];
+          b += curr[o + 2];
+          count++;
+        }
+      }
+      const inv = count > 0 ? 1 / count : 1;
+      colorArr[outOffset] = r * inv;
+      colorArr[outOffset + 1] = g * inv;
+      colorArr[outOffset + 2] = b * inv;
+    };
+
+    const idx = gz * gs + gx;
+    const vOff = idx * 18;
+    // Write 6 vertices matching _buildTerrain alternating diagonal triangulation
+    if (((gx + gz) & 1) === 0) {
+      // (x0,z0), (x0,z1), (x1,z0), (x1,z0), (x0,z1), (x1,z1)
+      sampleCorner(gx, gz, vOff);
+      sampleCorner(gx, gz + 1, vOff + 3);
+      sampleCorner(gx + 1, gz, vOff + 6);
+      colorArr[vOff + 9] = colorArr[vOff + 6];
+      colorArr[vOff + 10] = colorArr[vOff + 7];
+      colorArr[vOff + 11] = colorArr[vOff + 8];
+      colorArr[vOff + 12] = colorArr[vOff + 3];
+      colorArr[vOff + 13] = colorArr[vOff + 4];
+      colorArr[vOff + 14] = colorArr[vOff + 5];
+      sampleCorner(gx + 1, gz + 1, vOff + 15);
+    } else {
+      // (x0,z0), (x0,z1), (x1,z1), (x0,z0), (x1,z1), (x1,z0)
+      sampleCorner(gx, gz, vOff);
+      sampleCorner(gx, gz + 1, vOff + 3);
+      sampleCorner(gx + 1, gz + 1, vOff + 6);
+      colorArr[vOff + 9] = colorArr[vOff];
+      colorArr[vOff + 10] = colorArr[vOff + 1];
+      colorArr[vOff + 11] = colorArr[vOff + 2];
+      colorArr[vOff + 12] = colorArr[vOff + 6];
+      colorArr[vOff + 13] = colorArr[vOff + 7];
+      colorArr[vOff + 14] = colorArr[vOff + 8];
+      sampleCorner(gx + 1, gz, vOff + 15);
+    }
+  }
+
+  /**
+   * Advances time-based animations on world meshes (burning tree ember rims).
+   */
+  update(elapsed = 0) {
+    if (this._forest && typeof this._forest.updateTime === 'function') {
+      this._forest.updateTime(elapsed);
+    }
+  }
+
+  /**
+   * Fast partial update of smooth terrain vertex colors, organic conifer states, and cabin states
    * driven by FireSim dirtyIndices (or full pass when dirtyIndices is null).
    */
   syncFireState(cells, dirtyIndices, cabinHp, cabinAtRisk, elapsed = 0) {
     let terrainDirty = false;
-    let pineColorDirty = false;
-    let pineMatDirty = false;
 
-    const colorArr = this._terrainColorAttr.array;
     const baseColors = this._cellBaseColors;
+    const currColors = this._cellCurrentColors;
+    const gs = this._gridSize;
     const tmpCol = this._tmpColor;
+    const changedCellList = [];
 
     const updateCell = (idx) => {
       if (idx < 0 || idx >= this._cellCount) return;
@@ -744,92 +875,37 @@ export class WorldMeshes {
       let b = bb;
 
       if (st === 14) {
-        // Charred earth (#2b2421)
+        // Organic charred charcoal earth
         r = COL_CHARRED_GROUND.r;
         g = COL_CHARRED_GROUND.g;
         b = COL_CHARRED_GROUND.b;
       } else if (st >= 1 && st <= 12) {
-        // Active burn scorches terrain under fire
-        const t = Math.min(1, 0.35 + (st / 12) * 0.65);
-        r = br + (COL_BURNING_GROUND.r - br) * t;
-        g = bg + (COL_BURNING_GROUND.g - bg) * t;
-        b = bb + (COL_BURNING_GROUND.b - bb) * t;
+        // Glowing warm scorched earth under active fire (brighter at high intensity)
+        const norm = st / 12;
+        const heatR = COL_BURNING_GROUND.r + (COL_BURNING_HOT.r - COL_BURNING_GROUND.r) * norm;
+        const heatG = COL_BURNING_GROUND.g + (COL_BURNING_HOT.g - COL_BURNING_GROUND.g) * norm;
+        const heatB = COL_BURNING_GROUND.b + (COL_BURNING_HOT.b - COL_BURNING_GROUND.b) * norm;
+        const t = Math.min(1, 0.45 + norm * 0.55);
+        r = br + (heatR - br) * t;
+        g = bg + (heatG - bg) * t;
+        b = bb + (heatB - bb) * t;
       } else if (st === 13) {
-        // Wet / steam cooldown dampened tint
-        r = br * 0.68 + COL_WET_TINT.r * 0.32;
-        g = bg * 0.68 + COL_WET_TINT.g * 0.32;
-        b = bb * 0.68 + COL_WET_TINT.b * 0.32;
+        // Distinct dark wet teal firebreak trench clearly visible from the air
+        r = br * 0.34 + COL_WET_TINT.r * 0.66;
+        g = bg * 0.34 + COL_WET_TINT.g * 0.66;
+        b = bb * 0.34 + COL_WET_TINT.b * 0.66;
       } else if (st === 15) {
-        // Ember warning slight warm glow on ground
-        r = Math.min(1, br * 1.12 + 0.08);
-        g = br * 0.55 + bg * 0.45;
-        b = bb * 0.72;
+        // Ember warning warm amber ground glow
+        r = Math.min(1, br * 1.25 + 0.14);
+        g = br * 0.45 + bg * 0.45 + 0.05;
+        b = bb * 0.58;
       }
 
-      const vOffset = idx * 18; // 6 vertices * 3 floats
-      for (let k = 0; k < 6; k++) {
-        const o = vOffset + k * 3;
-        colorArr[o] = r;
-        colorArr[o + 1] = g;
-        colorArr[o + 2] = b;
-      }
+      currColors[b3] = r;
+      currColors[b3 + 1] = g;
+      currColors[b3 + 2] = b;
+      changedCellList.push(idx);
       terrainDirty = true;
-
-      // Update pines standing on this cell
-      if (this.pineMesh) {
-        let ti = this._cellTreeHead[idx];
-        while (ti !== -1) {
-          const tb3 = ti * 3;
-          const wasCharred = this._treeCharred[ti];
-          let isCharred = 0;
-
-          if (st === 14) {
-            tmpCol.copy(COL_PINE_CHARRED);
-            isCharred = 1;
-          } else if (st >= 1 && st <= 12) {
-            const bt = Math.min(1, 0.25 + (st / 12) * 0.75);
-            tmpCol.setRGB(
-              this._treeBaseColors[tb3] + (COL_PINE_BURNING.r - this._treeBaseColors[tb3]) * bt,
-              this._treeBaseColors[tb3 + 1] + (COL_PINE_BURNING.g - this._treeBaseColors[tb3 + 1]) * bt,
-              this._treeBaseColors[tb3 + 2] + (COL_PINE_BURNING.b - this._treeBaseColors[tb3 + 2]) * bt
-            );
-          } else if (st === 13) {
-            tmpCol.setRGB(
-              this._treeBaseColors[tb3] * 0.65 + COL_PINE_WET.r * 0.35,
-              this._treeBaseColors[tb3 + 1] * 0.65 + COL_PINE_WET.g * 0.35,
-              this._treeBaseColors[tb3 + 2] * 0.65 + COL_PINE_WET.b * 0.35
-            );
-          } else {
-            tmpCol.setRGB(
-              this._treeBaseColors[tb3],
-              this._treeBaseColors[tb3 + 1],
-              this._treeBaseColors[tb3 + 2]
-            );
-          }
-
-          this.pineMesh.setColorAt(ti, tmpCol);
-          pineColorDirty = true;
-
-          // Shrink charred pines into narrow dark burned skeletons (or restore on wave reset)
-          if (isCharred !== wasCharred) {
-            this._treeCharred[ti] = isCharred;
-            const tr = this._trees[ti];
-            const sc = this._treeBaseScales[ti];
-            this._tmpPos.set(tr.x, tr.y - 0.15, tr.z);
-            this._tmpQuat.setFromAxisAngle(this._upAxis, this._treeYaws[ti]);
-            if (isCharred) {
-              this._tmpScale.set(sc * 0.56, sc * 0.88, sc * 0.56);
-            } else {
-              this._tmpScale.set(sc, sc, sc);
-            }
-            this._tmpMat.compose(this._tmpPos, this._tmpQuat, this._tmpScale);
-            this.pineMesh.setMatrixAt(ti, this._tmpMat);
-            pineMatDirty = true;
-          }
-
-          ti = this._treeNext[ti];
-        }
-      }
     };
 
     if (cells) {
@@ -837,21 +913,51 @@ export class WorldMeshes {
         for (let i = 0; i < dirtyIndices.length; i++) {
           updateCell(dirtyIndices[i]);
         }
+        // Smooth vertex color update for each changed cell and its 8 adjacent neighbors
+        if (changedCellList.length > 0) {
+          this._smoothPassId = (this._smoothPassId + 1) >>> 0;
+          if (this._smoothPassId === 0) {
+            this._dirtySmoothStamp.fill(0);
+            this._smoothPassId = 1;
+          }
+          const passId = this._smoothPassId;
+          for (let i = 0; i < changedCellList.length; i++) {
+            const cIdx = changedCellList[i];
+            const cgx = cIdx % gs;
+            const cgz = (cIdx / gs) | 0;
+            for (let dz = -1; dz <= 1; dz++) {
+              const nz = cgz + dz;
+              if (nz < 0 || nz >= gs) continue;
+              for (let dx = -1; dx <= 1; dx++) {
+                const nx = cgx + dx;
+                if (nx < 0 || nx >= gs) continue;
+                const nIdx = nz * gs + nx;
+                if (this._dirtySmoothStamp[nIdx] !== passId) {
+                  this._dirtySmoothStamp[nIdx] = passId;
+                  this._writeSmoothCellVertices(nx, nz);
+                }
+              }
+            }
+          }
+        }
       } else if (dirtyIndices === null) {
         for (let idx = 0; idx < this._cellCount; idx++) {
           updateCell(idx);
         }
+        for (let gz = 0; gz < gs; gz++) {
+          for (let gx = 0; gx < gs; gx++) {
+            this._writeSmoothCellVertices(gx, gz);
+          }
+        }
+      }
+
+      if (this._forest && typeof this._forest.updateFromFireGrid === 'function') {
+        this._forest.updateFromFireGrid(cells, dirtyIndices, elapsed);
       }
     }
 
     if (terrainDirty) {
       this._terrainColorAttr.needsUpdate = true;
-    }
-    if (pineColorDirty && this.pineMesh && this.pineMesh.instanceColor) {
-      this.pineMesh.instanceColor.needsUpdate = true;
-    }
-    if (pineMatDirty && this.pineMesh) {
-      this.pineMesh.instanceMatrix.needsUpdate = true;
     }
 
     // Update cabin HP / collapse ruins / at-risk window pulse
@@ -918,15 +1024,14 @@ export class WorldMeshes {
   }
 
   dispose() {
-    if (this.pineMesh) this.pineMesh.dispose();
+    if (this._texHandle) this._texHandle.unsubscribe();
+    if (this._forest) this._forest.dispose();
     if (this.cabinMesh) this.cabinMesh.dispose();
     if (this.windowMesh) this.windowMesh.dispose();
     if (this.ruinMesh) this.ruinMesh.dispose();
     if (this.towerMesh) this.towerMesh.dispose();
     this._terrainGeo.dispose();
     this._terrainMat.dispose();
-    this._pineGeo.dispose();
-    this._pineMat.dispose();
     this._cabinGeo.dispose();
     this._cabinMat.dispose();
     this._windowGeo.dispose();

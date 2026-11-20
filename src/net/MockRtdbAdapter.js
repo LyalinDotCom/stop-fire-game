@@ -788,7 +788,7 @@ export class MockRtdbHub {
         const auth = oldWorld.authority;
         if (newVal.e !== auth.epoch) throw deny(`planes epoch mismatch (${newVal.e} !== ${auth.epoch})`);
         if (!Number.isInteger(newVal.q) || newVal.q < 0 || newVal.q > 1e9) throw deny('planes.q invalid');
-        if (typeof newVal.t !== 'number' || !Number.isFinite(newVal.t)) throw deny('planes.t required number');
+        this._requireParentServerTimestamp(entity, 't', sentinelPaths, newVal, now);
         if (oldVal && !(newVal.e > oldVal.e || (newVal.e === oldVal.e && newVal.q > oldVal.q))) {
           throw deny('planes (e, q) must strictly advance');
         }
@@ -806,9 +806,12 @@ export class MockRtdbHub {
         const auth = oldWorld.authority;
         if (newVal.e !== auth.epoch) throw deny(`fireRing epoch mismatch (${newVal.e} !== ${auth.epoch})`);
         if (!Number.isInteger(newVal.q) || newVal.q < 1 || newVal.q > 1e9) throw deny('fireRing.q must be int >= 1');
-        if (typeof newVal.t !== 'number' || !Number.isFinite(newVal.t)) throw deny('fireRing.t required number');
+        this._requireParentServerTimestamp(entity, 't', sentinelPaths, newVal, now);
         if (String(newVal.q % 16) !== key) {
           throw deny(`fireRing slot mismatch: q (${newVal.q}) % 16 !== ${key}`);
+        }
+        if (oldVal && !(newVal.e > oldVal.e || newVal.q > oldVal.q)) {
+          throw deny('fireRing (e, q) must strictly advance');
         }
         if (typeof newVal.d !== 'string' || newVal.d.length < 1 || newVal.d.length > PAYLOAD_CAPS.fireRing) {
           throw deny(`fireRing.d must be string 1..${PAYLOAD_CAPS.fireRing} chars`);
@@ -824,7 +827,7 @@ export class MockRtdbHub {
         if (newVal.e !== auth.epoch) throw deny(`fireKey epoch mismatch (${newVal.e} !== ${auth.epoch})`);
         if (!Number.isInteger(newVal.q) || newVal.q < 0 || newVal.q > 1e9) throw deny('fireKey.q invalid');
         this._requireParentServerTimestamp(entity, 't', sentinelPaths, newVal, now);
-        if (oldVal && now - oldVal.t < PACING_MS.fireKey) {
+        if (oldVal && newVal.e <= oldVal.e && now - oldVal.t < PACING_MS.fireKey) {
           throw deny(`fireKey pacing violation (${now - oldVal.t}ms < ${PACING_MS.fireKey}ms)`);
         }
         if (typeof newVal.d !== 'string' || newVal.d.length < 1 || newVal.d.length > PAYLOAD_CAPS.fireKey) {
@@ -840,7 +843,7 @@ export class MockRtdbHub {
         const auth = oldWorld.authority;
         if (newVal.e !== auth.epoch) throw deny(`meta epoch mismatch (${newVal.e} !== ${auth.epoch})`);
         this._requireParentServerTimestamp(entity, 't', sentinelPaths, newVal, now);
-        if (oldVal && now - oldVal.t < PACING_MS.meta) {
+        if (oldVal && newVal.e <= oldVal.e && now - oldVal.t < PACING_MS.meta) {
           throw deny(`meta pacing violation (${now - oldVal.t}ms < ${PACING_MS.meta}ms)`);
         }
         if (typeof newVal.d !== 'string' || newVal.d.length < 1 || newVal.d.length > PAYLOAD_CAPS.meta) {

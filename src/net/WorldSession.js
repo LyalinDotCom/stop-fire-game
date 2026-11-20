@@ -22,6 +22,7 @@ export class WorldSession {
     terrain,
     fireSim,
     opConfig = null,
+    opIndex = null,
     worldId = DEFAULT_WORLD_ID,
     buildHash = getBuildHash(),
     callsign = 'EF-07',
@@ -29,6 +30,11 @@ export class WorldSession {
     mode = 'mp',
     onStatusChange = null,
     onScoreEvents = null,
+    onDropOutcomes = null,
+    onWorldEvents = null,
+    onOperationChange = null,
+    onOperationAdvance = null,
+    onPilotJoined = null,
     onMetaUpdate = null,
     onImpactEvents = null,
     onFireSync = null,
@@ -42,6 +48,8 @@ export class WorldSession {
     this.terrain = terrain;
     this.fireSim = fireSim;
     this.opConfig = opConfig;
+    const initialOpIndex = opIndex ?? opConfig?.opIndex ?? 0;
+    this.opIndex = Math.max(0, Math.min(4, Math.floor(initialOpIndex) || 0));
     this.worldId = worldId;
     this.buildHash = buildHash;
     this.callsign = sanitizeCallsign(callsign, 'EF-07');
@@ -50,6 +58,11 @@ export class WorldSession {
 
     this.onStatusChange = onStatusChange;
     this.onScoreEvents = onScoreEvents;
+    this.onDropOutcomes = onDropOutcomes;
+    this.onWorldEvents = onWorldEvents;
+    this.onOperationChange = onOperationChange;
+    this.onOperationAdvance = onOperationAdvance;
+    this.onPilotJoined = onPilotJoined;
     this.onMetaUpdate = onMetaUpdate;
     this.onImpactEvents = onImpactEvents;
     this.onFireSync = onFireSync;
@@ -133,16 +146,34 @@ export class WorldSession {
 
     this.stream = new StreamClient(this.adapter, this.worldId, {
       fireSim: null,
+      opIndex: this.opIndex,
       nowFn,
-      onFireKey: (keyState) => {
+      onOperationChange: async (nextOpIndex, keyState) => {
         if (!this.isHost) {
-          this.fireSim?.applyExternalKey(keyState);
+          this.opIndex = nextOpIndex;
+          await this.onOperationChange?.(nextOpIndex, keyState);
+        }
+      },
+      onFireKey: (keyState) => {
+        if (!this.isHost && this.fireSim && keyState.gridSize === this.fireSim.gridSize) {
+          this.fireSim.applyExternalKey(keyState);
           this.onFireSync?.({ full: true, dirtyIndices: null });
         }
       },
       onFireDelta: (delta) => {
-        if (!this.isHost) {
-          const dirty = this.fireSim ? this.fireSim.applyExternalDelta(delta) : [];
+        if (!this.isHost && this.fireSim) {
+          const dirty = this.fireSim.applyExternalDelta(delta);
+          // Drain FireSim's replica drop outcome mirror so it doesn't accumulate;
+          // drop outcomes are delivered once via StreamClient.onDropOutcomes below.
+          if (typeof this.fireSim.drainDropOutcomes === 'function') {
+            this.fireSim.drainDropOutcomes();
+          }
+          const worldEvents = typeof this.fireSim.drainWorldEvents === 'function'
+            ? this.fireSim.drainWorldEvents()
+            : [];
+          if (worldEvents.length) {
+            this.onWorldEvents?.(worldEvents);
+          }
           this.onFireSync?.({ full: false, dirtyIndices: dirty });
         }
       },
@@ -175,6 +206,12 @@ export class WorldSession {
       onScoreEvents: (events) => {
         if (!this.isHost) this.onScoreEvents?.(events);
       },
+      onDropOutcomes: (outcomes) => {
+        if (!this.isHost) this.onDropOutcomes?.(outcomes);
+      },
+      onPilotJoined: (pilot) => {
+        this.onPilotJoined?.(pilot);
+      },
     });
 
     this.election = new AuthorityElection(this.adapter, this.worldId, {
@@ -206,6 +243,30 @@ export class WorldSession {
     this._updateStatus();
   }
 
+  /**
+   * Swap active Operation terrain & FireSim while keeping the live RTDB session,
+   * slot lease, presence, and Host authority continuously intact.
+   */
+  setWorld({ terrain, fireSim, opConfig = null, opIndex = null, publishNow = true } = {}) {
+    if (terrain) this.terrain = terrain;
+    if (fireSim) this.fireSim = fireSim;
+    if (opConfig) this.opConfig = opConfig;
+    const nextOpIndex = opIndex ?? opConfig?.opIndex;
+    if (typeof nextOpIndex === 'number') {
+      this.opIndex = Math.max(0, Math.min(4, Math.floor(nextOpIndex)));
+      this.stream?.setOperationIndex(this.opIndex);
+    }
+    if (this.host?.running) {
+      this.host.setWorld({
+        terrain: this.terrain,
+        fireSim: this.fireSim,
+        opIndex: this.opIndex,
+        worldName: this.opConfig?.name,
+        publishNow,
+      });
+    }
+  }
+
   _startHost(epoch, isFailover) {
     if (this.stopped) return;
     if (this.host?.running) {
@@ -218,11 +279,21 @@ export class WorldSession {
       terrain: this.terrain,
       fireSim: this.fireSim,
       epoch,
+      opIndex: this.opIndex,
       buildHash: this.buildHash,
+      worldName: this.opConfig?.name || 'Cinderpine Basin',
       localSlotId: this.localSlotId,
       enableBackgroundTicker: !this._disableRealTimers,
       onScoreEvents: (events) => this.onScoreEvents?.(events),
       onImpactEvents: (impacts) => this.onImpactEvents?.(impacts),
+      onDropOutcomes: (outcomes) => this.onDropOutcomes?.(outcomes),
+      onWorldEvents: (events) => this.onWorldEvents?.(events),
+      onOperationAdvance: this.onOperationAdvance ? (info) => this.onOperationAdvance(info) : null,
+      onOperationHydrated: async (opIdx, keyState) => {
+        this.opIndex = opIdx;
+        this.stream?.setOperationIndex(opIdx);
+        await this.onOperationChange?.(opIdx, keyState);
+      },
       onSimStep: (stepDelta) => {
         if (stepDelta.fullReset) {
           this.onFireSync?.({ full: true, dirtyIndices: null });
@@ -292,6 +363,7 @@ export class WorldSession {
       colorIdx: this.colorIdx,
       connId: ackedConnId,
       buildHash: this.buildHash,
+      mapId: this.opConfig?.id || 'op01',
     });
 
     if (!res.seated) {
@@ -355,7 +427,7 @@ export class WorldSession {
     this._updateStatus();
   }
 
-  /** Send rate-limited 4 Hz local aircraft state to `in/$uid` while seated. */
+  /** Send rate-limited 4 Hz local aircraft state to `in/$uid` while seated (keeps slot alive through crash/respawn). */
   sendLocalState(aircraft, dropSeq = 0) {
     if (this.stopped || !aircraft) return;
     this._latestAircraft = aircraft;
@@ -384,7 +456,10 @@ export class WorldSession {
       this._inputSeqConnId = connId;
     }
     const seq = ++this._inputSeq;
-    const d = encodeInput(aircraft, dropSeq);
+    const wireState = aircraft.crashed
+      ? { ...aircraft, speedKmh: 0, releasing: false, scooping: false }
+      : aircraft;
+    const d = encodeInput(wireState, dropSeq);
     this._lastInputSentAt = now;
     const path = `worlds/${this.worldId}/in/${this.adapter.uid}`;
     if (!this._inputInFlightSince) this._inputInFlightSince = this._nowPerf();
@@ -456,6 +531,7 @@ export class WorldSession {
     return {
       mode: this.mode,
       status: this._status,
+      opIndex: this.opIndex,
       pilotsCount,
       pilotsCap: MAX_SLOTS,
       localSlotId: slotId,

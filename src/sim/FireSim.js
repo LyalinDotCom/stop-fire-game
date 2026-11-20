@@ -1,14 +1,16 @@
 /**
  * EMBER FRONT — 10 Hz 4-Bit Cellular Wildfire Simulation
- * Supports both Solo Operations (128x128 @ 16m) and 100-Pilot Mega-Basin (160x160 @ 20m).
+ * Supports focused Operations 01-05 (128x128 @ 16m, scaling 1..100 pilots) and Mega-Basin (160x160 @ 20m).
  * Engineered with flat typed arrays and sparse active sets for p99 < 2.0 ms at 100 pilots.
  * Pure simulation module — zero DOM / Three.js dependencies.
  */
 
 import { createRng } from './TerrainGen.js';
-import { FLIGHT_CONSTANTS } from './FlightModel.js';
+import { FLIGHT_CONSTANTS, computeSplashRadius } from './FlightModel.js';
+import { getNextOperation } from '../config/operations.js';
 
 const DEG2RAD = Math.PI / 180;
+const RAD2DEG = 180 / Math.PI;
 const KNOTS_TO_MS = 0.514444;
 
 // Cell states (4-bit: 0..15)
@@ -29,6 +31,15 @@ export const SCORE = {
   WAVE_CONTAINED: 1000,
 };
 
+// Compact wire-friendly code tables for Drop Outcome telemetry
+export const OUTCOME_CODES = ['direct', 'partial', 'miss'];
+export const MISS_CODES = ['none', 'overshot', 'short', 'wide'];
+export const COMPASS_DIRS = ['', 'N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+
+// Wet firebreak cooldown bounds (seconds)
+export const WET_COOLDOWN_MIN = 28.0;
+export const WET_COOLDOWN_MAX = 35.0;
+
 // 8-way Moore neighborhood offsets
 const NBR_DX = [-1, 0, 1, -1, 1, -1, 0, 1];
 const NBR_DZ = [-1, -1, -1, 0, 0, 1, 1, 1];
@@ -38,22 +49,77 @@ const NBR_UZ = NBR_DZ.map((dz, i) => dz / NBR_DIST[i]);
 
 const MAX_PARCELS = 4096;
 const ATTR_SLOTS_PER_CELL = 8; // Zero-GC fixed per-cell 3s attribution ring
+const BASE_SPREAD_RATE = 0.0065; // Solo-winnable in 2-4 min at 1 pilot; scales smoothly 1..100 via pilotScale
 
 function clamp(v, lo, hi) {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
+function shortestAngleDiffDeg(a, b) {
+  let d = ((a - b) % 360 + 540) % 360 - 180;
+  if (d < -180) d += 360;
+  return Math.abs(d);
+}
+
+/**
+ * Convert a 2D horizontal vector (dx = East, -dz = North) to an 8-point compass direction.
+ */
+function vectorToCompass(dx, dz) {
+  if (dx * dx + dz * dz < 1e-4) return '';
+  const bearingDeg = ((Math.atan2(dx, -dz) * RAD2DEG) % 360 + 360) % 360;
+  const idx = Math.round(bearingDeg / 45) % 8;
+  return COMPASS_DIRS[idx + 1];
+}
+
+function normalizeExternalOutcome(raw) {
+  if (!raw) return null;
+  if (Array.isArray(raw)) {
+    // Compact fireRing tuple: [slotId, ix, iz, cells, pts, outcomeCode, missCode, dirCode, missDistM?, cabinSaved?]
+    return {
+      dropId: 0,
+      slotId: raw[0] | 0,
+      impactX: Number(raw[1]) || 0,
+      impactZ: Number(raw[2]) || 0,
+      cellsExtinguished: Math.max(0, raw[3] | 0),
+      cellsCooled: 0,
+      pointsAwarded: Math.max(0, Math.round(Number(raw[4]) || 0)),
+      outcome: OUTCOME_CODES[raw[5] | 0] || 'miss',
+      missType: MISS_CODES[raw[6] | 0] || 'none',
+      missDirCompass: COMPASS_DIRS[raw[7] | 0] || '',
+      missDistM: Math.max(0, Math.round(Number(raw[8]) || 0)),
+      cabinSaved: Boolean(raw[9]),
+    };
+  }
+  return {
+    dropId: raw.dropId ?? 0,
+    slotId: raw.slotId | 0,
+    impactX: Number(raw.impactX) || 0,
+    impactZ: Number(raw.impactZ) || 0,
+    cellsExtinguished: Math.max(0, raw.cellsExtinguished | 0),
+    cellsCooled: Math.max(0, raw.cellsCooled | 0),
+    pointsAwarded: Math.max(0, Math.round(Number(raw.pointsAwarded) || 0)),
+    outcome: OUTCOME_CODES.includes(raw.outcome) ? raw.outcome : 'miss',
+    missType: MISS_CODES.includes(raw.missType) ? raw.missType : 'none',
+    missDirCompass: typeof raw.missDirCompass === 'string' ? raw.missDirCompass : '',
+    missDistM: Math.max(0, Math.round(Number(raw.missDistM) || 0)),
+    cabinSaved: Boolean(raw.cabinSaved),
+  };
+}
+
 export class FireSim {
   /**
    * @param {import('./TerrainGen.js').TerrainData} terrain
-   * @param {{ isMegaBasin?: boolean }} [opts]
+   * @param {{ isMegaBasin?: boolean, onDropOutcome?: (ev: object) => void, onWorldEvent?: (ev: object) => void }} [opts]
    */
-  constructor(terrain, { isMegaBasin = false } = {}) {
+  constructor(terrain, { isMegaBasin = false, onDropOutcome = null, onWorldEvent = null } = {}) {
     this.terrain = terrain;
     this.isMegaBasin = Boolean(isMegaBasin || terrain.opConfig?.mode === 'megabasin');
     this.gridSize = terrain.gridSize;
     this.cellSize = terrain.cellSize;
     this.cellCount = this.gridSize * this.gridSize;
+
+    this._onDropOutcome = typeof onDropOutcome === 'function' ? onDropOutcome : null;
+    this._onWorldEvent = typeof onWorldEvent === 'function' ? onWorldEvent : null;
 
     // 4-bit grid state & animation phase
     this.cells = new Uint8Array(this.cellCount);
@@ -72,6 +138,9 @@ export class FireSim {
     this.wetDirtyFlags = new Uint8Array(this.cellCount);
     this.wetDirtyList = new Int32Array(this.cellCount);
     this.wetDirtyCount = 0;
+
+    // Last water burst id that touched each cell (for exact drop outcome attribution)
+    this.cellLastDropId = new Int32Array(this.cellCount);
 
     // Sparse active cell set (burning 1..12, wet 13, ember 15, or heated intact)
     this.activeList = new Int32Array(this.cellCount);
@@ -111,7 +180,7 @@ export class FireSim {
     }
     this.totalFlammable = Math.max(1, flammable);
 
-    // Cabin state
+    // Cabin & settlement state
     const nCabins = terrain.cabins.length;
     this.cabinsTotal = nCabins;
     this.cabinHp = new Uint8Array(nCabins);
@@ -120,7 +189,6 @@ export class FireSim {
     this.cabinThreatTime = new Float32Array(nCabins);
     this.cabinSavedCooldown = new Float32Array(nCabins);
     this.cabinLastHelperSlot = new Int16Array(nCabins);
-    // Precompute cabin grid coordinates for fast inner loop
     this._cabinGx = new Int16Array(nCabins);
     this._cabinGz = new Int16Array(nCabins);
     for (let c = 0; c < nCabins; c++) {
@@ -129,9 +197,14 @@ export class FireSim {
       this._cabinGz[c] = g.gz;
     }
 
+    const nSettlements = Math.max(1, terrain.settlements?.length ?? 1);
+    this._settlementAtRisk = new Uint8Array(nSettlements);
+    this._settlementAlertCooldown = new Float32Array(nSettlements);
+
     // Fixed-size struct-of-arrays pool for ballistic water parcels
     this.parcelCount = 0;
     this.parcelSlot = new Int16Array(MAX_PARCELS);
+    this.parcelDropId = new Int32Array(MAX_PARCELS);
     this.parcelX = new Float32Array(MAX_PARCELS);
     this.parcelY = new Float32Array(MAX_PARCELS);
     this.parcelZ = new Float32Array(MAX_PARCELS);
@@ -139,6 +212,22 @@ export class FireSim {
     this.parcelVy = new Float32Array(MAX_PARCELS);
     this.parcelVz = new Float32Array(MAX_PARCELS);
     this.parcelReleaseAgl = new Float32Array(MAX_PARCELS);
+
+    // Per-drop burst tracking & structured event queues
+    this._nextDropId = 0;
+    /** @type {Map<number, object>} */
+    this._activeBurstBySlot = new Map();
+    /** @type {Map<number, object>} */
+    this._latestBurstBySlot = new Map();
+    /** @type {Map<number, object>} */
+    this._burstsById = new Map();
+    this._dropOutcomeQueue = [];
+    this._worldEventQueue = [];
+
+    // Wind shift telemetry state
+    this._lastReportedWindDir = terrain.opConfig?.windDirDeg ?? 90;
+    this._lastReportedWindSpeed = terrain.opConfig?.windSpeedKt ?? 12;
+    this._windShiftCooldown = 30.0;
 
     // Score & wave state
     this.missionScore = 0;
@@ -166,6 +255,44 @@ export class FireSim {
     this.hotClusters = [];
 
     this.reset(1);
+  }
+
+  /**
+   * Register optional push callbacks for drop outcomes and tactical world events.
+   */
+  setEventCallbacks({ onDropOutcome = null, onWorldEvent = null } = {}) {
+    this._onDropOutcome = typeof onDropOutcome === 'function' ? onDropOutcome : null;
+    this._onWorldEvent = typeof onWorldEvent === 'function' ? onWorldEvent : null;
+  }
+
+  /**
+   * Drain and return all completed Drop Outcome Events since the last drain.
+   */
+  drainDropOutcomes() {
+    if (this._dropOutcomeQueue.length === 0) return [];
+    const out = this._dropOutcomeQueue;
+    this._dropOutcomeQueue = [];
+    return out;
+  }
+
+  /**
+   * Drain and return all tactical World Events since the last drain.
+   */
+  drainWorldEvents() {
+    if (this._worldEventQueue.length === 0) return [];
+    const out = this._worldEventQueue;
+    this._worldEventQueue = [];
+    return out;
+  }
+
+  _emitDropOutcome(outcome) {
+    this._dropOutcomeQueue.push(outcome);
+    if (this._onDropOutcome) this._onDropOutcome(outcome);
+  }
+
+  _emitWorldEvent(event) {
+    this._worldEventQueue.push(event);
+    if (this._onWorldEvent) this._onWorldEvent(event);
   }
 
   _addActive(idx) {
@@ -204,10 +331,18 @@ export class FireSim {
     const sid = slotId ?? 0;
     this.slotScores.set(sid, (this.slotScores.get(sid) || 0) + pts);
     scoreEvents.push({ slotId: sid, pts, kind, x, z });
+
+    const burst = this._latestBurstBySlot.get(sid);
+    if (burst && !burst.emitted) {
+      burst.pointsAwarded += pts;
+      if (kind === 'cabin') {
+        burst.cabinSaved = true;
+      }
+    }
   }
 
   /**
-   * Reset fire simulation for a given wave (wave 1 resets score; wave > 1 in Mega-Basin preserves score).
+   * Reset fire simulation for a given wave (wave 1 resets score; wave > 1 in rolling/Mega-Basin preserves score).
    */
   reset(wave = 1) {
     this.wave = wave;
@@ -229,6 +364,7 @@ export class FireSim {
     this.wetDelta.fill(0);
     this.wetDirtyFlags.fill(0);
     this.wetDirtyCount = 0;
+    this.cellLastDropId.fill(0);
     this.activePos.fill(-1);
     this.activeCount = 0;
     this.attrSlot.fill(-1);
@@ -239,14 +375,22 @@ export class FireSim {
     this.intermissionTimer = 0;
     this.intermissionReason = null;
 
-    // Initialize fuel & per-cell burn duration (120..180 s)
+    this._activeBurstBySlot.clear();
+    this._latestBurstBySlot.clear();
+    this._burstsById.clear();
+    this._dropOutcomeQueue = [];
+    this._worldEventQueue = [];
+    this._settlementAtRisk.fill(0);
+    this._settlementAlertCooldown.fill(0);
+
+    // Initialize fuel & per-cell burn duration (140..210 s)
     for (let i = 0; i < this.cellCount; i++) {
       if (this.terrain.fuelMask[i] === 1) {
         this.fuelRemaining[i] = 1.0;
-        this.burnDuration[i] = 120 + this.rng() * 60;
+        this.burnDuration[i] = 140 + this.rng() * 70;
       } else {
         this.fuelRemaining[i] = 0;
-        this.burnDuration[i] = 150;
+        this.burnDuration[i] = 160;
       }
     }
 
@@ -261,11 +405,11 @@ export class FireSim {
     }
     this.cabinsAlive = this.cabinsTotal;
 
-    // Wind base & peak gust amplitude (supports both peak-knot configs like 12->14 and delta configs)
+    // Wind base & peak gust amplitude
     const baseDir = this.terrain.opConfig?.windDirDeg ?? 90;
     const waveRot = this.isMegaBasin ? ((wave - 1) * 55) % 360 : 0;
     this.baseWindDirDeg = (baseDir + waveRot + 360) % 360;
-    this.baseWindSpeedKt = this.terrain.opConfig?.windSpeedKt ?? 12;
+    this.baseWindSpeedKt = this.terrain.opConfig?.windSpeedKt ?? 10;
     const rawGust = this.terrain.opConfig?.windGustKt;
     this.windGustAmpKt =
       typeof rawGust === 'number'
@@ -275,6 +419,9 @@ export class FireSim {
         : 2;
     this.windDirDeg = this.baseWindDirDeg;
     this.windSpeedKt = this.baseWindSpeedKt;
+    this._lastReportedWindDir = this.windDirDeg;
+    this._lastReportedWindSpeed = this.windSpeedKt;
+    this._windShiftCooldown = 30.0;
     this._updateWindVector();
 
     // Seed initial wildfire patches
@@ -288,7 +435,7 @@ export class FireSim {
       this._ignitePatch(seed.gx, seed.gz, seed.radius);
     }
 
-    this._updateReplicaCabinRisk();
+    this._updateReplicaCabinRisk(false);
     this._recomputeMetricsAndTargets();
   }
 
@@ -302,12 +449,12 @@ export class FireSim {
         const gx = cx + dx;
         if (gx < 1 || gx >= gs - 1) continue;
         const d = Math.hypot(dx, dz);
-        if (d > radius + (this.rng() - 0.5) * 1.4) continue;
+        if (d > radius + (this.rng() - 0.5) * 1.1) continue;
         const idx = gz * gs + gx;
         if (this.terrain.fuelMask[idx] !== 1 || this.terrain.waterMask[idx] === 1) continue;
 
         const norm = clamp(1 - d / (radius + 0.5), 0.15, 1.0);
-        const initInt = clamp(2 + norm * 8 + (this.rng() - 0.5) * 2, 2, 11);
+        const initInt = clamp(2 + norm * 7.5 + (this.rng() - 0.5) * 1.8, 2, 10);
         this.intensityF[idx] = initInt;
         this.cells[idx] = Math.round(initInt);
         this.phases[idx] = Math.floor(this.rng() * 255);
@@ -318,11 +465,57 @@ export class FireSim {
 
   /**
    * Spawn a ballistic water drop parcel (called at ~10 Hz per releasing aircraft).
+   * Automatically groups consecutive parcels from the same pilot into one tracked drop burst
+   * unless an explicit `dropId` is provided.
    */
-  spawnWaterParcel(slotId, x, y, z, vx, vy, vz, releaseAgl) {
+  spawnWaterParcel(slotId, x, y, z, vx, vy, vz, releaseAgl, dropId = null) {
     if (this.parcelCount >= MAX_PARCELS) return;
+    const sid = slotId ?? 0;
+
+    let burst = this._activeBurstBySlot.get(sid);
+    const shouldStartNew =
+      !burst ||
+      burst.emitted ||
+      (dropId != null && burst.externalDropId !== dropId) ||
+      (dropId == null && this.simTime - burst.lastSpawnTime > 0.45);
+
+    if (shouldStartNew) {
+      const id = ++this._nextDropId;
+      burst = {
+        id,
+        externalDropId: dropId,
+        slotId: sid,
+        createdTime: this.simTime,
+        lastSpawnTime: this.simTime,
+        lastImpactTime: -1,
+        parcelsInFlight: 0,
+        totalParcels: 0,
+        headingSumX: 0,
+        headingSumZ: 0,
+        impactSumX: 0,
+        impactSumZ: 0,
+        impactCount: 0,
+        cellsExtinguished: 0,
+        cooledCellSet: new Set(),
+        fireCellsTouched: new Set(),
+        pointsAwarded: 0,
+        cabinSaved: false,
+        emitted: false,
+      };
+      this._activeBurstBySlot.set(sid, burst);
+      this._latestBurstBySlot.set(sid, burst);
+      this._burstsById.set(id, burst);
+    }
+
+    burst.lastSpawnTime = this.simTime;
+    burst.parcelsInFlight++;
+    burst.totalParcels++;
+    burst.headingSumX += vx;
+    burst.headingSumZ += vz;
+
     const i = this.parcelCount++;
-    this.parcelSlot[i] = slotId ?? 0;
+    this.parcelSlot[i] = sid;
+    this.parcelDropId[i] = burst.id;
     this.parcelX[i] = x;
     this.parcelY[i] = y;
     this.parcelZ[i] = z;
@@ -332,15 +525,17 @@ export class FireSim {
     this.parcelReleaseAgl[i] = Math.max(0, releaseAgl ?? 35);
   }
 
-  _recordWet(idx, slotId, amount, isActiveFire) {
+  _recordWet(idx, slotId, dropId, amount, isActiveFire) {
     if (amount <= 0) return;
     if (this.wetDirtyFlags[idx] === 0) {
       this.wetDirtyFlags[idx] = 1;
       this.wetDirtyList[this.wetDirtyCount++] = idx;
     }
     this.wetDelta[idx] += amount;
+    if (dropId > 0) {
+      this.cellLastDropId[idx] = dropId;
+    }
 
-    // Only track 3.0 s attribution for burning / ember-warning cells (zero overhead on wet/intact cells)
     if (!isActiveFire) return;
 
     const base = idx * ATTR_SLOTS_PER_CELL;
@@ -374,11 +569,21 @@ export class FireSim {
 
   /**
    * Apply a landed water parcel splash onto the grid via conflict-free wetDelta.
+   * Uses the exact shared computeSplashRadius() formula matching predictDropImpact().
    */
-  _applyWaterSplash(slotId, x, z, releaseAgl) {
-    const R = clamp(14 + 0.22 * releaseAgl, 16, 42);
-    const K0 = 4.6;
-    const knockdown = K0 * Math.pow(24 / R, 1.35);
+  _applyWaterSplash(slotId, dropId, x, z, releaseAgl) {
+    const R = computeSplashRadius(releaseAgl, this.cellSize);
+    const refR = 44.0 * (this.cellSize / 16.0);
+    const K0 = 9.8;
+    const knockdown = K0 * Math.pow(refR / R, 0.80);
+
+    const burst = dropId > 0 ? this._burstsById.get(dropId) : null;
+    if (burst) {
+      burst.impactSumX += x;
+      burst.impactSumZ += z;
+      burst.impactCount++;
+      burst.lastImpactTime = this.simTime;
+    }
 
     const gs = this.gridSize;
     const cellSize = this.cellSize;
@@ -412,9 +617,12 @@ export class FireSim {
 
         const st = cells[idx];
         const isFire = (st >= 1 && st <= 12) || st === CELL_STATE.EMBER_WARN;
-        const falloff = 1.0 - 0.6 * (dSq / rSq);
-        this._recordWet(idx, slotId, knockdown * falloff, isFire);
-        if (isFire) hitActiveFire = true;
+        const falloff = 1.0 - 0.32 * (dSq / rSq);
+        this._recordWet(idx, slotId, dropId, knockdown * falloff, isFire);
+        if (isFire) {
+          hitActiveFire = true;
+          if (burst) burst.fireCellsTouched.add(idx);
+        }
       }
     }
     return hitActiveFire;
@@ -510,6 +718,27 @@ export class FireSim {
     return th > wl ? th : wl;
   }
 
+  _checkWindShiftEvent(dtSafe) {
+    if (this._windShiftCooldown > 0) {
+      this._windShiftCooldown = Math.max(0, this._windShiftCooldown - dtSafe);
+      return;
+    }
+    const dirDelta = shortestAngleDiffDeg(this.windDirDeg, this._lastReportedWindDir);
+    const spdDelta = Math.abs(this.windSpeedKt - this._lastReportedWindSpeed);
+    if (dirDelta >= 18 || spdDelta >= 4) {
+      this._lastReportedWindDir = this.windDirDeg;
+      this._lastReportedWindSpeed = this.windSpeedKt;
+      this._windShiftCooldown = 35.0;
+      const rad = this.windDirDeg * DEG2RAD;
+      this._emitWorldEvent({
+        type: 'wind_shift',
+        windDirDeg: Math.round(this.windDirDeg),
+        windSpeedKt: Math.round(this.windSpeedKt),
+        compass: vectorToCompass(Math.sin(rad), -Math.cos(rad)),
+      });
+    }
+  }
+
   /**
    * Advance the wildfire simulation by `dt` seconds (designed for 10 Hz, dt = 0.1 s).
    */
@@ -523,23 +752,40 @@ export class FireSim {
     const impactEvents = [];
     this._changedCount = 0;
 
-    // 1. Update smoothly gusting wind vector (baseWindSpeedKt .. baseWindSpeedKt + windGustAmpKt)
+    // 1. Update smoothly gusting wind vector
     const dirShift = Math.sin(this.simTime * 0.045) * 14 + Math.sin(this.simTime * 0.11) * 6;
     const gustWave = 0.5 + 0.5 * (Math.sin(this.simTime * 0.19) * 0.65 + Math.cos(this.simTime * 0.07) * 0.35);
     this.windDirDeg = ((this.baseWindDirDeg + dirShift) % 360 + 360) % 360;
     this.windSpeedKt = Math.max(4, this.baseWindSpeedKt + gustWave * this.windGustAmpKt);
     this._updateWindVector();
+    this._checkWindShiftEvent(dtSafe);
 
-    // Handle Mega-Basin intermission countdown
+    // Handle rolling intermission countdown (live shared mission & Mega-Basin)
     if (this.status === 'intermission') {
       this.intermissionTimer = Math.max(0, this.intermissionTimer - dtSafe);
       let fullReset = false;
+      let advanceOperation = false;
       if (this.intermissionTimer <= 0) {
-        this.reset(this.wave + 1);
+        const prevReason = this.intermissionReason || 'contained';
+        const fromOp = this.terrain.opConfig;
+        const nextOp = getNextOperation(fromOp);
+        const nextWave = this.wave + 1;
+        advanceOperation = prevReason === 'contained';
+
+        this.reset(nextWave);
         fullReset = true;
         for (let c = 0; c < this.cabinsTotal; c++) {
           cabinChanges.push({ id: c, hp: this.cabinHp[c] });
         }
+        this._emitWorldEvent({
+          type: 'operation_advance',
+          fromOpId: fromOp?.id || 'op01',
+          fromOpIndex: typeof fromOp?.opIndex === 'number' ? fromOp.opIndex : 0,
+          nextOpId: nextOp.id,
+          nextOpIndex: nextOp.opIndex,
+          wave: nextWave,
+          reason: prevReason,
+        });
       }
       return {
         changedCells,
@@ -560,10 +806,11 @@ export class FireSim {
         intermissionTimer: this.intermissionTimer,
         wave: this.wave,
         fullReset,
+        advanceOperation,
       };
     }
 
-    // 2. Step ballistic water parcels
+    // 2. Step ballistic water parcels (with exact sub-step ground crossing interpolation)
     this._stepParcels(dtSafe, impactEvents);
 
     // 3. Apply accumulated conflict-free wetDelta to touched cells
@@ -587,11 +834,16 @@ export class FireSim {
       });
     }
 
-    // 8. Recompute counts, burningPct, hotClusters, fireHead, targets, and win/loss
+    // 6. Recompute counts, burningPct, hotClusters, fireHead, targets
     this._recomputeMetricsAndTargets();
 
+    // 7. Finalize settled drop bursts and emit structured Drop Outcome Events
+    this._finalizeSettledBursts();
+
+    // 8. Evaluate victory / containment / overrun transitions
     if (this.status === 'active') {
       if (this.burningCount === 0 && this.emberCount === 0) {
+        const opCfg = this.terrain.opConfig;
         if (this.isMegaBasin) {
           this.status = 'intermission';
           this.intermissionReason = 'contained';
@@ -600,6 +852,15 @@ export class FireSim {
         } else {
           this.status = 'victory';
         }
+        this._emitWorldEvent({
+          type: 'fire_contained',
+          opId: opCfg?.id || 'op01',
+          opIndex: typeof opCfg?.opIndex === 'number' ? opCfg.opIndex : 0,
+          wave: this.wave,
+          missionScore: this.missionScore,
+          cabinsAlive: this.cabinsAlive,
+          cabinsTotal: this.cabinsTotal,
+        });
       } else if (this.cabinsTotal > 0 && this.cabinsAlive === 0) {
         if (this.isMegaBasin) {
           this.status = 'intermission';
@@ -630,6 +891,7 @@ export class FireSim {
       intermissionTimer: this.intermissionTimer,
       wave: this.wave,
       fullReset: false,
+      advanceOperation: false,
     };
   }
 
@@ -640,6 +902,9 @@ export class FireSim {
     const halfDt = 0.5 * dtSafe;
 
     for (let i = this.parcelCount - 1; i >= 0; i--) {
+      const x0 = this.parcelX[i];
+      const y0 = this.parcelY[i];
+      const z0 = this.parcelZ[i];
       const vx0 = this.parcelVx[i];
       const vy0 = this.parcelVy[i];
       const vz0 = this.parcelVz[i];
@@ -648,9 +913,9 @@ export class FireSim {
       const vy1 = vy0 - g * dtSafe;
       const vz1 = vz0 + awz * dtSafe;
 
-      const nx = this.parcelX[i] + (vx0 + vx1) * halfDt;
-      const ny = this.parcelY[i] + (vy0 + vy1) * halfDt;
-      const nz = this.parcelZ[i] + (vz0 + vz1) * halfDt;
+      const nx = x0 + (vx0 + vx1) * halfDt;
+      const ny = y0 + (vy0 + vy1) * halfDt;
+      const nz = z0 + (vz0 + vz1) * halfDt;
 
       this.parcelVx[i] = vx1;
       this.parcelVy[i] = vy1;
@@ -661,12 +926,32 @@ export class FireSim {
 
       const groundY = this._sampleGroundY(nx, nz);
       if (ny <= groundY) {
-        const hitFire = this._applyWaterSplash(this.parcelSlot[i], nx, nz, this.parcelReleaseAgl[i]);
-        impactEvents.push({ x: nx, y: groundY, z: nz, extinguished: hitFire });
+        // Sub-step exact terrain crossing interpolation so impacts match predictDropImpact() < 1 cell
+        const prevGroundY = this._sampleGroundY(x0, z0);
+        const prevAbove = Math.max(0, y0 - prevGroundY);
+        const curBelow = Math.max(0, groundY - ny);
+        const denom = prevAbove + curBelow;
+        const frac = denom > 1e-5 ? clamp(prevAbove / denom, 0, 1) : 1.0;
+        const ix = x0 + (nx - x0) * frac;
+        const iz = z0 + (nz - z0) * frac;
+        const iy = this._sampleGroundY(ix, iz);
+
+        const slotId = this.parcelSlot[i];
+        const dropId = this.parcelDropId[i];
+        const hitFire = this._applyWaterSplash(slotId, dropId, ix, iz, this.parcelReleaseAgl[i]);
+        impactEvents.push({ x: ix, y: iy, z: iz, extinguished: hitFire });
+
+        if (dropId > 0) {
+          const burst = this._burstsById.get(dropId);
+          if (burst) {
+            burst.parcelsInFlight = Math.max(0, burst.parcelsInFlight - 1);
+          }
+        }
 
         const last = --this.parcelCount;
         if (i !== last) {
           this.parcelSlot[i] = this.parcelSlot[last];
+          this.parcelDropId[i] = this.parcelDropId[last];
           this.parcelX[i] = this.parcelX[last];
           this.parcelY[i] = this.parcelY[last];
           this.parcelZ[i] = this.parcelZ[last];
@@ -687,6 +972,7 @@ export class FireSim {
     const cells = this.cells;
     const intensityF = this.intensityF;
     const fuelMask = this.terrain.fuelMask;
+    const wetSpan = WET_COOLDOWN_MAX - WET_COOLDOWN_MIN;
 
     for (let d = 0; d < count; d++) {
       const idx = list[d];
@@ -694,20 +980,30 @@ export class FireSim {
       wetDelta[idx] = 0;
       wetDirtyFlags[idx] = 0;
 
+      const dropId = this.cellLastDropId[idx];
+      const burst = dropId > 0 ? this._burstsById.get(dropId) : null;
+
       const st = cells[idx];
       if (st >= 1 && st <= 12) {
         const nextI = intensityF[idx] - wet;
         intensityF[idx] = nextI;
-        if (nextI <= 0.4) {
+        if (nextI <= 1.2) {
           intensityF[idx] = 0;
           cells[idx] = CELL_STATE.WET;
-          this.wetTimer[idx] = 15.0 + this.rng() * 5.0;
+          this.wetTimer[idx] = WET_COOLDOWN_MIN + this.rng() * wetSpan;
           this.phases[idx] = 255;
           this.ignitionAccum[idx] = 0;
           this._addActive(idx);
           this._markChanged(idx);
+          if (burst && !burst.emitted) {
+            burst.cellsExtinguished++;
+            burst.cooledCellSet.delete(idx);
+          }
           this._awardExtinguishAttribution(idx, scoreEvents);
         } else {
+          if (burst && !burst.emitted) {
+            burst.cooledCellSet.add(idx);
+          }
           const q = clamp(Math.round(nextI), 1, 12);
           if (q !== st) {
             cells[idx] = q;
@@ -715,33 +1011,178 @@ export class FireSim {
           }
         }
       } else if (st === CELL_STATE.EMBER_WARN) {
-        if (wet >= 0.8) {
+        if (wet >= 0.6) {
           cells[idx] = CELL_STATE.WET;
           this.emberTimer[idx] = 0;
-          this.wetTimer[idx] = 15.0 + this.rng() * 5.0;
+          this.wetTimer[idx] = WET_COOLDOWN_MIN + this.rng() * wetSpan;
           this.phases[idx] = 255;
           this._addActive(idx);
           this._markChanged(idx);
+          if (burst && !burst.emitted) {
+            burst.cellsExtinguished++;
+            burst.cooledCellSet.delete(idx);
+          }
           this._awardExtinguishAttribution(idx, scoreEvents);
+        } else if (burst && !burst.emitted) {
+          burst.cooledCellSet.add(idx);
         }
       } else if (st === CELL_STATE.INTACT && fuelMask[idx] === 1) {
-        if (wet >= 1.6) {
+        // Any water mist cools pre-heated foliage; >= 1.2 creates a full 28-35 s wet firebreak
+        this.ignitionAccum[idx] = 0;
+        if (wet >= 1.2) {
           cells[idx] = CELL_STATE.WET;
-          this.wetTimer[idx] = 15.0 + this.rng() * 5.0;
-          this.ignitionAccum[idx] = 0;
+          this.wetTimer[idx] = WET_COOLDOWN_MIN + this.rng() * wetSpan;
           this.phases[idx] = 255;
           this._addActive(idx);
           this._markChanged(idx);
         }
       } else if (st === CELL_STATE.WET) {
-        this.wetTimer[idx] = Math.min(20.0, this.wetTimer[idx] + wet * 1.5);
+        this.wetTimer[idx] = Math.min(WET_COOLDOWN_MAX, this.wetTimer[idx] + wet * 2.0);
       }
     }
     this.wetDirtyCount = 0;
   }
 
-  _tryEmberSpot(spotCandidateIdx, wHatX, wHatZ, pilotScale, dtSafe) {
-    const spotRate = (this.isMegaBasin ? 0.02 : 0.012) * pilotScale;
+  /**
+   * Find nearest burning or ember-warning cell to world coordinates (wx, wz).
+   */
+  _findNearestFireCell(wx, wz) {
+    const gs = this.gridSize;
+    const cellSize = this.cellSize;
+    const halfWorld = this.terrain.halfWorld;
+    const cells = this.cells;
+    let bestSq = Infinity;
+    let bestX = 0;
+    let bestZ = 0;
+
+    for (let a = 0; a < this.activeCount; a++) {
+      const idx = this.activeList[a];
+      const st = cells[idx];
+      if (!((st >= 1 && st <= 12) || st === CELL_STATE.EMBER_WARN)) continue;
+      const gx = idx % gs;
+      const gz = (idx - gx) / gs;
+      const fx = (gx + 0.5) * cellSize - halfWorld;
+      const fz = (gz + 0.5) * cellSize - halfWorld;
+      const dx = fx - wx;
+      const dz = fz - wz;
+      const dSq = dx * dx + dz * dz;
+      if (dSq < bestSq) {
+        bestSq = dSq;
+        bestX = fx;
+        bestZ = fz;
+      }
+    }
+
+    if (!Number.isFinite(bestSq)) return null;
+    return { x: bestX, z: bestZ, distM: Math.sqrt(bestSq) };
+  }
+
+  /**
+   * Emit Drop Outcome Events for any pilot water bursts whose parcels have all landed and settled.
+   */
+  _finalizeSettledBursts() {
+    if (this._burstsById.size === 0) return;
+    const now = this.simTime;
+
+    for (const [id, burst] of this._burstsById) {
+      if (burst.emitted) {
+        this._burstsById.delete(id);
+        continue;
+      }
+      if (burst.parcelsInFlight > 0) continue;
+
+      const sinceSpawn = now - burst.lastSpawnTime;
+      const sinceImpact = burst.lastImpactTime >= 0 ? now - burst.lastImpactTime : 0;
+      const settled =
+        burst.impactCount > 0 &&
+        (sinceSpawn >= 0.35 || sinceImpact >= 0.25);
+
+      if (!settled) continue;
+
+      burst.emitted = true;
+      this._burstsById.delete(id);
+      if (this._activeBurstBySlot.get(burst.slotId) === burst) {
+        this._activeBurstBySlot.delete(burst.slotId);
+      }
+
+      const impactX = burst.impactSumX / burst.impactCount;
+      const impactZ = burst.impactSumZ / burst.impactCount;
+      const cellsExtinguished = burst.cellsExtinguished;
+      const cellsCooled = burst.cooledCellSet.size;
+      const pointsAwarded = Math.round(burst.pointsAwarded);
+      const targetFireCount = burst.fireCellsTouched.size;
+
+      let outcome;
+      if (
+        cellsExtinguished >= 3 ||
+        (cellsExtinguished >= 1 && targetFireCount > 0 && cellsExtinguished >= targetFireCount * 0.5)
+      ) {
+        outcome = 'direct';
+      } else if (cellsExtinguished >= 1 || cellsCooled >= 1) {
+        outcome = 'partial';
+      } else {
+        outcome = 'miss';
+      }
+
+      let missType = 'none';
+      let missDirCompass = '';
+      let missDistM = 0;
+
+      if (outcome === 'miss') {
+        const nearest = this._findNearestFireCell(impactX, impactZ);
+        if (nearest) {
+          // Vector from nearest fire -> impact point (shows where the water landed relative to fire)
+          const dx = impactX - nearest.x;
+          const dz = impactZ - nearest.z;
+          missDistM = Math.round(nearest.distM);
+          missDirCompass = vectorToCompass(dx, dz);
+
+          const hMag = Math.hypot(burst.headingSumX, burst.headingSumZ);
+          if (hMag >= 0.5) {
+            const hx = burst.headingSumX / hMag;
+            const hz = burst.headingSumZ / hMag;
+            // Right perpendicular vector: (-hz, hx)
+            const along = dx * hx + dz * hz;
+            const cross = dx * -hz + dz * hx;
+            if (Math.abs(cross) > Math.abs(along) * 1.15) {
+              missType = 'wide';
+            } else if (along > 0) {
+              missType = 'overshot';
+            } else {
+              missType = 'short';
+            }
+          } else {
+            missType = 'wide';
+          }
+        } else {
+          missType = 'wide';
+        }
+      }
+
+      this._emitDropOutcome({
+        dropId: burst.id,
+        slotId: burst.slotId,
+        impactX: Math.round(impactX * 10) / 10,
+        impactZ: Math.round(impactZ * 10) / 10,
+        cellsExtinguished,
+        cellsCooled,
+        pointsAwarded,
+        outcome,
+        missType,
+        missDirCompass,
+        missDistM,
+        cabinSaved: burst.cabinSaved,
+      });
+    }
+  }
+
+  _tryEmberSpot(spotCandidateIdx, wHatX, wHatZ, effPilots, dtSafe) {
+    // Heavily reduced random ember spotting for 1-2 pilots; scales smoothly with larger squadrons
+    const pilotEmberFactor =
+      effPilots <= 2
+        ? 0.22
+        : 0.22 + 0.42 * Math.log(1 + (effPilots - 2));
+    const spotRate = (this.isMegaBasin ? 0.012 : 0.008) * pilotEmberFactor;
     this.emberSpotAccum += spotRate * dtSafe;
     if (this.emberSpotAccum < 1.0) return;
     this.emberSpotAccum -= 1.0;
@@ -749,7 +1190,7 @@ export class FireSim {
     const gs = this.gridSize;
     const sgx = spotCandidateIdx % gs;
     const sgz = (spotCandidateIdx - sgx) / gs;
-    const jumpCells = 3 + Math.floor(this.rng() * 6);
+    const jumpCells = 3 + Math.floor(this.rng() * 5);
     const lateral = (this.rng() - 0.5) * 3;
     const tgx = Math.round(sgx + wHatX * jumpCells - wHatZ * lateral);
     const tgz = Math.round(sgz + wHatZ * jumpCells + wHatX * lateral);
@@ -773,11 +1214,12 @@ export class FireSim {
     const wHatX = windMag > 1e-4 ? this.windVx / windMag : 0;
     const wHatZ = windMag > 1e-4 ? this.windVz / windMag : 0;
     const windSpeedScale = windSpeedKt / 14.0;
-    const pilotScale = this.isMegaBasin
-      ? 1.0 + 0.55 * Math.log(1 + Math.max(0, activeManualPilots))
-      : 1.0;
 
-    const baseSpreadDt = 0.068 * pilotScale * dtSafe;
+    // Unified sublinear pilot pressure scaling: 1.0x at 1 pilot -> ~7.7x at 100 pilots
+    const effPilots = Math.max(1, activeManualPilots || 1);
+    const pilotScale = 1.0 + 1.45 * Math.log(effPilots);
+
+    const baseSpreadDt = BASE_SPREAD_RATE * pilotScale * dtSafe;
     const fuelMask = this.terrain.fuelMask;
     const cellHeights = this.terrain.cellHeights;
     const cells = this.cells;
@@ -786,10 +1228,14 @@ export class FireSim {
     const burnDur = this.burnDuration;
     const ignAccum = this.ignitionAccum;
 
+    // Realistic wind-driven spread: crisp downwind head advance, minimal upwind/flank backing
     const nbrWindFactor = this._nbrWindFactor;
     for (let n = 0; n < 8; n++) {
       const dotW = NBR_UX[n] * wHatX + NBR_UZ[n] * wHatZ;
-      nbrWindFactor[n] = (1.0 + 1.8 * (dotW > 0 ? dotW : 0) * windSpeedScale) / NBR_DIST[n];
+      const windMult = dotW >= 0
+        ? 0.14 + 3.45 * dotW * windSpeedScale
+        : Math.max(0.05, 0.14 + 0.10 * dotW * windSpeedScale);
+      nbrWindFactor[n] = windMult / NBR_DIST[n];
     }
 
     const snapCount = this.activeCount;
@@ -818,7 +1264,7 @@ export class FireSim {
         }
 
         const nextInt = nextFuel > 0.15
-          ? Math.min(12.0, curInt + 0.8 * dtSafe)
+          ? Math.min(12.0, curInt + 0.55 * dtSafe)
           : Math.max(1.0, curInt - 1.5 * dtSafe);
         intensityF[idx] = nextInt;
 
@@ -828,7 +1274,7 @@ export class FireSim {
           this._markChanged(idx);
         }
 
-        if (q >= 7 && this.rng() < 0.04) {
+        if (q >= 7 && this.rng() < 0.03) {
           const sc = q + this.rng() * 4;
           if (sc > spotCandidateScore) {
             spotCandidateScore = sc;
@@ -849,7 +1295,7 @@ export class FireSim {
           if (cells[nIdx] !== CELL_STATE.INTACT || fuelMask[nIdx] !== 1) continue;
 
           const dh = cellHeights[nIdx] - myH;
-          const uphillBoost = dh > 0 ? 1.0 + 1.2 * ((dh * invCellSize) / NBR_DIST[n]) : 1.0;
+          const uphillBoost = dh > 0 ? 1.0 + 1.0 * ((dh * invCellSize) / NBR_DIST[n]) : 1.0;
 
           const prevHeat = ignAccum[nIdx];
           const nextHeat = prevHeat + spreadScale * nbrWindFactor[n] * uphillBoost;
@@ -869,7 +1315,7 @@ export class FireSim {
       } else if (st === CELL_STATE.WET) {
         const nextW = this.wetTimer[idx] - dtSafe;
         this.wetTimer[idx] = nextW;
-        this.phases[idx] = clamp(Math.round((nextW / 20.0) * 255), 0, 255);
+        this.phases[idx] = clamp(Math.round((nextW / WET_COOLDOWN_MAX) * 255), 0, 255);
         if (nextW <= 0) {
           this.wetTimer[idx] = 0;
           cells[idx] = fuelRem[idx] > 0.05 ? CELL_STATE.INTACT : CELL_STATE.CHARRED;
@@ -889,7 +1335,7 @@ export class FireSim {
           this._markChanged(idx);
         }
       } else if (st === CELL_STATE.INTACT) {
-        const nextH = ignAccum[idx] - 0.015 * dtSafe;
+        const nextH = ignAccum[idx] - 0.008 * dtSafe;
         if (nextH <= 0) {
           ignAccum[idx] = 0;
           this._toRemove[removeCount++] = idx;
@@ -905,8 +1351,53 @@ export class FireSim {
       this._removeActive(this._toRemove[r]);
     }
 
-    if (windSpeedKt >= 14 && spotCandidateIdx >= 0) {
-      this._tryEmberSpot(spotCandidateIdx, wHatX, wHatZ, pilotScale, dtSafe);
+    const spotWindMinKt = effPilots <= 2 ? 16 : 14;
+    if (windSpeedKt >= spotWindMinKt && spotCandidateIdx >= 0) {
+      this._tryEmberSpot(spotCandidateIdx, wHatX, wHatZ, effPilots, dtSafe);
+    }
+  }
+
+  _emitCabinRiskTransitions(dtSafe) {
+    const settlements = this.terrain.settlements || [];
+    for (let s = 0; s < this._settlementAlertCooldown.length; s++) {
+      if (this._settlementAlertCooldown[s] > 0) {
+        this._settlementAlertCooldown[s] = Math.max(0, this._settlementAlertCooldown[s] - dtSafe);
+      }
+    }
+
+    for (let s = 0; s < settlements.length; s++) {
+      const stObj = settlements[s];
+      let riskCount = 0;
+      let worstCabin = null;
+      let worstHp = 101;
+      for (let k = 0; k < stObj.cabins.length; k++) {
+        const cid = stObj.cabins[k].id;
+        if (this.cabinHp[cid] > 0 && this.cabinAtRisk[cid] === 1) {
+          riskCount++;
+          if (this.cabinHp[cid] < worstHp) {
+            worstHp = this.cabinHp[cid];
+            worstCabin = this.terrain.cabins[cid];
+          }
+        }
+      }
+
+      const wasAtRisk = this._settlementAtRisk[s] === 1;
+      const nowAtRisk = riskCount > 0;
+      this._settlementAtRisk[s] = nowAtRisk ? 1 : 0;
+
+      if (nowAtRisk && !wasAtRisk && worstCabin && this._settlementAlertCooldown[s] <= 0) {
+        this._settlementAlertCooldown[s] = 22.0;
+        this._emitWorldEvent({
+          type: 'cabin_at_risk',
+          cabinId: worstCabin.id,
+          settlementIdx: s,
+          settlementName: stObj.name,
+          x: worstCabin.x,
+          z: worstCabin.z,
+          hp: this.cabinHp[worstCabin.id],
+          cabinsAtRiskCount: riskCount,
+        });
+      }
     }
   }
 
@@ -958,7 +1449,7 @@ export class FireSim {
           if (dSq <= riskRadiusSq) {
             atRisk = true;
             if (dSq <= dmgRadiusSq && st >= 1 && st <= 12) {
-              dmgRate += 0.9 * (st / 12.0);
+              dmgRate += 0.85 * (st / 12.0);
             }
           }
         }
@@ -1001,6 +1492,7 @@ export class FireSim {
     }
 
     this.cabinsAlive = alive;
+    this._emitCabinRiskTransitions(dt);
   }
 
   _recomputeMetricsAndTargets() {
@@ -1114,7 +1606,70 @@ export class FireSim {
     this.emberCount = embers;
     this.burningPct = (burning / this.totalFlammable) * 100;
 
-    if (headWeight > 0) {
+    // Select top 6 macro-bins prioritized by intensity + proximity to threatened settlement
+    this._binUsed.fill(0);
+    const hot = [];
+    let primaryBin = -1;
+    for (let pick = 0; pick < 6; pick++) {
+      let bestBin = -1;
+      let bestScore = 0;
+      for (let b = 0; b < 64; b++) {
+        const bw = this._binWeight[b];
+        if (this._binUsed[b] !== 0 || bw <= 0) continue;
+        const bx = this._binSumX[b] / bw;
+        const bz = this._binSumZ[b] / bw;
+        const dSet = Math.hypot(bx - primarySetX, bz - primarySetZ);
+        const threatScore = bw * (1.0 + 360.0 / (dSet + 120.0));
+        if (threatScore > bestScore) {
+          bestScore = threatScore;
+          bestBin = b;
+        }
+      }
+      if (bestBin === -1) break;
+      if (pick === 0) primaryBin = bestBin;
+      this._binUsed[bestBin] = 1;
+      const bestW = this._binWeight[bestBin];
+      const cnt = this._binCount[bestBin];
+      hot.push({
+        x: this._binSumX[bestBin] / bestW,
+        z: this._binSumZ[bestBin] / bestW,
+        y: this._binSumY[bestBin] / bestW + 4,
+        intensity: clamp(bestW / (cnt * 12), 0.15, 1.0) * Math.min(1.5, 0.5 + cnt * 0.08),
+      });
+    }
+    this.hotClusters = hot;
+
+    if (primaryBin >= 0) {
+      // Snap fireHead onto an ACTUAL burning cell in the primary cluster (closest to centroid
+      // biased toward settlement) so fireHead NEVER sits inside an extinguished donut hole!
+      const cx = hot[0].x;
+      const cz = hot[0].z;
+      let bestCellX = cx;
+      let bestCellZ = cz;
+      let bestCellScore = Infinity;
+      for (let a = 0; a < this.activeCount; a++) {
+        const idx = this.activeList[a];
+        const st = cells[idx];
+        if (st < 1 || st > 12) continue;
+        const gx = idx % gs;
+        const gz = (idx - gx) / gs;
+        const bx = (gx * invGs8) | 0;
+        const bz = (gz * invGs8) | 0;
+        if (bz * 8 + bx !== primaryBin) continue;
+        const wx = (gx + 0.5) * cellSize - halfWorld;
+        const wz = (gz + 0.5) * cellSize - halfWorld;
+        // Prefer burning cells near the hot core & facing the threatened settlement
+        const dCore = Math.hypot(wx - cx, wz - cz);
+        const dSet = Math.hypot(wx - primarySetX, wz - primarySetZ);
+        const score = dCore * 0.65 + dSet * 0.35 - st * 1.5;
+        if (score < bestCellScore) {
+          bestCellScore = score;
+          bestCellX = wx;
+          bestCellZ = wz;
+        }
+      }
+      this.fireHead = { x: bestCellX, z: bestCellZ };
+    } else if (headWeight > 0) {
       this.fireHead = { x: headSumX / headWeight, z: headSumZ / headWeight };
     } else if (embers > 0) {
       for (let a = 0; a < this.activeCount; a++) {
@@ -1129,30 +1684,6 @@ export class FireSim {
     } else {
       this.fireHead = null;
     }
-
-    // Select top 6 macro-bins without allocating/sorting 64 temporary objects
-    this._binUsed.fill(0);
-    const hot = [];
-    for (let pick = 0; pick < 6; pick++) {
-      let bestBin = -1;
-      let bestW = 0;
-      for (let b = 0; b < 64; b++) {
-        if (this._binUsed[b] === 0 && this._binWeight[b] > bestW) {
-          bestW = this._binWeight[b];
-          bestBin = b;
-        }
-      }
-      if (bestBin === -1) break;
-      this._binUsed[bestBin] = 1;
-      const cnt = this._binCount[bestBin];
-      hot.push({
-        x: this._binSumX[bestBin] / bestW,
-        z: this._binSumZ[bestBin] / bestW,
-        y: this._binSumY[bestBin] / bestW + 4,
-        intensity: clamp(bestW / (cnt * 12), 0.15, 1.0) * Math.min(1.5, 0.5 + cnt * 0.08),
-      });
-    }
-    this.hotClusters = hot;
   }
 
   /**
@@ -1220,6 +1751,7 @@ export class FireSim {
     this.activeCount = 0;
     this.ignitionAccum.fill(0);
     this.attrSlot.fill(-1);
+    this.cellLastDropId.fill(0);
 
     for (let i = 0; i < this.cellCount; i++) {
       const st = this.cells[i];
@@ -1229,7 +1761,7 @@ export class FireSim {
         this._addActive(i);
       } else if (st === CELL_STATE.WET) {
         this.intensityF[i] = 0;
-        this.wetTimer[i] = Math.max(2.0, (this.phases[i] / 255) * 18.0 || 12.0);
+        this.wetTimer[i] = Math.max(4.0, (this.phases[i] / 255) * WET_COOLDOWN_MAX || 30.0);
         this._addActive(i);
       } else if (st === CELL_STATE.EMBER_WARN) {
         this.intensityF[i] = 0;
@@ -1261,10 +1793,12 @@ export class FireSim {
     if (typeof keyState.windDirDeg === 'number') {
       this.windDirDeg = keyState.windDirDeg;
       this.baseWindDirDeg = keyState.windDirDeg;
+      this._lastReportedWindDir = keyState.windDirDeg;
     }
     if (typeof keyState.windSpeedKt === 'number') {
       this.windSpeedKt = keyState.windSpeedKt;
       this.baseWindSpeedKt = keyState.windSpeedKt;
+      this._lastReportedWindSpeed = keyState.windSpeedKt;
     }
     this._updateWindVector();
 
@@ -1284,16 +1818,18 @@ export class FireSim {
       }
     }
 
-    this._updateReplicaCabinRisk();
+    this._updateReplicaCabinRisk(false);
     this._recomputeMetricsAndTargets();
   }
 
   /**
    * Apply incremental `fireRing` delta on an MP replica.
+   * Mirrors remote drop outcomes (`delta.dropOutcomes` or compact `delta.o`) and tactical world events cleanly!
    */
   applyExternalDelta(delta) {
     if (!delta) return [];
     const dirtyIndices = [];
+    const prevStatus = this.status;
 
     const cellList = delta.changedCells || delta.cells || [];
     for (let i = 0; i < cellList.length; i++) {
@@ -1309,7 +1845,7 @@ export class FireSim {
         this._addActive(idx);
       } else if (st === CELL_STATE.WET) {
         this.intensityF[idx] = 0;
-        this.wetTimer[idx] = 16.0;
+        this.wetTimer[idx] = 31.0;
         this._addActive(idx);
       } else if (st === CELL_STATE.EMBER_WARN) {
         this.intensityF[idx] = 0;
@@ -1343,6 +1879,7 @@ export class FireSim {
     if (typeof delta.windSpeedKt === 'number') this.windSpeedKt = delta.windSpeedKt;
     if (typeof delta.windDirDeg === 'number' || typeof delta.windSpeedKt === 'number') {
       this._updateWindVector();
+      this._checkWindShiftEvent(0.5);
     }
 
     if (typeof delta.missionScore === 'number') this.missionScore = delta.missionScore;
@@ -1362,12 +1899,39 @@ export class FireSim {
       }
     }
 
-    this._updateReplicaCabinRisk();
+    // Mirror synced Drop Outcome Events from Host fireRing delta onto replica queue
+    const outcomes = delta.dropOutcomes || delta.o || null;
+    if (Array.isArray(outcomes) && outcomes.length > 0) {
+      for (let i = 0; i < outcomes.length; i++) {
+        const norm = normalizeExternalOutcome(outcomes[i]);
+        if (norm) this._emitDropOutcome(norm);
+      }
+    }
+
+    this._updateReplicaCabinRisk(true);
     this._recomputeMetricsAndTargets();
+
+    // Emit replica fire_contained world event on transition out of active
+    if (
+      prevStatus === 'active' &&
+      (this.status === 'victory' || (this.status === 'intermission' && this.burningCount === 0))
+    ) {
+      const opCfg = this.terrain.opConfig;
+      this._emitWorldEvent({
+        type: 'fire_contained',
+        opId: opCfg?.id || 'op01',
+        opIndex: typeof opCfg?.opIndex === 'number' ? opCfg.opIndex : 0,
+        wave: this.wave,
+        missionScore: this.missionScore,
+        cabinsAlive: this.cabinsAlive,
+        cabinsTotal: this.cabinsTotal,
+      });
+    }
+
     return dirtyIndices;
   }
 
-  _updateReplicaCabinRisk() {
+  _updateReplicaCabinRisk(emitEvents = false) {
     const gs = this.gridSize;
     const cellSize = this.cellSize;
     const halfWorld = this.terrain.halfWorld;
@@ -1401,6 +1965,24 @@ export class FireSim {
         }
       }
       this.cabinAtRisk[c] = risk;
+    }
+
+    if (emitEvents) {
+      this._emitCabinRiskTransitions(0.5);
+    } else {
+      // Seed baseline settlement risk without firing spurious alerts on initial hydration
+      const settlements = this.terrain.settlements || [];
+      for (let s = 0; s < settlements.length; s++) {
+        let anyRisk = 0;
+        for (let k = 0; k < settlements[s].cabins.length; k++) {
+          const cid = settlements[s].cabins[k].id;
+          if (this.cabinHp[cid] > 0 && this.cabinAtRisk[cid] === 1) {
+            anyRisk = 1;
+            break;
+          }
+        }
+        this._settlementAtRisk[s] = anyRisk;
+      }
     }
   }
 
