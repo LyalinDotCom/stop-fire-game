@@ -1,6 +1,6 @@
 // Slide-over Settings, Audio Mixer, Controls, Pilot Profile & Live Squadron Drawer
 // Strictly uses DOM APIs and textContent (zero innerHTML).
-// Single-player mode removed: EMBER FRONT is always one live shared cooperative mission.
+// Supports Solo local flight, Hosted Live Lobbies (with Invite Link), and Live Shared Airspace.
 
 import { LIVERIES } from '../config/liveries.js';
 import { OPERATIONS } from '../config/operations.js';
@@ -65,19 +65,24 @@ function el(tag, className, text) {
 function resolveConnStatus(netState) {
   if (!netState) return 'connecting';
   if (
+    netState.connStatus === 'solo' ||
+    netState.connStatus === 'host' ||
     netState.connStatus === 'online' ||
     netState.connStatus === 'connecting' ||
     netState.connStatus === 'offline_full' ||
     netState.connStatus === 'offline_error'
   ) {
+    if (netState.connStatus === 'online' && netState.status === 'host') return 'host';
     return netState.connStatus;
   }
+  if (netState.mode === 'solo' || netState.status === 'solo') return 'solo';
   if (netState.status === 'syncing') return 'connecting';
   if (netState.status === 'offline' || netState.offlineFallback) {
     const reason = String(netState.offlineReason || '').toLowerCase();
     return reason.includes('full') || reason.includes('100') ? 'offline_full' : 'offline_error';
   }
-  if (netState.status === 'host' || netState.status === 'live') return 'online';
+  if (netState.status === 'host') return 'host';
+  if (netState.status === 'live') return 'online';
   return 'connecting';
 }
 
@@ -89,6 +94,8 @@ export class SettingsDrawer {
     this._open = false;
     this._activeTab = 'audio';
     this._lastLeaderboardKey = '';
+    this._currentInviteUrl = '';
+    this._copyFlashTimer = null;
 
     this._callsign = readStoredCallsign();
     this._colorIdx = readStoredColorIdx();
@@ -181,13 +188,57 @@ export class SettingsDrawer {
     this._airspaceConnLine = el('div', 'ef-airspace-conn-line', 'CONNECTING — Joining Live Shared Airspace...');
     statusCard.appendChild(this._airspaceConnLine);
 
+    const actionsRow = el('div', 'ef-drawer-actions-row');
+
+    this._copyInviteBtn = el('button', 'ef-copy-invite-btn ef-hidden', 'COPY INVITE LINK');
+    this._copyInviteBtn.type = 'button';
+    this._copyInviteBtn.setAttribute('data-action', 'copy-invite');
+    this._copyInviteBtn.addEventListener('click', () => {
+      const url =
+        this._currentInviteUrl ||
+        (typeof window !== 'undefined' && window.location ? window.location.href : '');
+      if (url && typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(url).catch(() => {});
+      }
+      if (this._copyFlashTimer) clearTimeout(this._copyFlashTimer);
+      this._copyInviteBtn.textContent = '✓ INVITE COPIED!';
+      this._copyInviteBtn.classList.add('is-copied');
+      this._copyFlashTimer = setTimeout(() => {
+        this._copyFlashTimer = null;
+        this._copyInviteBtn.textContent = 'COPY INVITE LINK';
+        this._copyInviteBtn.classList.remove('is-copied');
+      }, 2100);
+      if (this._onSettingChange) this._onSettingChange('copyInviteLink', url || true);
+    });
+    actionsRow.appendChild(this._copyInviteBtn);
+
+    this._hostLobbyBtn = el('button', 'ef-host-lobby-btn ef-hidden', 'HOST LIVE LOBBY');
+    this._hostLobbyBtn.type = 'button';
+    this._hostLobbyBtn.setAttribute('data-action', 'host-lobby');
+    this._hostLobbyBtn.addEventListener('click', () => {
+      this.toggle(false);
+      if (this._onSettingChange) this._onSettingChange('hostLobby', true);
+    });
+    actionsRow.appendChild(this._hostLobbyBtn);
+
     this._retryLiveBtn = el('button', 'ef-retry-live-btn ef-hidden', 'RETRY LIVE');
     this._retryLiveBtn.type = 'button';
     this._retryLiveBtn.setAttribute('data-action', 'retry-live');
     this._retryLiveBtn.addEventListener('click', () => {
       if (this._onSettingChange) this._onSettingChange('retryLive', true);
     });
-    statusCard.appendChild(this._retryLiveBtn);
+    actionsRow.appendChild(this._retryLiveBtn);
+
+    this._lobbyMenuBtn = el('button', 'ef-lobby-menu-btn', 'LOBBY MENU');
+    this._lobbyMenuBtn.type = 'button';
+    this._lobbyMenuBtn.setAttribute('data-action', 'open-launch');
+    this._lobbyMenuBtn.addEventListener('click', () => {
+      this.toggle(false);
+      if (this._onSettingChange) this._onSettingChange('openLaunch', true);
+    });
+    actionsRow.appendChild(this._lobbyMenuBtn);
+
+    statusCard.appendChild(actionsRow);
 
     this._airspaceOpTitle = el('div', 'ef-airspace-op-title', 'OPERATION 01 / 05 · Cinderpine Basin');
     statusCard.appendChild(this._airspaceOpTitle);
@@ -356,7 +407,7 @@ export class SettingsDrawer {
     const tips = el(
       'div',
       'ef-tip-box',
-      'Skim alpine lakes below 9 m AGL to scoop water (~1.4 s refill; water skimming is forgiving). Keep clear of treetops (30% hull strike) and ground impact (airframe loss). Wait for the emerald ON TARGET ground ring, press SPACE to extinguish the fire head, and carve dark-teal wet firebreaks ahead of cabins.'
+      'Fly at 25–50 m AGL for concentrated water knockdown: drops above 58 m mist in the air, while flying below 16 m over flames risks thermal heat damage. Dense smoke plumes cause aerodynamic turbulence and updrafts. Skim alpine lakes below 9 m AGL with level wings (< 16° bank) to scoop water rapidly, then carve dark-teal wet firebreaks ahead of cabins.'
     );
     panel.appendChild(tips);
 
@@ -488,14 +539,20 @@ export class SettingsDrawer {
   }
 
   update({ opConfig, netState, settings } = {}) {
-    // 1. Online / Offline Airspace Connection Status
+    // 1. Solo / Host / Online / Offline Airspace Connection Status
     const status = (netState && netState.status) || 'live';
     const connStatus = resolveConnStatus(netState);
     const pilotsCount = Math.max(1, netState && typeof netState.pilotsCount === 'number' ? netState.pilotsCount : 1);
     const pilotsCap = (netState && netState.pilotsCap) || 100;
     const isOffline = connStatus === 'offline_full' || connStatus === 'offline_error';
+    const isSolo = connStatus === 'solo';
+    const isHost = connStatus === 'host' || (connStatus === 'online' && status === 'host');
+    const lobbyTag = netState && netState.worldId ? String(netState.worldId) : '';
+    const inviteUrl = netState && typeof netState.inviteUrl === 'string' ? netState.inviteUrl : '';
+    this._currentInviteUrl = inviteUrl;
 
     this._airspaceStateBadge.classList.remove(
+      'status-solo',
       'status-online',
       'status-host',
       'status-connecting',
@@ -504,15 +561,25 @@ export class SettingsDrawer {
     );
     this._airspaceStateBadge.setAttribute('data-conn-status', connStatus);
 
-    if (connStatus === 'online') {
-      this._airspaceStateBadge.classList.add('status-online');
-      if (status === 'host') this._airspaceStateBadge.classList.add('status-host');
-      this._airspaceStateText.textContent = status === 'host' ? 'ONLINE · HOST' : 'ONLINE';
+    if (isSolo) {
+      this._airspaceStateBadge.classList.add('status-solo');
+      this._airspaceStateText.textContent = 'SOLO · LOCAL';
+      this._airspacePilotsEl.textContent = 'LOCAL MISSION';
+      this._airspaceConnLine.textContent = 'SOLO — Local Single-Player Mission (Zero Network Traffic)';
+    } else if (isHost) {
+      this._airspaceStateBadge.classList.add('status-host');
+      this._airspaceStateText.textContent = 'HOST · LIVE';
       this._airspacePilotsEl.textContent = `${pilotsCount} / ${pilotsCap} PILOTS`;
-      this._airspaceConnLine.textContent =
-        status === 'host'
-          ? 'ONLINE — Live Shared Airspace (Command Host)'
-          : 'ONLINE — Live Shared Airspace';
+      this._airspaceConnLine.textContent = lobbyTag
+        ? `HOST — Live Hosted Lobby (${lobbyTag})`
+        : 'HOST — Live Hosted Lobby (Share invite link with squad)';
+    } else if (connStatus === 'online') {
+      this._airspaceStateBadge.classList.add('status-online');
+      this._airspaceStateText.textContent = 'ONLINE';
+      this._airspacePilotsEl.textContent = `${pilotsCount} / ${pilotsCap} PILOTS`;
+      this._airspaceConnLine.textContent = lobbyTag
+        ? `ONLINE — Live Shared Airspace (${lobbyTag})`
+        : 'ONLINE — Live Shared Airspace';
     } else if (connStatus === 'connecting') {
       this._airspaceStateBadge.classList.add('status-connecting');
       this._airspaceStateText.textContent = 'CONNECTING';
@@ -522,14 +589,16 @@ export class SettingsDrawer {
       this._airspaceStateBadge.classList.add('status-offline-full');
       this._airspaceStateText.textContent = 'OFFLINE · FULL';
       this._airspacePilotsEl.textContent = '100 / 100 FULL';
-      this._airspaceConnLine.textContent = 'OFFLINE — Local Mission (Airspace full · Reload to reconnect)';
+      this._airspaceConnLine.textContent = 'OFFLINE — Local Mission (Airspace full · Host a lobby or retry)';
     } else {
       this._airspaceStateBadge.classList.add('status-offline-error');
       this._airspaceStateText.textContent = 'OFFLINE · LOCAL';
       this._airspacePilotsEl.textContent = 'LOCAL';
-      this._airspaceConnLine.textContent = 'OFFLINE — Local Mission (Reload to reconnect)';
+      this._airspaceConnLine.textContent = 'OFFLINE — Local Mission (Live airspace unreachable)';
     }
 
+    this._copyInviteBtn.classList.toggle('ef-hidden', !(isHost || (connStatus === 'online' && Boolean(inviteUrl))));
+    this._hostLobbyBtn.classList.toggle('ef-hidden', !(isSolo || isOffline));
     this._retryLiveBtn.classList.toggle('ef-hidden', !isOffline);
 
     if (opConfig) {
@@ -649,6 +718,10 @@ export class SettingsDrawer {
   }
 
   dispose() {
+    if (this._copyFlashTimer) {
+      clearTimeout(this._copyFlashTimer);
+      this._copyFlashTimer = null;
+    }
     this.backdropEl.remove();
     this.drawerEl.remove();
   }

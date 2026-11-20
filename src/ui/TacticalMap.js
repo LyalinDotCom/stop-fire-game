@@ -224,11 +224,11 @@ export class TacticalMap {
           data[p + 3] = 228;
         }
       } else if (s === 13) {
-        // Cool dark-cyan wet firebreak (clearly distinct from active fire & deep lakes)
-        data[p] = 36;
-        data[p + 1] = 190;
-        data[p + 2] = 212;
-        data[p + 3] = 190;
+        // Cool dark-cyan wet firebreak (unmistakably distinct from active fire & deep lakes)
+        data[p] = 32;
+        data[p + 1] = 206;
+        data[p + 2] = 224;
+        data[p + 3] = 215;
       } else if (s === 14) {
         // Charred dark ash
         data[p] = 16;
@@ -264,27 +264,52 @@ export class TacticalMap {
     const onTarget = Boolean(dropPreview.onTarget || (dropPreview.fireCellsInTarget > 0));
     const nearDist = Number.isFinite(dropPreview.nearFireDistM) ? dropPreview.nearFireDistM : Infinity;
     const isNear = !onTarget && nearDist < 80;
+    const agl = Number.isFinite(aircraft.agl) ? aircraft.agl : 36;
+    const altZone =
+      dropPreview.altZone === 'optimal' ||
+      dropPreview.altZone === 'too_high' ||
+      dropPreview.altZone === 'too_low'
+        ? dropPreview.altZone
+        : agl > 58
+          ? 'too_high'
+          : agl < 16
+            ? 'too_low'
+            : 'optimal';
+    const isTooHigh = altZone === 'too_high';
+    const isLowDanger = altZone === 'too_low' && (onTarget || nearDist < 90);
 
-    const radiusM = Math.max(14, Math.min(72, dropPreview.radiusM ?? dropPreview.radius ?? 28));
+    const radiusM = Math.max(14, Math.min(88, dropPreview.radiusM ?? dropPreview.radius ?? 28));
     const rx = Math.max(4.5, radiusM * invWorld * w);
     const ry = Math.max(4.5, radiusM * invWorld * h);
     const pulse = 0.5 + 0.5 * Math.sin(nowMs * 0.015);
 
-    const strokeCol = onTarget
-      ? '#38f28b'
-      : isNear
+    const strokeCol = isLowDanger
+      ? '#ff4d45'
+      : isTooHigh
         ? '#f6b73c'
-        : '#66d9ff';
-    const fillCol = onTarget
-      ? `rgba(56, 242, 139, ${0.18 + pulse * 0.14})`
-      : isNear
-        ? 'rgba(246, 183, 60, 0.16)'
-        : 'rgba(102, 217, 255, 0.13)';
+        : onTarget
+          ? '#38f28b'
+          : isNear
+            ? '#f6b73c'
+            : '#66d9ff';
+    const fillCol = isLowDanger
+      ? 'rgba(255, 77, 69, 0.22)'
+      : isTooHigh
+        ? 'rgba(246, 183, 60, 0.12)'
+        : onTarget
+          ? `rgba(56, 242, 139, ${0.18 + pulse * 0.14})`
+          : isNear
+            ? 'rgba(246, 183, 60, 0.16)'
+            : 'rgba(102, 217, 255, 0.13)';
 
     ctx.save();
 
     // Subtle aiming line from aircraft nose to predicted drop impact
-    ctx.strokeStyle = onTarget ? 'rgba(56, 242, 139, 0.45)' : 'rgba(102, 217, 255, 0.30)';
+    ctx.strokeStyle = isTooHigh
+      ? 'rgba(246, 183, 60, 0.36)'
+      : onTarget
+        ? 'rgba(56, 242, 139, 0.45)'
+        : 'rgba(102, 217, 255, 0.30)';
     ctx.lineWidth = 1;
     ctx.setLineDash([2.5, 2.5]);
     ctx.beginPath();
@@ -303,7 +328,11 @@ export class TacticalMap {
       const ex = (dropPreview.corridorEndX + halfWorld) * invWorld * w;
       const ey = (dropPreview.corridorEndZ + halfWorld) * invWorld * h;
       if (Math.hypot(ex - sx, ey - sy) > 2.5) {
-        ctx.strokeStyle = onTarget ? 'rgba(56, 242, 139, 0.38)' : 'rgba(102, 217, 255, 0.28)';
+        ctx.strokeStyle = isTooHigh
+          ? 'rgba(246, 183, 60, 0.24)'
+          : onTarget
+            ? 'rgba(56, 242, 139, 0.38)'
+            : 'rgba(102, 217, 255, 0.28)';
         ctx.lineWidth = Math.max(3, (rx + ry) * 0.55);
         ctx.lineCap = 'round';
         ctx.beginPath();
@@ -313,15 +342,17 @@ export class TacticalMap {
       }
     }
 
-    // Main target footprint ellipse
-    const pulseScale = onTarget ? (1.0 + pulse * 0.14) : 1.0;
+    // Main target footprint ellipse (dashed amber mist ring when TOO HIGH!)
+    const pulseScale = onTarget && !isTooHigh ? (1.0 + pulse * 0.14) : 1.0;
     ctx.fillStyle = fillCol;
     ctx.strokeStyle = strokeCol;
-    ctx.lineWidth = onTarget ? 1.8 : 1.25;
+    ctx.lineWidth = onTarget && !isTooHigh ? 1.8 : 1.25;
+    if (isTooHigh) ctx.setLineDash([3, 2.5]);
     ctx.beginPath();
     ctx.ellipse(ix, iy, rx * pulseScale, ry * pulseScale, 0, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
+    ctx.setLineDash([]);
 
     // Crisp center pip
     ctx.fillStyle = strokeCol;

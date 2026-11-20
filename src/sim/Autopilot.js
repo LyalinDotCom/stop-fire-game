@@ -210,7 +210,7 @@ export class Autopilot {
   /**
    * Advance autopilot state machine and return flight control inputs.
    */
-  update(aircraft, fireSnapshot = {}, dt = 1 / 60) {
+  update(aircraft, fireSnapshot = {}, dt = 1 / 60, fireSim = null) {
     this.phaseTime += dt;
     if (this.extendTimer > 0) {
       this.extendTimer = Math.max(0, this.extendTimer - dt);
@@ -254,7 +254,8 @@ export class Autopilot {
         this.lastTarget = target;
 
         // Shared exact ballistic predictor (matches FireSim parcel impact!)
-        const impact = predictDropImpact(aircraft, fireSnapshot, this.terrain, fireSnapshot);
+        const fireSource = fireSim || fireSnapshot;
+        const impact = predictDropImpact(aircraft, fireSnapshot, this.terrain, fireSource);
         const windLeadX = 0.5 * FLIGHT_CONSTANTS.WIND_DRIFT_FACTOR * windVx * impact.flightTimeSec * impact.flightTimeSec;
         const windLeadZ = 0.5 * FLIGHT_CONSTANTS.WIND_DRIFT_FACTOR * windVz * impact.flightTimeSec * impact.flightTimeSec;
         const aimX = target.x - windLeadX;
@@ -273,14 +274,14 @@ export class Autopilot {
 
         const targetGroundY = Math.max(this.terrain.waterLevel, this.terrain.getHeight(target.x, target.z));
         const curGroundY = Math.max(this.terrain.waterLevel, this.terrain.getHeight(aircraft.x, aircraft.z));
-        // Cruise comfortably at ~45 m AGL, safely above all treetops (<= 16 m)
-        const desiredY = Math.max(curGroundY + 46, lookaheadY + 36, targetGroundY + 46);
+        // Cruise right in peak optimal drop envelope (36-40 m AGL), well above all treetops (<= 16 m)
+        const desiredY = Math.max(curGroundY + 38, lookaheadY + 32, targetGroundY + 38);
         pitch = this._altitudePitch(aircraft, desiredY, 18, -12);
-        throttleDelta = this._commandSpeed(aircraft, 158);
+        throttleDelta = this._commandSpeed(aircraft, 156);
 
         if (primaryTarget && aircraft.tankPct > 15 && aircraft.agl >= 24) {
           const impactDist = Math.hypot(impact.impactX - target.x, impact.impactZ - target.z);
-          const hasCells = Boolean(fireSnapshot && fireSnapshot.cells);
+          const hasCells = Boolean(fireSource && fireSource.cells);
           // Wait until impact footprint solidly overlaps the fire core (not grazing edge 45m early)
           const lockedOnFire = hasCells
             ? impact.onTarget &&
@@ -307,9 +308,9 @@ export class Autopilot {
         drop = aircraft.tankPct > 0.5;
         roll = this._commandRoll(aircraft, 0);
         const curGroundY = Math.max(this.terrain.waterLevel, this.terrain.getHeight(aircraft.x, aircraft.z));
-        const desiredY = Math.max(curGroundY + 46, lookaheadY + 34);
+        const desiredY = Math.max(curGroundY + 38, lookaheadY + 32);
         pitch = this._altitudePitch(aircraft, desiredY, 16, -10);
-        throttleDelta = this._commandSpeed(aircraft, 156);
+        throttleDelta = this._commandSpeed(aircraft, 154);
 
         if (aircraft.tankPct <= 0.5 || this.phaseTime >= 2.2) {
           drop = false;
@@ -423,7 +424,8 @@ export class Autopilot {
         }
 
         const headingErr = wrapDeg(desiredYaw - aircraft.yawDeg);
-        const maxScoopBank = aircraft.agl < 14 ? 18 : 30;
+        // Keep wings level (< 12 deg) when skimming low for smooth optimal 75%/s scoop
+        const maxScoopBank = aircraft.agl < 13 ? 11 : 28;
         roll = this._commandRoll(aircraft, clamp(headingErr * 0.95, -maxScoopBank, maxScoopBank));
 
         const runway = overWaterNow

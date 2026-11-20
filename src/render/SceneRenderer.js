@@ -37,9 +37,15 @@ export class SceneRenderer {
       canvas.style.imageRendering = 'pixelated';
     }
 
-    // Scene + twilight lavender-mauve distance fog
+    // Scene + twilight lavender-mauve distance fog (modulated smoothly inside dense smoke plumes)
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color('#2c2d42');
+    this._baseFogCol = new THREE.Color('#7f6585');
+    this._smokeFogCol = new THREE.Color('#3b3336');
+    this._heatFogCol = new THREE.Color('#6b331c');
+    this._fogWorkCol = new THREE.Color('#7f6585');
+    this._smokeSmooth = 0;
+    this._heatSmooth = 0;
     this.scene.fog = new THREE.Fog('#7f6585', 450, 2400);
 
     // Camera (FOV 52 deg)
@@ -216,9 +222,40 @@ export class SceneRenderer {
     showDropReticle = false,
     dropPreview = null,
     cameraShake = 0,
+    atmosphere = null,
   } = {}) {
     const safeDt = Math.min(Math.max(dt, 0.001), 0.05);
     this._lastElapsed = elapsed;
+
+    // Resolve atmosphere from explicit param or aircraft fields
+    const smokeDensity = atmosphere
+      ? Math.max(0, Math.min(1, atmosphere.smokeDensity || 0))
+      : Math.max(0, Math.min(1, localAircraft?.smokeDensity || 0));
+    const turbulence = atmosphere
+      ? Math.max(0, Math.min(1, atmosphere.turbulence || 0))
+      : Math.max(0, Math.min(1, localAircraft?.turbulence || 0));
+    const heatDanger = atmosphere
+      ? Math.max(0, Math.min(1, atmosphere.heatDanger || 0))
+      : Math.max(0, Math.min(1, localAircraft?.heatDanger || 0));
+    const thermalLift = atmosphere
+      ? Math.max(0, Math.min(1, atmosphere.thermalLift || 0))
+      : Math.max(0, Math.min(1, localAircraft?.thermalLift || 0));
+
+    // Smoothly modulate scene fog for immersive smoke-plume visibility drop & warm thermal haze
+    const fogAlpha = 1.0 - Math.exp(-4.0 * safeDt);
+    this._smokeSmooth += (smokeDensity - this._smokeSmooth) * fogAlpha;
+    this._heatSmooth += (heatDanger - this._heatSmooth) * fogAlpha;
+    if (this.scene.fog) {
+      const s = this._smokeSmooth;
+      const h = this._heatSmooth;
+      this.scene.fog.near = 450 - s * 395; // 450 m -> 55 m inside thick smoke!
+      this.scene.fog.far = 2400 - s * 2120; // 2400 m -> 280 m inside thick smoke!
+      this._fogWorkCol.copy(this._baseFogCol).lerp(this._smokeFogCol, Math.min(1, s * 1.15));
+      if (h > 0.02) {
+        this._fogWorkCol.lerp(this._heatFogCol, Math.min(0.65, h * 0.72));
+      }
+      this.scene.fog.color.copy(this._fogWorkCol);
+    }
 
     // 1. Hero plane pose, livery & wing stencil
     if (localAircraft) {
@@ -251,7 +288,7 @@ export class SceneRenderer {
       if (isCrashed) {
         this._updateCrashCamera(safeDt, elapsed, combinedShake);
       } else {
-        this._updateChaseCamera(localAircraft, safeDt, elapsed, combinedShake);
+        this._updateChaseCamera(localAircraft, safeDt, elapsed, combinedShake, turbulence, heatDanger);
       }
     }
 
@@ -286,6 +323,7 @@ export class SceneRenderer {
         fireSnapshot,
         showDropReticle,
         dropPreview,
+        atmosphere: { smokeDensity, thermalLift, turbulence, heatDanger },
       });
     }
 
@@ -293,7 +331,7 @@ export class SceneRenderer {
     this.renderer.render(this.scene, this.camera);
   }
 
-  _updateChaseCamera(plane, dt, elapsed, extShake) {
+  _updateChaseCamera(plane, dt, elapsed, extShake, turbulence = 0, heatDanger = 0) {
     const yawRad = (plane.yawDeg || 0) * (Math.PI / 180);
     const pitchRad = (plane.pitchDeg || 0) * (Math.PI / 180);
     const rollRad = (plane.rollDeg || 0) * (Math.PI / 180);
@@ -352,24 +390,38 @@ export class SceneRenderer {
       this._camRollLag += (rollRad * 0.28 - this._camRollLag) * rollAlpha;
     }
 
-    // Impulse shake from drop, scoop, bounce, or external caller
+    // Impulse shake from drop, scoop, choppy scoop, smoke turbulence, thermal heat, or external caller
     let shake = extShake || 0;
     if (plane.releasing) shake = Math.max(shake, 0.14);
-    if (plane.scooping) shake = Math.max(shake, 0.18);
+    if (plane.scooping) {
+      shake = Math.max(shake, plane.scoopQuality === 'rough' ? 0.42 : 0.16);
+    }
     if (plane.bounceTimer > 0) shake = Math.max(shake, 0.45 * Math.min(1, plane.bounceTimer / 0.4));
+    if (turbulence > 0.05) {
+      shake = Math.max(shake, turbulence * 0.55);
+    }
+    if (heatDanger > 0.15) {
+      shake = Math.max(shake, heatDanger * 0.70);
+    }
 
     let sx = 0;
     let sy = 0;
+    let rollBuffet = 0;
     if (shake > 0.001) {
-      sx = Math.sin(elapsed * 57.0) * shake * 0.65;
-      sy = Math.cos(elapsed * 73.0) * shake * 0.50;
+      sx = (Math.sin(elapsed * 57.0) * 0.72 + Math.cos(elapsed * 31.3) * 0.28) * shake * 0.65;
+      sy = (Math.cos(elapsed * 73.0) * 0.68 + Math.sin(elapsed * 23.7) * 0.32) * shake * 0.52;
+    }
+    if (turbulence > 0.05 || heatDanger > 0.15) {
+      const buffet = Math.max(turbulence, heatDanger);
+      rollBuffet = (Math.sin(elapsed * 19.5) * 0.6 + Math.cos(elapsed * 33.1) * 0.4) * buffet * 0.045;
     }
 
     this.camera.position.set(this._camPos.x + sx, this._camPos.y + sy, this._camPos.z);
 
-    // Apply 28% damped bank roll to camera up vector around forward axis
-    const sinR = Math.sin(this._camRollLag);
-    const cosR = Math.cos(this._camRollLag);
+    // Apply 28% damped bank roll + turbulence shudder to camera up vector around forward axis
+    const effRoll = this._camRollLag + rollBuffet;
+    const sinR = Math.sin(effRoll);
+    const cosR = Math.cos(effRoll);
     this._camUp.set(
       this._rightVec.x * sinR,
       cosR,

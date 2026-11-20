@@ -1,7 +1,10 @@
 /**
  * EMBER FRONT — Fixed-60Hz Arcade Floatplane Flight Model
  * - Smooth, rock-steady drop-pass handling with crisp auto-leveling
- * - Forgiving lake scooping (<= 9.0 m AGL enter, >= 11.5 m exit, 3.0 m hydroplane cushion, 70%/s refill)
+ * - Altitude drop envelope coaching & skill curve (18-52 m optimal 1.8x peak vs >58 m misted vs <16 m low risk)
+ * - Convective thermal updraft lift, smoke plume aerodynamic turbulence, & low-flame extreme heat ticks
+ * - Realistic heavy-tank inertia (~13% slower climb/roll loaded) & upward drop buoyancy surge on release
+ * - Forgiving water-skim survival (0 damage, 3.0 m hydroplane cushion) + skillful optimal vs rough scooping
  * - Standing tree hull damage (-30 HP, 0.9 s cooldown) and instant non-water ground crash + 3.5 s respawn
  * - Exact shared ballistic drop predictor matching FireSim water parcel physics
  * Pure simulation module — zero DOM / Three.js dependencies.
@@ -18,11 +21,22 @@ export const FLIGHT_CONSTANTS = {
   THROTTLE_MAX_KMH: 195,
   SCOOP_ENTER_AGL: 9.0,
   SCOOP_EXIT_AGL: 11.5,
-  SCOOP_RATE: 70.0,
+  SCOOP_RATE: 75.0,
+  SCOOP_RATE_OPTIMAL: 75.0,
+  SCOOP_RATE_ROUGH: 30.0,
+  SCOOP_OPTIMAL_MAX_ROLL_DEG: 16,
+  SCOOP_OPTIMAL_MIN_SPEED_KMH: 120,
+  SCOOP_OPTIMAL_MAX_SPEED_KMH: 175,
   SCOOP_DRAG: 2.2,
   DROP_RATE: 80.0,
   DROP_GRAVITY: 40.0,
   WIND_DRIFT_FACTOR: 0.35,
+  DROP_BUOYANCY_VY: 3.4,
+  TANK_WEIGHT_PENALTY: 0.13,
+  DROP_ALT_TOO_LOW: 16.0,
+  DROP_ALT_MIN_OPTIMAL: 18.0,
+  DROP_ALT_MAX_OPTIMAL: 52.0,
+  DROP_ALT_TOO_HIGH: 58.0,
   MAX_ROLL_DEG: 48,
   ROLL_RATE_DEG_S: 105,
   ROLL_AUTOLEVEL_DEG_S: 95,
@@ -39,6 +53,7 @@ export const FLIGHT_CONSTANTS = {
   MAX_HP: 100,
   TREE_HIT_DAMAGE: 30,
   TREE_HIT_COOLDOWN_S: 0.9,
+  HEAT_TICK_COOLDOWN_S: 0.85,
   CRASH_RESPAWN_S: 3.5,
 };
 
@@ -64,20 +79,86 @@ function moveToward(current, target, maxDelta) {
 }
 
 /**
+ * Evaluate the aerial firefighting altitude drop envelope for a given AGL.
+ * - `< 16 m`: `'too_low'` / `'low_risk'` — narrow splash + thermal danger over flames
+ * - `16–58 m` (ideal `18–52 m`, peak `25–42 m`): `'optimal'` — concentrated dense curtain (up to 1.8x cooling!)
+ * - `> 58 m`: `'too_high'` / `'misted_high'` — wind shears load into wide mist (1.0x at 55m -> 0.22x at 100m+)
+ *
+ * @param {number} releaseAgl
+ * @returns {{ altZone: 'optimal'|'too_high'|'too_low', dropQuality: 'optimal'|'misted_high'|'low_risk', coolingMult: number, radiusMult: number, releaseAgl: number }}
+ */
+export function evaluateDropAltitude(releaseAgl) {
+  const agl = Math.max(0, Number.isFinite(releaseAgl) ? releaseAgl : 35);
+
+  if (agl < FLIGHT_CONSTANTS.DROP_ALT_TOO_LOW) {
+    const t = clamp(agl / FLIGHT_CONSTANTS.DROP_ALT_TOO_LOW, 0, 1);
+    return {
+      altZone: 'too_low',
+      dropQuality: 'low_risk',
+      coolingMult: 1.05 + 0.15 * t,
+      radiusMult: 0.66 + 0.16 * t,
+      releaseAgl: agl,
+    };
+  }
+
+  if (agl <= FLIGHT_CONSTANTS.DROP_ALT_TOO_HIGH) {
+    let coolingMult;
+    let radiusMult;
+    if (agl >= 25 && agl <= 42) {
+      coolingMult = 1.8;
+      radiusMult = 1.0;
+    } else if (agl < 25) {
+      const u = clamp((agl - 16) / 9, 0, 1);
+      coolingMult = 1.2 + 0.6 * u;
+      radiusMult = 0.85 + 0.15 * u;
+    } else if (agl <= 52) {
+      const u = clamp((agl - 42) / 10, 0, 1);
+      coolingMult = 1.8 - 0.45 * u;
+      radiusMult = 1.0 + 0.08 * u;
+    } else {
+      const u = clamp((agl - 52) / 6, 0, 1);
+      coolingMult = 1.35 - 0.47 * u;
+      radiusMult = 1.08 + 0.06 * u;
+    }
+    return {
+      altZone: 'optimal',
+      dropQuality: 'optimal',
+      coolingMult,
+      radiusMult,
+      releaseAgl: agl,
+    };
+  }
+
+  // > 58 m AGL: wind shears water load into wide weak mist (1.0x @ 55 m -> 0.22x @ 100 m+)
+  const t = clamp((agl - 55) / 45, 0, 1);
+  const coolingMult = Math.max(0.22, 1.0 - (1.0 - 0.22) * Math.pow(t, 0.85));
+  const radiusMult = 1.14 + 0.50 * clamp((agl - 58) / 42, 0, 1);
+  return {
+    altZone: 'too_high',
+    dropQuality: 'misted_high',
+    coolingMult,
+    radiusMult,
+    releaseAgl: agl,
+  };
+}
+
+/**
  * Shared water splash impact radius (meters) used identically by FireSim & predictDropImpact.
- * Yields ~2.2-2.8x cellSize (~35-45 m on 16 m grids) at normal drop altitudes.
+ * Tight & dense in optimal 25-42 m window (~42 m on 16 m grid), narrows < 16 m, widens into mist > 58 m.
  * @param {number} releaseAgl
  * @param {number} [cellSize=16]
  * @returns {number}
  */
 export function computeSplashRadius(releaseAgl, cellSize = 16) {
-  const agl = Math.max(0, Number.isFinite(releaseAgl) ? releaseAgl : 40);
+  const agl = Math.max(0, Number.isFinite(releaseAgl) ? releaseAgl : 35);
   const scale = (cellSize || 16) / 16;
-  return clamp((32 + 0.30 * agl) * scale, 34 * scale, 54 * scale);
+  const { radiusMult } = evaluateDropAltitude(agl);
+  const baseR = 44.0 * scale;
+  return clamp(baseR * radiusMult, 28 * scale, 74 * scale);
 }
 
 /**
- * Create a new AircraftState matching docs/INTERFACES.md §3 plus hull/crash fields.
+ * Create a new AircraftState matching docs/INTERFACES.md §3 plus hull, crash, scoop & atmosphere fields.
  * @param {object} opts
  */
 export function createAircraftState(opts = {}) {
@@ -113,6 +194,7 @@ export function createAircraftState(opts = {}) {
     vy: Math.sin(pitchRad) * vMs,
     vz: -Math.cos(yawRad) * cosP * vMs,
     scooping: Boolean(opts.scooping ?? false),
+    scoopQuality: opts.scoopQuality ?? 'none',
     releasing: Boolean(opts.releasing ?? false),
     dropBurstTimer: opts.dropBurstTimer ?? 0,
     stallWarn: Boolean(opts.stallWarn ?? false),
@@ -128,6 +210,12 @@ export function createAircraftState(opts = {}) {
     crashTimer: opts.crashTimer ?? 0,
     crashReason: opts.crashReason ?? '',
     treeHitCooldown: opts.treeHitCooldown ?? 0,
+    heatTickCooldown: opts.heatTickCooldown ?? 0,
+    turbulence: 0,
+    smokeDensity: 0,
+    thermalLift: 0,
+    heatDanger: 0,
+    turbTime: 0,
   };
 }
 
@@ -148,7 +236,6 @@ function computeRespawnPose(state, terrain) {
   const halfWorld = terrain?.halfWorld ?? 1024;
   const radius = halfWorld * 0.64;
   const slotSeed = typeof state.slotId === 'number' ? state.slotId : 7;
-  // Staggered angle on basin perimeter well inside outer mountain ring
   const angleDeg = (slotSeed * 137.508 + 215) % 360;
   const rad = angleDeg * DEG2RAD;
   const rx = Math.sin(rad) * radius;
@@ -167,12 +254,17 @@ function triggerCrash(state, reason, events) {
   state.tankPct = 0;
   state.releasing = false;
   state.scooping = false;
+  state.scoopQuality = 'none';
   state.dropBurstTimer = 0;
   state.stallWarn = false;
   state.vx = 0;
   state.vy = 0;
   state.vz = 0;
   state.speedKmh = 0;
+  state.turbulence = 0;
+  state.smokeDensity = 0;
+  state.thermalLift = 0;
+  state.heatDanger = 0;
 
   const crashEv = {
     type: 'plane_crash',
@@ -193,29 +285,35 @@ function triggerCrash(state, reason, events) {
  * @param {object} [input]
  * @param {import('./TerrainGen.js').TerrainData} terrain
  * @param {number} dt
- * @param {{ externalTankSync?: boolean, fireCells?: Uint8Array|null }} [options]
+ * @param {{ externalTankSync?: boolean, fireCells?: Uint8Array|null, atmosphere?: { smokeDensity?: number, thermalLift?: number, turbulence?: number, heatDanger?: number }|null, fireSim?: object|null }} [options]
  */
 export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   const events = {
     bounced: false,
     scoopStarted: false,
     scoopEnded: false,
+    scoopRough: false,
+    scoopRoughStarted: false,
     tankFull: false,
     dropStarted: false,
     dropEnded: false,
     treeHit: null,
+    heatDamage: null,
     planeCrash: null,
     respawned: false,
     flightEvents: [],
   };
 
-  // Lazily initialize hull fields on legacy state objects if needed
+  // Lazily initialize extended fields on legacy state objects if needed
   if (typeof state.maxHp !== 'number') state.maxHp = FLIGHT_CONSTANTS.MAX_HP;
   if (typeof state.hp !== 'number') state.hp = state.maxHp;
   if (typeof state.crashed !== 'boolean') state.crashed = false;
   if (typeof state.crashTimer !== 'number') state.crashTimer = 0;
   if (typeof state.crashReason !== 'string') state.crashReason = '';
   if (typeof state.treeHitCooldown !== 'number') state.treeHitCooldown = 0;
+  if (typeof state.heatTickCooldown !== 'number') state.heatTickCooldown = 0;
+  if (typeof state.scoopQuality !== 'string') state.scoopQuality = 'none';
+  if (typeof state.turbTime !== 'number') state.turbTime = 0;
 
   const dtSafe = Math.max(0, Math.min(dt, 0.05));
   if (dtSafe <= 0) return { events };
@@ -224,11 +322,16 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   if (state.crashed) {
     state.releasing = false;
     state.scooping = false;
+    state.scoopQuality = 'none';
     state.dropBurstTimer = 0;
     state.vx = 0;
     state.vy = 0;
     state.vz = 0;
     state.speedKmh = 0;
+    state.turbulence = 0;
+    state.smokeDensity = 0;
+    state.thermalLift = 0;
+    state.heatDanger = 0;
     state.crashTimer = Math.max(0, state.crashTimer - dtSafe);
 
     if (state.crashTimer <= 0) {
@@ -260,6 +363,7 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
       state.stallWarn = false;
       state.outOfBounds = false;
       state.treeHitCooldown = 1.5;
+      state.heatTickCooldown = 1.0;
 
       events.respawned = true;
       events.flightEvents.push({
@@ -272,8 +376,12 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
     return { events };
   }
 
+  state.turbTime += dtSafe;
   if (state.treeHitCooldown > 0) {
     state.treeHitCooldown = Math.max(0, state.treeHitCooldown - dtSafe);
+  }
+  if (state.heatTickCooldown > 0) {
+    state.heatTickCooldown = Math.max(0, state.heatTickCooldown - dtSafe);
   }
   if (state.bounceTimer > 0) {
     state.bounceTimer = Math.max(0, state.bounceTimer - dtSafe);
@@ -282,6 +390,27 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   const pitchIn = clamp(input.pitch ?? 0, -1, 1);
   const rollIn = clamp(input.roll ?? 0, -1, 1);
   const throttleDelta = clamp(input.throttleDelta ?? 0, -1, 1);
+
+  // Sample fire atmosphere (smoke plumes, convective thermal columns, low-altitude flame heat)
+  const atm = options.atmosphere
+    ? options.atmosphere
+    : options.fireSim && typeof options.fireSim.sampleFireAtmosphere === 'function'
+      ? options.fireSim.sampleFireAtmosphere(state.x, state.y, state.z)
+      : null;
+
+  const smokeDensity = atm ? clamp(Number(atm.smokeDensity) || 0, 0, 1) : 0;
+  const thermalLift = atm ? clamp(Number(atm.thermalLift) || 0, 0, 1) : 0;
+  const turbulence = atm ? clamp(Number(atm.turbulence) || 0, 0, 1) : 0;
+  const heatDanger = atm ? clamp(Number(atm.heatDanger) || 0, 0, 1) : 0;
+
+  state.smokeDensity = smokeDensity;
+  state.thermalLift = thermalLift;
+  state.turbulence = turbulence;
+  state.heatDanger = heatDanger;
+
+  // Heavy water load inertia: 100% tank feels ~13% heavier on roll & climb authority
+  const tankNorm = clamp((state.tankPct ?? 0) / 100, 0, 1);
+  const weightAgility = 1.0 - FLIGHT_CONSTANTS.TANK_WEIGHT_PENALTY * tankNorm;
 
   // 1. Throttle & target cruise speed
   state.throttle = clamp(state.throttle + throttleDelta * 0.6 * dtSafe, 0, 1);
@@ -295,31 +424,35 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   const isOob = Math.abs(state.x) > fenceLimit || Math.abs(state.z) > fenceLimit;
   state.outOfBounds = isOob;
 
-  // 3. Roll dynamics: smooth bank-in, crisp auto-level when released for rock-steady aiming
+  // 3. Roll dynamics: tank-weighted bank-in, crisp auto-level when released (softened in heavy turbulence so wings genuinely rock)
+  const apAtmScale = state.autopilot ? 0.35 : 1.0;
+  const effectiveTurb = state.scooping ? 0 : turbulence * apAtmScale;
   if (isOob) {
     const inwardYawDeg = normHeading(Math.atan2(-state.x, state.z) * RAD2DEG);
     const err = wrapDeg(inwardYawDeg - state.yawDeg);
     const targetRoll = clamp(err * 0.9, -42, 42);
     state.rollDeg = moveToward(state.rollDeg, targetRoll, FLIGHT_CONSTANTS.ROLL_RATE_DEG_S * dtSafe);
   } else if (Math.abs(rollIn) > 0.01) {
-    // Slightly gentler fine-control response near wings-level for pinpoint fireline alignment
     const bankMag = Math.abs(state.rollDeg) / FLIGHT_CONSTANTS.MAX_ROLL_DEG;
     const fineFactor = Math.sign(rollIn) === Math.sign(state.rollDeg) || Math.abs(state.rollDeg) < 10
       ? 0.78 + 0.22 * bankMag
-      : 1.15; // snappy counter-bank recovery
-    state.rollDeg += rollIn * FLIGHT_CONSTANTS.ROLL_RATE_DEG_S * fineFactor * dtSafe;
+      : 1.15;
+    state.rollDeg += rollIn * FLIGHT_CONSTANTS.ROLL_RATE_DEG_S * fineFactor * weightAgility * dtSafe;
   } else {
-    state.rollDeg = moveToward(state.rollDeg, 0, FLIGHT_CONSTANTS.ROLL_AUTOLEVEL_DEG_S * dtSafe);
+    const autoLevelRate = FLIGHT_CONSTANTS.ROLL_AUTOLEVEL_DEG_S * (1.0 - 0.78 * effectiveTurb);
+    state.rollDeg = moveToward(state.rollDeg, 0, autoLevelRate * dtSafe);
   }
   state.rollDeg = clamp(state.rollDeg, -FLIGHT_CONSTANTS.MAX_ROLL_DEG, FLIGHT_CONSTANTS.MAX_ROLL_DEG);
 
-  // 4. Pitch dynamics: smooth response + snappy auto-trim + gentle bank-lift assist
+  // 4. Pitch dynamics: tank-weighted climb authority + snappy auto-trim + buoyancy relief + gentle bank-lift assist
   if (Math.abs(pitchIn) > 0.01) {
-    state.pitchDeg += pitchIn * FLIGHT_CONSTANTS.PITCH_RATE_DEG_S * dtSafe;
+    const pitchWeight = pitchIn > 0 ? weightAgility : 1.0 + 0.05 * tankNorm;
+    state.pitchDeg += pitchIn * FLIGHT_CONSTANTS.PITCH_RATE_DEG_S * pitchWeight * dtSafe;
   } else {
-    // Gentle coordinated turn trim keeps nose flat during banking turns
     const bankTrimTarget = Math.min(2.2, (Math.abs(state.rollDeg) / FLIGHT_CONSTANTS.MAX_ROLL_DEG) * 1.8);
-    state.pitchDeg = moveToward(state.pitchDeg, bankTrimTarget, FLIGHT_CONSTANTS.PITCH_TRIM_DEG_S * dtSafe);
+    const buoyancyTrimBoost = state.releasing ? 4.2 * (state.autopilot ? 0.45 : 1.0) : 0;
+    const pitchTrimRate = FLIGHT_CONSTANTS.PITCH_TRIM_DEG_S * (1.0 - 0.65 * effectiveTurb);
+    state.pitchDeg = moveToward(state.pitchDeg, bankTrimTarget + buoyancyTrimBoost, pitchTrimRate * dtSafe);
   }
 
   // Stall guard (< 120 km/h -> soft nose-down assist -10 deg/s until > 128 km/h)
@@ -346,6 +479,30 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
     }
   }
 
+  // 4b. Convective thermal updraft & aerodynamic smoke/heat turbulence (applied after trim so wings/nose genuinely buck!)
+  let thermalUpdraftMs = 0;
+  let turbVertMs = 0;
+  if (!state.scooping) {
+    if (thermalLift > 0.04) {
+      const liftBlend = Math.min(1, thermalLift * 1.8);
+      thermalUpdraftMs = (2.5 + 4.0 * thermalLift) * liftBlend * apAtmScale;
+      state.pitchDeg += thermalUpdraftMs * 0.55 * dtSafe;
+    }
+    if (turbulence > 0.04) {
+      const t = state.turbTime;
+      const gustRoll = Math.sin(t * 7.3) * 0.62 + Math.sin(t * 17.1 + 1.4) * 0.38;
+      const gustPitch = Math.cos(t * 6.1 + 0.7) * 0.55 + Math.sin(t * 14.7 + 2.3) * 0.45;
+      const gustVert = Math.sin(t * 9.7 + 0.3) * 0.65 + Math.cos(t * 19.3) * 0.35;
+      state.rollDeg = clamp(
+        state.rollDeg + gustRoll * turbulence * 48.0 * apAtmScale * dtSafe,
+        -FLIGHT_CONSTANTS.MAX_ROLL_DEG,
+        FLIGHT_CONSTANTS.MAX_ROLL_DEG
+      );
+      state.pitchDeg += gustPitch * turbulence * 20.0 * apAtmScale * dtSafe;
+      turbVertMs = gustVert * turbulence * 4.0 * apAtmScale;
+    }
+  }
+
   state.pitchDeg = clamp(state.pitchDeg, -FLIGHT_CONSTANTS.MAX_PITCH_DEG, FLIGHT_CONSTANTS.MAX_PITCH_DEG);
 
   // 5. Coordinated turn heading rate
@@ -359,24 +516,26 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   );
   state.yawDeg = normHeading(state.yawDeg + yawRateRad * RAD2DEG * dtSafe);
 
-  // 6. Airspeed integration (energy exchange, gentle scoop drag, relaxation tau = 2.0 s)
-  const energyAccel = -38.0 * Math.sin(pitchRad);
+  // 6. Airspeed integration (heavier climb energy bleed when loaded, gentle/rough scoop drag)
+  const energyAccel = -(35.0 + 7.5 * tankNorm) * Math.sin(pitchRad);
   const relaxAccel = (vTargetKmh - state.speedKmh) / 2.0;
-  const dragAccel = state.scooping ? -FLIGHT_CONSTANTS.SCOOP_DRAG : 0;
+  const dragAccel = state.scooping
+    ? -(state.scoopQuality === 'rough' ? FLIGHT_CONSTANTS.SCOOP_DRAG * 2.1 : FLIGHT_CONSTANTS.SCOOP_DRAG)
+    : 0;
   state.speedKmh = clamp(
     state.speedKmh + (energyAccel + relaxAccel + dragAccel) * dtSafe,
     FLIGHT_CONSTANTS.MIN_SPEED_KMH,
     FLIGHT_CONSTANTS.MAX_SPEED_KMH
   );
 
-  // 7. Integrate velocity and position
+  // 7. Integrate velocity and position (+ convective updraft & turbulence vertical gusts)
   const yawRad = state.yawDeg * DEG2RAD;
   const vMs = state.speedKmh / 3.6;
   const cosP = Math.cos(pitchRad);
   const sinP = Math.sin(pitchRad);
 
   state.vx = Math.sin(yawRad) * cosP * vMs;
-  state.vy = sinP * vMs;
+  state.vy = sinP * vMs + thermalUpdraftMs + turbVertMs;
   state.vz = -Math.cos(yawRad) * cosP * vMs;
 
   state.x = clamp(state.x + state.vx * dtSafe, -hardLimit, hardLimit);
@@ -410,25 +569,19 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
     }
 
     // Standing tree collision = hull damage (-30 HP, 0.9 s cooldown, speed drop + jolt)
+    const fireCells = options.fireCells || options.fireSim?.cells || null;
     if (
       state.treeHitCooldown <= 0 &&
       agl <= 19.0 &&
       typeof terrain.findCollidingTree === 'function'
     ) {
-      const hitTree = terrain.findCollidingTree(
-        state.x,
-        state.y,
-        state.z,
-        2.6,
-        options.fireCells || null
-      );
+      const hitTree = terrain.findCollidingTree(state.x, state.y, state.z, 2.6, fireCells);
       if (hitTree) {
         const dmg = FLIGHT_CONSTANTS.TREE_HIT_DAMAGE;
         state.hp = Math.max(0, state.hp - dmg);
         state.treeHitCooldown = FLIGHT_CONSTANTS.TREE_HIT_COOLDOWN_S;
         state.speedKmh = Math.max(FLIGHT_CONSTANTS.MIN_SPEED_KMH, state.speedKmh * 0.84);
 
-        // Deflect slightly away from tree laterally and kick nose up
         const rightX = Math.cos(yawRad);
         const rightZ = Math.sin(yawRad);
         const sideSign = (state.x - hitTree.x) * rightX + (state.z - hitTree.z) * rightZ >= 0 ? 1 : -1;
@@ -467,6 +620,36 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
         }
       }
     }
+
+    // Extreme convective flame heat hull ticks if flying dangerously low (< 16 m AGL) straight through raging fire
+    if (
+      !state.autopilot &&
+      heatDanger >= 0.45 &&
+      agl < FLIGHT_CONSTANTS.DROP_ALT_TOO_LOW + 0.5 &&
+      state.heatTickCooldown <= 0
+    ) {
+      const dmg = Math.round(6 + heatDanger * 8);
+      state.hp = Math.max(0, state.hp - dmg);
+      state.heatTickCooldown = FLIGHT_CONSTANTS.HEAT_TICK_COOLDOWN_S;
+
+      const heatEv = {
+        type: 'heat_damage',
+        x: state.x,
+        y: state.y,
+        z: state.z,
+        damage: dmg,
+        hp: state.hp,
+        heatDanger,
+      };
+      events.heatDamage = heatEv;
+      events.flightEvents.push(heatEv);
+
+      if (state.hp <= 0) {
+        state.agl = agl;
+        triggerCrash(state, 'heat', events);
+        return { events };
+      }
+    }
   }
 
   // Hard ceiling clamp at 220 m AGL
@@ -479,7 +662,7 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
 
   state.agl = agl;
 
-  // 9. Forgiving scoop hysteresis: enter <= 9.0 m AGL over water, exit >= 11.5 m or leaving water
+  // 9. Forgiving scoop hysteresis + skillful technique check (optimal 75%/s vs rough 30%/s)
   const wasScooping = state.scooping;
   if (!state.scooping) {
     if (overWater && state.agl <= FLIGHT_CONSTANTS.SCOOP_ENTER_AGL) {
@@ -495,14 +678,46 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   if (!state.scooping && wasScooping) events.scoopEnded = true;
 
   if (state.scooping) {
+    const prevQuality = state.scoopQuality;
+    const isOptimalScoop =
+      Math.abs(state.rollDeg) < FLIGHT_CONSTANTS.SCOOP_OPTIMAL_MAX_ROLL_DEG &&
+      state.speedKmh >= FLIGHT_CONSTANTS.SCOOP_OPTIMAL_MIN_SPEED_KMH &&
+      state.speedKmh <= FLIGHT_CONSTANTS.SCOOP_OPTIMAL_MAX_SPEED_KMH;
+
+    state.scoopQuality = isOptimalScoop ? 'optimal' : 'rough';
+    const scoopRate = isOptimalScoop
+      ? FLIGHT_CONSTANTS.SCOOP_RATE_OPTIMAL
+      : FLIGHT_CONSTANTS.SCOOP_RATE_ROUGH;
+
+    if (!isOptimalScoop) {
+      events.scoopRough = true;
+      if (prevQuality !== 'rough') {
+        events.scoopRoughStarted = true;
+      }
+      // Choppy spray jolt & wave slap (never damages hull — forgiving survival!)
+      const waveChop = Math.sin(state.turbTime * 23.0) * 14.0;
+      state.rollDeg = clamp(
+        moveToward(state.rollDeg, 0, 22.0 * dtSafe) + waveChop * dtSafe,
+        -FLIGHT_CONSTANTS.MAX_ROLL_DEG,
+        FLIGHT_CONSTANTS.MAX_ROLL_DEG
+      );
+      state.pitchDeg = clamp(
+        state.pitchDeg + (Math.cos(state.turbTime * 19.0) * 6.0 + 3.0) * dtSafe,
+        0,
+        FLIGHT_CONSTANTS.MAX_PITCH_DEG
+      );
+    }
+
     const prevTank = state.tankPct;
-    state.tankPct = Math.min(100, state.tankPct + FLIGHT_CONSTANTS.SCOOP_RATE * dtSafe);
+    state.tankPct = Math.min(100, state.tankPct + scoopRate * dtSafe);
     if (prevTank < 100 && state.tankPct >= 100) {
       events.tankFull = true;
     }
+  } else {
+    state.scoopQuality = 'none';
   }
 
-  // 10. Water drop & 0.25 s (20%) minimum tactical burst
+  // 10. Water drop, 0.25 s minimum tactical burst & upward drop buoyancy lift surge!
   const wasReleasing = state.releasing;
   if (input.dropJustPressed && state.tankPct > 0.01 && !state.scooping) {
     state.dropBurstTimer = Math.max(state.dropBurstTimer, FLIGHT_CONSTANTS.MIN_DROP_BURST_S);
@@ -518,6 +733,25 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
     if (state.tankPct <= 0) {
       state.dropBurstTimer = 0;
     }
+
+    // Real upward buoyancy / lift surge as tons of water drop from the belly!
+    const buoyancyScale = state.autopilot ? 0.45 : 1.0;
+    const buoyancyVy = FLIGHT_CONSTANTS.DROP_BUOYANCY_VY * buoyancyScale;
+    state.y += buoyancyVy * dtSafe;
+    state.vy += buoyancyVy;
+    if (pitchIn >= -0.05) {
+      state.pitchDeg = clamp(
+        state.pitchDeg + 5.2 * buoyancyScale * dtSafe,
+        -FLIGHT_CONSTANTS.MAX_PITCH_DEG,
+        FLIGHT_CONSTANTS.MAX_PITCH_DEG
+      );
+    }
+    state.speedKmh = clamp(
+      state.speedKmh + 3.0 * buoyancyScale * dtSafe,
+      FLIGHT_CONSTANTS.MIN_SPEED_KMH,
+      FLIGHT_CONSTANTS.MAX_SPEED_KMH
+    );
+    state.agl = Math.min(FLIGHT_CONSTANTS.HARD_CEILING_AGL, state.y - surfaceY);
   } else {
     state.releasing = false;
     if (state.dropBurstTimer > 0) {
@@ -551,7 +785,6 @@ function evaluateFireTarget(impactX, impactZ, radiusM, terrain, fireSource) {
   let fireCellsInTarget = 0;
   let nearestSq = Infinity;
 
-  // Fast path: if FireSim instance with sparse activeList, scan activeList directly!
   if (fireSource.activeList && typeof fireSource.activeCount === 'number') {
     const activeList = fireSource.activeList;
     const count = fireSource.activeCount;
@@ -575,7 +808,6 @@ function evaluateFireTarget(impactX, impactZ, radiusM, terrain, fireSource) {
     };
   }
 
-  // Snapshot path: scan local +/- 12-cell window (~192 m) around impact first
   const cgx = Math.floor((impactX + halfWorld) / cellSize);
   const cgz = Math.floor((impactZ + halfWorld) / cellSize);
   const searchCells = Math.max(Math.ceil(radiusM / cellSize) + 2, 12);
@@ -600,7 +832,6 @@ function evaluateFireTarget(impactX, impactZ, radiusM, terrain, fireSource) {
     }
   }
 
-  // Fallback distance to hotClusters / fireHead if no fire in local 192 m window
   if (!Number.isFinite(nearestSq)) {
     const clusters = fireSource.hotClusters;
     if (Array.isArray(clusters)) {
@@ -626,7 +857,7 @@ function evaluateFireTarget(impactX, impactZ, radiusM, terrain, fireSource) {
 
 /**
  * Exact shared ballistic water drop impact predictor.
- * Uses the EXACT same gravity, wind-drift, and splash-radius equations as FireSim's falling parcels.
+ * Uses the EXACT same gravity, wind-drift, altitude-envelope, and splash-radius equations as FireSim.
  *
  * Accepts BOTH:
  *   - New signature:    predictDropImpact(planeState, windState, terrain, fireSim?)
@@ -690,16 +921,15 @@ export function predictDropImpact(planeState, windOrVx, terrainOrVz, fireSimOrTe
     iz = z0 + vz * tFall + 0.5 * awz * tFall * tFall;
     groundY = Math.max(terrain.waterLevel, terrain.getHeight(ix, iz));
   }
-  // Final unblended exact evaluation on converged terrain elevation
   const finalH = Math.max(0.25, y0 - groundY);
   tFall = Math.max(0.02, (vy + Math.sqrt(Math.max(0, vy * vy + 2 * g * finalH))) / g);
   ix = x0 + vx * tFall + 0.5 * awx * tFall * tFall;
   iz = z0 + vz * tFall + 0.5 * awz * tFall * tFall;
   groundY = Math.max(terrain.waterLevel, terrain.getHeight(ix, iz));
 
+  const altEval = evaluateDropAltitude(releaseAgl);
   const radiusM = computeSplashRadius(releaseAgl, terrain.cellSize);
 
-  // Predicted water curtain corridor from immediate release to end of tactical burst
   const tankPct = Number.isFinite(planeState.tankPct) ? planeState.tankPct : 100;
   const burstDur = tankPct > 0
     ? clamp(tankPct / FLIGHT_CONSTANTS.DROP_RATE, FLIGHT_CONSTANTS.MIN_DROP_BURST_S, 1.0)
@@ -732,6 +962,10 @@ export function predictDropImpact(planeState, windOrVx, terrainOrVz, fireSimOrTe
     fireCellsInTarget,
     nearFireDistM,
     onTarget,
+    altZone: altEval.altZone,
+    dropQuality: altEval.dropQuality,
+    releaseAgl,
+    coolingMult: altEval.coolingMult,
     // Legacy aliases preserved for backward compatibility
     x: ix,
     z: iz,

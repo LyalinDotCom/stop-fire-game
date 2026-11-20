@@ -6,7 +6,7 @@
  */
 
 import { createRng } from './TerrainGen.js';
-import { FLIGHT_CONSTANTS, computeSplashRadius } from './FlightModel.js';
+import { FLIGHT_CONSTANTS, computeSplashRadius, evaluateDropAltitude } from './FlightModel.js';
 import { getNextOperation } from '../config/operations.js';
 
 const DEG2RAD = Math.PI / 180;
@@ -35,6 +35,7 @@ export const SCORE = {
 export const OUTCOME_CODES = ['direct', 'partial', 'miss'];
 export const MISS_CODES = ['none', 'overshot', 'short', 'wide'];
 export const COMPASS_DIRS = ['', 'N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+export const DROP_QUALITY_CODES = ['optimal', 'misted_high', 'low_risk'];
 
 // Wet firebreak cooldown bounds (seconds)
 export const WET_COOLDOWN_MIN = 28.0;
@@ -74,7 +75,7 @@ function vectorToCompass(dx, dz) {
 function normalizeExternalOutcome(raw) {
   if (!raw) return null;
   if (Array.isArray(raw)) {
-    // Compact fireRing tuple: [slotId, ix, iz, cells, pts, outcomeCode, missCode, dirCode, missDistM?, cabinSaved?]
+    // Compact fireRing tuple: [slotId, ix, iz, cells, pts, outcomeCode, missCode, dirCode, missDistM?, cabinSaved?, qualityCode?, releaseAgl?]
     return {
       dropId: 0,
       slotId: raw[0] | 0,
@@ -88,6 +89,8 @@ function normalizeExternalOutcome(raw) {
       missDirCompass: COMPASS_DIRS[raw[7] | 0] || '',
       missDistM: Math.max(0, Math.round(Number(raw[8]) || 0)),
       cabinSaved: Boolean(raw[9]),
+      dropQuality: DROP_QUALITY_CODES[raw[10] | 0] || 'optimal',
+      releaseAgl: raw[11] != null ? Math.max(0, Math.round(Number(raw[11]) || 0)) : 35,
     };
   }
   return {
@@ -103,6 +106,8 @@ function normalizeExternalOutcome(raw) {
     missDirCompass: typeof raw.missDirCompass === 'string' ? raw.missDirCompass : '',
     missDistM: Math.max(0, Math.round(Number(raw.missDistM) || 0)),
     cabinSaved: Boolean(raw.cabinSaved),
+    dropQuality: DROP_QUALITY_CODES.includes(raw.dropQuality) ? raw.dropQuality : 'optimal',
+    releaseAgl: raw.releaseAgl != null ? Math.max(0, Math.round(Number(raw.releaseAgl) || 0)) : 35,
   };
 }
 
@@ -490,6 +495,7 @@ export class FireSim {
         lastImpactTime: -1,
         parcelsInFlight: 0,
         totalParcels: 0,
+        releaseAglSum: 0,
         headingSumX: 0,
         headingSumZ: 0,
         impactSumX: 0,
@@ -507,9 +513,11 @@ export class FireSim {
       this._burstsById.set(id, burst);
     }
 
+    const safeAgl = Math.max(0, releaseAgl ?? 35);
     burst.lastSpawnTime = this.simTime;
     burst.parcelsInFlight++;
     burst.totalParcels++;
+    burst.releaseAglSum += safeAgl;
     burst.headingSumX += vx;
     burst.headingSumZ += vz;
 
@@ -522,7 +530,7 @@ export class FireSim {
     this.parcelVx[i] = vx;
     this.parcelVy[i] = vy;
     this.parcelVz[i] = vz;
-    this.parcelReleaseAgl[i] = Math.max(0, releaseAgl ?? 35);
+    this.parcelReleaseAgl[i] = safeAgl;
   }
 
   _recordWet(idx, slotId, dropId, amount, isActiveFire) {
@@ -569,13 +577,16 @@ export class FireSim {
 
   /**
    * Apply a landed water parcel splash onto the grid via conflict-free wetDelta.
-   * Uses the exact shared computeSplashRadius() formula matching predictDropImpact().
+   * Uses the exact shared evaluateDropAltitude() & computeSplashRadius() formulas matching predictDropImpact().
+   * - Optimal 18-52 m (peak 25-42 m): concentrated curtain (up to 1.8x cooling -> massive knockdown)
+   * - Too high > 58 m: wide wind-sheared mist (drops smoothly to 0.22x @ 100 m+)
    */
   _applyWaterSplash(slotId, dropId, x, z, releaseAgl) {
+    const altEval = evaluateDropAltitude(releaseAgl);
     const R = computeSplashRadius(releaseAgl, this.cellSize);
     const refR = 44.0 * (this.cellSize / 16.0);
-    const K0 = 9.8;
-    const knockdown = K0 * Math.pow(refR / R, 0.80);
+    const K0 = 6.8;
+    const knockdown = K0 * altEval.coolingMult * Math.pow(refR / R, 0.90);
 
     const burst = dropId > 0 ? this._burstsById.get(dropId) : null;
     if (burst) {
@@ -1027,9 +1038,9 @@ export class FireSim {
           burst.cooledCellSet.add(idx);
         }
       } else if (st === CELL_STATE.INTACT && fuelMask[idx] === 1) {
-        // Any water mist cools pre-heated foliage; >= 1.2 creates a full 28-35 s wet firebreak
+        // Any water mist cools pre-heated foliage; >= 1.8 creates a full 28-35 s wet firebreak
         this.ignitionAccum[idx] = 0;
-        if (wet >= 1.2) {
+        if (wet >= 1.8) {
           cells[idx] = CELL_STATE.WET;
           this.wetTimer[idx] = WET_COOLDOWN_MIN + this.rng() * wetSpan;
           this.phases[idx] = 255;
@@ -1159,6 +1170,9 @@ export class FireSim {
         }
       }
 
+      const avgReleaseAgl = burst.totalParcels > 0 ? burst.releaseAglSum / burst.totalParcels : 35;
+      const { dropQuality } = evaluateDropAltitude(avgReleaseAgl);
+
       this._emitDropOutcome({
         dropId: burst.id,
         slotId: burst.slotId,
@@ -1172,6 +1186,8 @@ export class FireSim {
         missDirCompass,
         missDistM,
         cabinSaved: burst.cabinSaved,
+        dropQuality,
+        releaseAgl: Math.round(avgReleaseAgl),
       });
     }
   }
@@ -1684,6 +1700,140 @@ export class FireSim {
     } else {
       this.fireHead = null;
     }
+  }
+
+  /**
+   * Sample fire-driven atmospheric conditions at world position (x, y, z):
+   * downwind tilted smoke plumes, rising convective thermal columns, aerodynamic turbulence,
+   * and dangerously low-altitude radiant/flame heat.
+   * Fast O(1) zero-GC grid lookup — works identically on Host and Replica.
+   *
+   * @param {number} x
+   * @param {number} y
+   * @param {number} z
+   * @returns {{ smokeDensity: number, thermalLift: number, turbulence: number, heatDanger: number }}
+   */
+  sampleFireAtmosphere(x, y, z) {
+    if (this.burningCount <= 0) {
+      return { smokeDensity: 0, thermalLift: 0, turbulence: 0, heatDanger: 0 };
+    }
+    const groundY = this._sampleGroundY(x, z);
+    const h = Math.max(0, y - groundY);
+    if (h > 195) {
+      return { smokeDensity: 0, thermalLift: 0, turbulence: 0, heatDanger: 0 };
+    }
+
+    const gs = this.gridSize;
+    const cs = this.cellSize;
+    const halfWorld = this._halfWorld;
+    const cells = this.cells;
+    const cellHeights = this.terrain.cellHeights;
+    const wvx = this.windVx;
+    const wvz = this.windVz;
+
+    // 1. Convective thermal updraft column (tilts gently downwind with height) + low-flame heat danger
+    const tTherm = h / 18.0;
+    const thermSrcX = x - wvx * tTherm;
+    const thermSrcZ = z - wvz * tTherm;
+    const rTherm = 26.0 + h * 0.22;
+    const invTwoRThermSq = 1.0 / (2.0 * rTherm * rTherm);
+    const thermVertEnv = h < 135
+      ? Math.min(1.0, (h + 10.0) / 22.0) * (1.0 - Math.max(0, (h - 40.0) / 95.0))
+      : 0;
+
+    let thermalEnergy = 0;
+    let heatEnergy = 0;
+
+    const tCgx = Math.floor((thermSrcX + halfWorld) * this._invCellSize);
+    const tCgz = Math.floor((thermSrcZ + halfWorld) * this._invCellSize);
+    const tWin = 3;
+    const tMinGz = Math.max(0, tCgz - tWin);
+    const tMaxGz = Math.min(gs - 1, tCgz + tWin);
+    const tMinGx = Math.max(0, tCgx - tWin);
+    const tMaxGx = Math.min(gs - 1, tCgx + tWin);
+
+    for (let gz = tMinGz; gz <= tMaxGz; gz++) {
+      const wz = (gz + 0.5) * cs - halfWorld;
+      const dzT = wz - thermSrcZ;
+      const dzDirect = wz - z;
+      const rowBase = gz * gs;
+      for (let gx = tMinGx; gx <= tMaxGx; gx++) {
+        const idx = rowBase + gx;
+        const st = cells[idx];
+        if (st < 1 || st > 12) continue;
+        const iNorm = st / 12.0;
+        const wx = (gx + 0.5) * cs - halfWorld;
+
+        if (thermVertEnv > 0) {
+          const dxT = wx - thermSrcX;
+          const dSqT = dxT * dxT + dzT * dzT;
+          thermalEnergy += iNorm * Math.exp(-dSqT * invTwoRThermSq) * thermVertEnv;
+        }
+
+        const cellH = Math.max(0, y - cellHeights[idx]);
+        if (cellH < 22.0) {
+          const dxD = wx - x;
+          const dSqD = dxD * dxD + dzDirect * dzDirect;
+          if (dSqD < 26.0 * 26.0) {
+            const altFactor = clamp((22.0 - cellH) / 14.0, 0, 1);
+            const radFactor = 1.0 - Math.sqrt(dSqD) / 26.0;
+            heatEnergy += iNorm * altFactor * radFactor;
+          }
+        }
+      }
+    }
+
+    // 2. Downwind tilted smoke plume (2 bands: rising core plume + trailing downwind smoke deck)
+    let smokeEnergy = 0;
+    const smokeVertEnv = h >= 4.0 && h < 185.0
+      ? Math.min(1.0, (h - 2.0) / 16.0) * (1.0 - Math.max(0, (h - 75.0) / 110.0))
+      : 0;
+
+    if (smokeVertEnv > 0) {
+      const tRise = h / 13.0;
+      const rSmoke = 28.0 + h * 0.34;
+      const invTwoRSmokeSq = 1.0 / (2.0 * rSmoke * rSmoke);
+      const sWin = 4;
+
+      for (let band = 0; band < 2; band++) {
+        const driftMult = band === 0 ? 0.90 : 1.55;
+        const bandWeight = band === 0 ? 1.0 : 0.62;
+        const srcX = x - wvx * driftMult * tRise;
+        const srcZ = z - wvz * driftMult * tRise;
+        const sCgx = Math.floor((srcX + halfWorld) * this._invCellSize);
+        const sCgz = Math.floor((srcZ + halfWorld) * this._invCellSize);
+        const sMinGz = Math.max(0, sCgz - sWin);
+        const sMaxGz = Math.min(gs - 1, sCgz + sWin);
+        const sMinGx = Math.max(0, sCgx - sWin);
+        const sMaxGx = Math.min(gs - 1, sCgx + sWin);
+
+        for (let gz = sMinGz; gz <= sMaxGz; gz++) {
+          const wz = (gz + 0.5) * cs - halfWorld;
+          const dzS = wz - srcZ;
+          const dzSqS = dzS * dzS;
+          const rowBase = gz * gs;
+          for (let gx = sMinGx; gx <= sMaxGx; gx++) {
+            const st = cells[rowBase + gx];
+            if (st < 1 || st > 12) continue;
+            const wx = (gx + 0.5) * cs - halfWorld;
+            const dxS = wx - srcX;
+            const dSqS = dxS * dxS + dzSqS;
+            smokeEnergy += (st / 12.0) * bandWeight * Math.exp(-dSqS * invTwoRSmokeSq) * smokeVertEnv;
+          }
+        }
+      }
+    }
+
+    const smokeDensity = clamp(1.0 - Math.exp(-smokeEnergy * 0.42), 0, 1);
+    const thermalLift = clamp(1.0 - Math.exp(-thermalEnergy * 0.58), 0, 1);
+    const turbulence = clamp(
+      Math.max(smokeDensity * 0.74, thermalLift * 0.90) + Math.min(smokeDensity, thermalLift) * 0.25,
+      0,
+      1
+    );
+    const heatDanger = clamp(1.0 - Math.exp(-heatEnergy * 1.15), 0, 1);
+
+    return { smokeDensity, thermalLift, turbulence, heatDanger };
   }
 
   /**

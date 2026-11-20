@@ -15,6 +15,7 @@ import { generateTerrain } from '../src/sim/TerrainGen.js';
 import {
   FLIGHT_CONSTANTS,
   computeSplashRadius,
+  evaluateDropAltitude,
   createAircraftState,
   stepFlight,
   predictDropImpact,
@@ -24,6 +25,7 @@ import {
   FireSim,
   CELL_STATE,
   SCORE,
+  DROP_QUALITY_CODES,
   WET_COOLDOWN_MIN,
   WET_COOLDOWN_MAX,
 } from '../src/sim/FireSim.js';
@@ -183,14 +185,15 @@ describe('FlightModel', () => {
     assert.equal(resExit.events.scoopEnded, true);
   });
 
-  it('fills tank 0 -> 100% in ~1.43 s with forgiving 3.0 m hydroplane cushion and zero damage', () => {
+  it('fills tank 0 -> 100% in ~1.33 s on optimal level scoop vs ~30%/s on rough banked/overspeed scoop (0 damage)', () => {
     const plane = createAircraftState({
       x: lake.x,
       z: lake.z + 250,
       y: terrain.waterLevel + 5.0,
       yawDeg: 0,
       pitchDeg: 0,
-      speedKmh: FLIGHT_CONSTANTS.CRUISE_SPEED_KMH,
+      rollDeg: 0,
+      speedKmh: 150,
       tankPct: 0,
     });
 
@@ -200,6 +203,7 @@ describe('FlightModel', () => {
     while (plane.tankPct < 100 && elapsed < 2.5) {
       const { events } = stepFlight(plane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, dt);
       if (events.tankFull) tankFullFired = true;
+      assert.equal(events.scoopRough, false, 'level 150 km/h scoop is optimal, not rough');
       if (!terrain.isWater(plane.x, plane.z)) {
         plane.x = lake.x;
         plane.z = lake.z + 200;
@@ -209,8 +213,36 @@ describe('FlightModel', () => {
     }
 
     assert.equal(tankFullFired, true, 'tankFull event must fire');
-    assert.ok(elapsed >= 1.35 && elapsed <= 1.52, `0->100% scoop took ${elapsed.toFixed(3)}s (expected ~1.43s)`);
+    assert.ok(elapsed >= 1.28 && elapsed <= 1.42, `0->100% optimal scoop took ${elapsed.toFixed(3)}s (expected ~1.33s)`);
     assert.equal(plane.hp, 100, 'full scoop leaves hull at 100 HP');
+
+    // Rough banked scoop (> 16 deg roll) refills slower (~30%/s), emits scoopRough, and still deals 0 hull damage!
+    const roughPlane = createAircraftState({
+      x: lake.x,
+      z: lake.z + 200,
+      y: terrain.waterLevel + 5.0,
+      yawDeg: 0,
+      pitchDeg: 0,
+      rollDeg: 28,
+      speedKmh: 155,
+      tankPct: 0,
+    });
+    let sawRoughStart = false;
+    let sawRough = false;
+    for (let i = 0; i < 60; i++) {
+      roughPlane.rollDeg = 28;
+      roughPlane.y = terrain.waterLevel + 5.0;
+      roughPlane.x = lake.x;
+      roughPlane.z = lake.z;
+      const { events } = stepFlight(roughPlane, { pitch: 0, roll: 0.5, throttleDelta: 0, drop: false }, terrain, dt);
+      if (events.scoopRoughStarted) sawRoughStart = true;
+      if (events.scoopRough) sawRough = true;
+    }
+    assert.equal(sawRoughStart, true, 'rough scoop emits scoopRoughStarted');
+    assert.equal(sawRough, true, 'rough scoop emits scoopRough');
+    assert.equal(roughPlane.scoopQuality, 'rough');
+    assert.ok(roughPlane.tankPct >= 25 && roughPlane.tankPct <= 35, `1 s rough scoop filled ~30% (got ${roughPlane.tankPct.toFixed(1)}%)`);
+    assert.equal(roughPlane.hp, 100, 'rough water scoop still deals 0 hull damage (forgiving survival)');
 
     // Forgiving hydroplane floor: diving into lake floors cleanly at waterLevel + 3.0 m with 0 damage and level pitch
     plane.y = terrain.waterLevel + 1.5;
@@ -221,6 +253,103 @@ describe('FlightModel', () => {
     assert.equal(plane.hp, 100, 'water hydroplane cushion takes zero damage');
     assert.equal(plane.crashed, false);
     assert.equal(diveRes.events.planeCrash, null);
+  });
+
+  it('models heavy full-tank inertia (~13% slower climb/roll) and upward buoyancy surge when dropping water', () => {
+    const dt = 1 / 60;
+    const emptyPlane = createAircraftState({
+      x: 0, z: 0, y: terrain.getHeight(0, 0) + 60, yawDeg: 90, pitchDeg: 0, rollDeg: 0, tankPct: 0, autopilot: false,
+    });
+    const fullPlane = createAircraftState({
+      x: 0, z: 0, y: terrain.getHeight(0, 0) + 60, yawDeg: 90, pitchDeg: 0, rollDeg: 0, tankPct: 100, autopilot: false,
+    });
+
+    for (let i = 0; i < 18; i++) {
+      stepFlight(emptyPlane, { pitch: 1, roll: 1, throttleDelta: 0, drop: false }, terrain, dt);
+      stepFlight(fullPlane, { pitch: 1, roll: 1, throttleDelta: 0, drop: false }, terrain, dt);
+    }
+    assert.ok(fullPlane.rollDeg < emptyPlane.rollDeg * 0.92, `loaded roll (${fullPlane.rollDeg.toFixed(1)}) slower than empty (${emptyPlane.rollDeg.toFixed(1)})`);
+    assert.ok(fullPlane.pitchDeg < emptyPlane.pitchDeg * 0.92, `loaded climb pitch (${fullPlane.pitchDeg.toFixed(1)}) slower than empty (${emptyPlane.pitchDeg.toFixed(1)})`);
+
+    // Upward buoyancy/lift surge when dumping water vs holding water in level flight
+    const holdPlane = createAircraftState({
+      x: 0, z: 0, y: terrain.getHeight(0, 0) + 60, yawDeg: 90, pitchDeg: 0, rollDeg: 0, tankPct: 100, autopilot: false,
+    });
+    const dropPlane = createAircraftState({
+      x: 0, z: 0, y: terrain.getHeight(0, 0) + 60, yawDeg: 90, pitchDeg: 0, rollDeg: 0, tankPct: 100, autopilot: false,
+    });
+    for (let i = 0; i < 36; i++) {
+      stepFlight(holdPlane, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, dt);
+      stepFlight(dropPlane, { pitch: 0, roll: 0, throttleDelta: 0, drop: true }, terrain, dt);
+    }
+    assert.ok(
+      dropPlane.y > holdPlane.y + 1.5,
+      `water drop buoyancy surged altitude (drop=${dropPlane.y.toFixed(2)}m vs hold=${holdPlane.y.toFixed(2)}m)`
+    );
+    assert.ok(dropPlane.pitchDeg > holdPlane.pitchDeg + 1.0, 'drop release lightens nose upward');
+  });
+
+  it('applies convective thermal updraft lift, smoke turbulence buffet, and extreme low-fire heat ticks', () => {
+    const sim = new FireSim(terrain);
+    const seed = terrain.initialFireSeeds[0];
+    const center = terrain.gridToWorld(seed.gx, seed.gz);
+    const groundY = terrain.getHeight(center.x, center.z);
+
+    // 1. Calm lake air has zero fire atmosphere
+    const calmAtm = sim.sampleFireAtmosphere(lake.x, terrain.waterLevel + 40, lake.z);
+    assert.equal(calmAtm.smokeDensity, 0);
+    assert.equal(calmAtm.thermalLift, 0);
+    assert.equal(calmAtm.turbulence, 0);
+    assert.equal(calmAtm.heatDanger, 0);
+
+    // 2. Directly over fire at 35 m AGL: strong thermal lift + smoke + turbulence, safe from flame heat
+    const hotAtm = sim.sampleFireAtmosphere(center.x, groundY + 35, center.z);
+    assert.ok(hotAtm.thermalLift > 0.45, `thermalLift over fire=${hotAtm.thermalLift.toFixed(2)}`);
+    assert.ok(hotAtm.turbulence > 0.45, `turbulence over fire=${hotAtm.turbulence.toFixed(2)}`);
+    assert.ok(hotAtm.smokeDensity > 0.35, `smokeDensity over fire=${hotAtm.smokeDensity.toFixed(2)}`);
+    assert.equal(hotAtm.heatDanger, 0, '35 m AGL is above direct flame heat danger');
+
+    // 3. Downwind smoke plume (45 m downwind at 48 m AGL): noticeable smoke & turbulence
+    const downwindAtm = sim.sampleFireAtmosphere(center.x + 42, groundY + 48, center.z);
+    assert.ok(downwindAtm.smokeDensity > 0.15, `downwind smokeDensity=${downwindAtm.smokeDensity.toFixed(2)}`);
+    assert.ok(downwindAtm.turbulence > 0.12, `downwind turbulence=${downwindAtm.turbulence.toFixed(2)}`);
+
+    // 4. Convective updraft + turbulence visibly lifts and rocks aircraft vs calm flight
+    const dt = 1 / 60;
+    const calmAc = createAircraftState({
+      x: center.x, z: center.z, y: groundY + 42, yawDeg: 90, pitchDeg: 0, rollDeg: 0, autopilot: false,
+    });
+    const thermalAc = createAircraftState({
+      x: center.x, z: center.z, y: groundY + 42, yawDeg: 90, pitchDeg: 0, rollDeg: 0, autopilot: false,
+    });
+    let maxRollDeviation = 0;
+    for (let i = 0; i < 30; i++) {
+      stepFlight(calmAc, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, dt, {
+        atmosphere: { smokeDensity: 0, thermalLift: 0, turbulence: 0, heatDanger: 0 },
+      });
+      stepFlight(thermalAc, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, dt, {
+        atmosphere: hotAtm,
+      });
+      maxRollDeviation = Math.max(maxRollDeviation, Math.abs(thermalAc.rollDeg));
+    }
+    assert.ok(
+      thermalAc.y > calmAc.y + 1.5,
+      `thermal updraft lifted aircraft (thermal=${thermalAc.y.toFixed(2)}m vs calm=${calmAc.y.toFixed(2)}m)`
+    );
+    assert.ok(maxRollDeviation > 0.4, `turbulence rocked wings (maxRoll=${maxRollDeviation.toFixed(2)} deg)`);
+
+    // 5. Dangerously low (< 16 m AGL) directly over roaring flames triggers heatDanger & hull heat ticks
+    const lowAtm = sim.sampleFireAtmosphere(center.x, groundY + 10, center.z);
+    assert.ok(lowAtm.heatDanger > 0.5, `low flame heatDanger=${lowAtm.heatDanger.toFixed(2)}`);
+    const scorchedAc = createAircraftState({
+      x: center.x, z: center.z, y: groundY + 11, yawDeg: 90, pitchDeg: 0, rollDeg: 0, autopilot: false,
+    });
+    const res = stepFlight(scorchedAc, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, terrain, dt, {
+      atmosphere: lowAtm,
+    });
+    assert.ok(res.events.heatDamage, 'extreme low-flame flight emits heat_damage');
+    assert.equal(res.events.heatDamage.type, 'heat_damage');
+    assert.ok(scorchedAc.hp < 100, `heat tick reduced hull HP (${scorchedAc.hp})`);
   });
 
   it('drains tank 100 -> 0% in ~1.25 s and supports 0.25 s (20%) min burst on brief tap', () => {
@@ -650,11 +779,86 @@ describe('FireSim', () => {
     const out = outcomes[0];
     assert.equal(out.slotId, 7);
     assert.equal(out.outcome, 'direct');
+    assert.equal(out.dropQuality, 'optimal');
     assert.equal(out.missType, 'none');
     assert.equal(out.missDirCompass, '');
     assert.equal(out.missDistM, 0);
-    assert.ok(out.cellsExtinguished >= 10, `single pass extinguished ${out.cellsExtinguished} cells (expected >= 10)`);
+    assert.ok(out.cellsExtinguished >= 12, `single optimal pass extinguished ${out.cellsExtinguished} cells (expected >= 12)`);
     assert.ok(out.pointsAwarded >= out.cellsExtinguished * SCORE.CELL_PRIMARY);
+  });
+
+  it('enforces real altitude drop skill: optimal 34 m AGL extinguishes massive swath vs >100 m AGL misted_high', () => {
+    const terrain = generateTerrain(OPERATIONS[0]);
+    const seed = terrain.initialFireSeeds[0];
+    const center = terrain.gridToWorld(seed.gx, seed.gz);
+
+    // Check evaluateDropAltitude & predictDropImpact altZone classifications
+    assert.equal(evaluateDropAltitude(12).altZone, 'too_low');
+    assert.equal(evaluateDropAltitude(34).altZone, 'optimal');
+    assert.ok(evaluateDropAltitude(34).coolingMult >= 1.79, 'peak optimal cooling is 1.8x');
+    assert.equal(evaluateDropAltitude(85).altZone, 'too_high');
+    assert.equal(evaluateDropAltitude(105).dropQuality, 'misted_high');
+    assert.ok(evaluateDropAltitude(105).coolingMult <= 0.23, '105m misted cooling <= 0.22x');
+    assert.ok(computeSplashRadius(105, 16) > computeSplashRadius(34, 16) * 1.4, 'high mist widens splash radius');
+
+    // Run identical targeted drop passes over fresh identical Operation 01 fire at 34 m vs 105 m AGL
+    const runAltitudePass = (agl) => {
+      const sim = new FireSim(terrain);
+      // Ramp fire cells to full roaring intensity (10) so misted high-altitude drops can't accidentally snuff weak cells
+      for (let a = 0; a < sim.activeCount; a++) {
+        const idx = sim.activeList[a];
+        if (sim.cells[idx] >= 1 && sim.cells[idx] <= 12) {
+          sim.intensityF[idx] = 10.0;
+          sim.cells[idx] = 10;
+        }
+      }
+      const gy = terrain.getHeight(center.x, center.z);
+      const plane = createAircraftState({
+        x: center.x - 160,
+        y: gy + agl,
+        z: center.z,
+        yawDeg: 90,
+        speedKmh: 158,
+        tankPct: 100,
+        slotId: 7,
+      });
+      const pred0 = predictDropImpact(plane, sim, terrain, sim);
+      let dropped = 0;
+      let started = false;
+      const outcomes = [];
+      for (let i = 0; i < 120; i++) {
+        const pred = predictDropImpact(plane, sim, terrain, sim);
+        if (!started && pred.impactX >= center.x - 28) started = true;
+        if (started && dropped < 10) {
+          const curAgl = Math.max(4, plane.y - terrain.getHeight(plane.x, plane.z));
+          sim.spawnWaterParcel(7, plane.x, plane.y, plane.z, plane.vx, plane.vy, plane.vz, curAgl, 1);
+          dropped++;
+        }
+        plane.x += plane.vx * 0.1;
+        plane.y = Math.max(terrain.waterLevel, terrain.getHeight(plane.x, plane.z)) + agl;
+        sim.step(0.1, 1);
+        outcomes.push(...sim.drainDropOutcomes());
+      }
+      return { pred0, outcome: outcomes[0] };
+    };
+
+    const optRes = runAltitudePass(34);
+    const highRes = runAltitudePass(105);
+
+    assert.equal(optRes.pred0.altZone, 'optimal');
+    assert.equal(highRes.pred0.altZone, 'too_high');
+    assert.ok(optRes.outcome, 'optimal pass emitted outcome');
+    assert.ok(highRes.outcome, 'high pass emitted outcome');
+    assert.equal(optRes.outcome.dropQuality, 'optimal');
+    assert.equal(highRes.outcome.dropQuality, 'misted_high');
+    assert.ok(
+      optRes.outcome.cellsExtinguished >= 15,
+      `optimal 34m pass extinguished ${optRes.outcome.cellsExtinguished} cells (expected >= 15)`
+    );
+    assert.ok(
+      highRes.outcome.cellsExtinguished < optRes.outcome.cellsExtinguished * 0.3,
+      `high 105m misted pass (${highRes.outcome.cellsExtinguished}) must be drastically weaker than optimal 34m (${optRes.outcome.cellsExtinguished})`
+    );
   });
 
   it('classifies off-target drops accurately as miss with overshot / short / wide + compass direction', () => {
@@ -768,8 +972,8 @@ describe('FireSim', () => {
         const gy = terrain.getHeight(bestX, bestZ);
         const plane = createAircraftState({
           x: bestX,
-          y: gy + 45,
-          z: bestZ + 115,
+          y: gy + 36,
+          z: bestZ + 105,
           yawDeg: 0,
           speedKmh: 158,
           tankPct: 100,
@@ -795,7 +999,7 @@ describe('FireSim', () => {
           }
           plane.x += plane.vx * 0.1;
           plane.z += plane.vz * 0.1;
-          plane.y = Math.max(terrain.waterLevel, terrain.getHeight(plane.x, plane.z)) + 45;
+          plane.y = Math.max(terrain.waterLevel, terrain.getHeight(plane.x, plane.z)) + 36;
         }
       }
 
@@ -917,10 +1121,10 @@ describe('FireSim', () => {
     assert.deepEqual(replicaSim.cells, hostSim.cells);
     assert.equal(replicaSim.burningCount, hostSim.burningCount);
 
-    // Apply delta + compact mirrored remote drop outcome tuple `o`
+    // Apply delta + compact mirrored remote drop outcome tuple `o` (including optional qualityCode)
     const delta = hostSim.step(0.1, 10);
     assert.equal(delta.fullReset, false, 'normal step sets fullReset: false');
-    delta.o = [[7, 120, -45, 14, 980, 0, 0, 0, 0, 1]];
+    delta.o = [[7, 120, -45, 14, 980, 0, 0, 0, 0, 1, 1, 88]];
     replicaSim.applyExternalDelta(delta);
     assert.deepEqual(replicaSim.cells, hostSim.cells);
     const mirrored = replicaSim.drainDropOutcomes();
@@ -929,6 +1133,8 @@ describe('FireSim', () => {
     assert.equal(mirrored[0].outcome, 'direct');
     assert.equal(mirrored[0].cellsExtinguished, 14);
     assert.equal(mirrored[0].cabinSaved, true);
+    assert.equal(mirrored[0].dropQuality, DROP_QUALITY_CODES[1]);
+    assert.equal(mirrored[0].releaseAgl, 88);
 
     hostSim.cabinHp[0] = 40;
     hostSim.cabinHpF[0] = 40;

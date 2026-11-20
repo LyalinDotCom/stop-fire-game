@@ -32,6 +32,9 @@ const CODE_TO_MISS = ['none', 'overshot', 'short', 'wide'];
 const DIR_TO_CODE = { '': 0, N: 1, NE: 2, E: 3, SE: 4, S: 5, SW: 6, W: 7, NW: 8 };
 const CODE_TO_DIR = ['', 'N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
 
+const QUALITY_TO_CODE = { optimal: 0, misted_high: 1, low_risk: 2 };
+const CODE_TO_QUALITY = ['optimal', 'misted_high', 'low_risk'];
+
 function clamp(v, lo, hi) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
@@ -331,6 +334,7 @@ export function encodeFireDeltaWithOverflow(delta, maxChars = PAYLOAD_CAPS.fireR
       DIR_TO_CODE[o.missDirCompass || ''] ?? 0,
       Math.max(0, Math.round(o.missDistM ?? 0)),
       o.cabinSaved ? 1 : 0,
+      QUALITY_TO_CODE[o.dropQuality] ?? 0,
     ]);
   }
 
@@ -406,6 +410,7 @@ export function decodeFireDelta(str) {
         missDirCompass: CODE_TO_DIR[t[8] | 0] || '',
         missDistM: Math.max(0, Number(t[9]) || 0),
         cabinSaved: Boolean(t[10]),
+        dropQuality: CODE_TO_QUALITY[t[11] | 0] || 'optimal',
       }))
     : [];
   return {

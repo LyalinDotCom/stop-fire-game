@@ -551,6 +551,68 @@ export const RADIO_LINES = [
     urgency: 'urgent',
     text: 'We saw that bird go down! Reserve tanker launching now — get back up here, pilot!',
   },
+
+  // drop_too_high (3) — altitude envelope coaching when water mists from high drop
+  {
+    id: 'drop_too_high_01',
+    category: 'drop_too_high',
+    persona: 'AIR_ATTACK',
+    urgency: 'warn',
+    text: 'Way too high, Tanker! Wind sheared that load into mist — drop down to thirty meters!',
+  },
+  {
+    id: 'drop_too_high_02',
+    category: 'drop_too_high',
+    persona: 'LOOKOUT',
+    urgency: 'warn',
+    text: 'Water evaporated before hitting the crown! Descend into the twenty-five to fifty meter window!',
+  },
+  {
+    id: 'drop_too_high_03',
+    category: 'drop_too_high',
+    persona: 'HOTSHOT',
+    urgency: 'warn',
+    text: 'We barely felt mist down here! Come in lower over the ridge so that curtain punches through!',
+  },
+
+  // turbulence_smoke (3) — convective smoke plume turbulence & thermal shear advisories
+  {
+    id: 'turbulence_smoke_01',
+    category: 'turbulence_smoke',
+    persona: 'AIR_ATTACK',
+    urgency: 'warn',
+    text: 'Heavy convective turbulence in the smoke column! Watch for updrafts and hold your wings level!',
+  },
+  {
+    id: 'turbulence_smoke_02',
+    category: 'turbulence_smoke',
+    persona: 'LOOKOUT',
+    urgency: 'warn',
+    text: 'Dense smoke plume across the head — keep airspeed up and watch for thermal shear!',
+  },
+  {
+    id: 'turbulence_smoke_03',
+    category: 'turbulence_smoke',
+    persona: 'DISPATCH',
+    urgency: 'warn',
+    text: 'Advisory for all tankers: severe thermal lift over the active core. Avoid skimming inside the flames!',
+  },
+
+  // scoop_rough (2) — rough/choppy banked or overspeed lake scoop coaching
+  {
+    id: 'scoop_rough_01',
+    category: 'scoop_rough',
+    persona: 'AIR_ATTACK',
+    urgency: 'normal',
+    text: 'Choppy scoop, Tanker! Level your wings and ease the throttle for a faster lake pickup.',
+  },
+  {
+    id: 'scoop_rough_02',
+    category: 'scoop_rough',
+    persona: 'DISPATCH',
+    urgency: 'normal',
+    text: 'Rough water contact on the skim — keep wings level and steady speed for maximum intake!',
+  },
 ];
 
 async function fileExistsNonEmpty(p) {

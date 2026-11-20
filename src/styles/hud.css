@@ -92,6 +92,52 @@ body {
 }
 
 /* ==========================================================================
+   Dynamic Cockpit Smoke Haze & Thermal Heat Caution Vignettes
+   ========================================================================== */
+.ef-smoke-vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 13;
+  opacity: 0;
+  background:
+    radial-gradient(
+      ellipse at 50% 48%,
+      rgba(44, 42, 44, 0.24) 0%,
+      rgba(34, 31, 33, 0.56) 52%,
+      rgba(20, 18, 20, 0.84) 100%
+    );
+  transition: opacity 0.14s linear;
+  will-change: opacity;
+}
+
+.ef-smoke-vignette.is-turbulent {
+  animation: efSmokeShift 1.15s ease-in-out infinite;
+}
+
+.ef-heat-vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 14;
+  opacity: 0;
+  background:
+    radial-gradient(
+      ellipse at 50% 50%,
+      rgba(255, 90, 28, 0) 42%,
+      rgba(255, 76, 26, 0.28) 76%,
+      rgba(255, 42, 18, 0.64) 100%
+    );
+  box-shadow: inset 0 0 84px 10px rgba(255, 68, 24, 0.48);
+  transition: opacity 0.1s linear;
+  will-change: opacity;
+}
+
+.ef-heat-vignette.is-active {
+  animation: efHeatPulse 0.68s ease-in-out infinite;
+}
+
+/* ==========================================================================
    Peripheral HUD Edge Flash (Direct Hit emerald glow / Damage red vignette)
    ========================================================================== */
 .ef-hud-flash {
@@ -186,6 +232,29 @@ body {
   background: var(--ef-emerald);
   box-shadow: 0 0 7px rgba(56, 242, 139, 0.8);
   flex-shrink: 0;
+}
+
+.ef-airspace-chip.status-solo {
+  background: rgba(154, 178, 194, 0.12);
+  border-color: rgba(154, 178, 194, 0.44);
+  color: #c9dae4;
+}
+
+.ef-airspace-chip.status-solo .ef-status-dot {
+  background: transparent;
+  border: 1.5px solid #96b8cc;
+  box-shadow: none;
+}
+
+.ef-airspace-chip.status-host {
+  background: rgba(92, 225, 230, 0.14);
+  border-color: rgba(92, 225, 230, 0.52);
+  color: var(--ef-cyan);
+}
+
+.ef-airspace-chip.status-host .ef-status-dot {
+  background: var(--ef-cyan);
+  box-shadow: 0 0 8px rgba(92, 225, 230, 0.92);
 }
 
 .ef-airspace-chip.status-online {
@@ -1487,6 +1556,17 @@ body {
   color: var(--ef-emerald);
 }
 
+.ef-airspace-state.status-solo { color: #c9dae4; }
+.ef-airspace-state.status-solo .ef-status-dot {
+  background: transparent;
+  border: 1.5px solid #96b8cc;
+  box-shadow: none;
+}
+.ef-airspace-state.status-host { color: var(--ef-cyan); }
+.ef-airspace-state.status-host .ef-status-dot {
+  background: var(--ef-cyan);
+  box-shadow: 0 0 7px rgba(92, 225, 230, 0.9);
+}
 .ef-airspace-state.status-online { color: var(--ef-emerald); }
 .ef-airspace-state.status-online .ef-status-dot {
   background: var(--ef-emerald);
@@ -1522,21 +1602,72 @@ body {
   line-height: 1.35;
 }
 
+.ef-drawer-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.ef-copy-invite-btn,
+.ef-host-lobby-btn,
+.ef-lobby-menu-btn,
 .ef-retry-live-btn {
   appearance: none;
-  align-self: flex-start;
-  padding: 6px 12px;
+  padding: 6px 10px;
   border-radius: 3px;
+  font-family: var(--ef-font-mono);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.ef-copy-invite-btn {
+  background: rgba(92, 225, 230, 0.16);
+  border: 1px solid rgba(92, 225, 230, 0.58);
+  color: var(--ef-cyan);
+}
+
+.ef-copy-invite-btn:hover {
+  background: rgba(92, 225, 230, 0.28);
+  border-color: var(--ef-cyan);
+}
+
+.ef-copy-invite-btn.is-copied {
+  background: rgba(56, 242, 139, 0.2);
+  border-color: var(--ef-emerald);
+  color: var(--ef-emerald);
+}
+
+.ef-host-lobby-btn {
+  background: rgba(243, 114, 51, 0.18);
+  border: 1px solid rgba(243, 114, 51, 0.68);
+  color: var(--ef-orange-soft);
+}
+
+.ef-host-lobby-btn:hover {
+  background: rgba(243, 114, 51, 0.3);
+  border-color: var(--ef-orange-soft);
+}
+
+.ef-lobby-menu-btn {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: var(--ef-text);
+}
+
+.ef-lobby-menu-btn:hover {
+  background: rgba(255, 255, 255, 0.13);
+  border-color: rgba(255, 255, 255, 0.36);
+}
+
+.ef-retry-live-btn {
   background: rgba(56, 242, 139, 0.16);
   border: 1px solid rgba(56, 242, 139, 0.62);
   color: var(--ef-emerald);
-  font-family: var(--ef-font-mono);
-  font-size: 10.5px;
-  font-weight: 800;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
-  cursor: pointer;
-  transition: background 0.14s ease, border-color 0.14s ease;
 }
 
 .ef-retry-live-btn:hover {
@@ -1845,7 +1976,347 @@ body {
 }
 
 /* ==========================================================================
-   11. Victory / Defeat / Intermission / Offline Overlays
+   11. Sleek Minimal Launch & Live Lobby Browser Overlay (over live DEMO FLIGHT)
+   ========================================================================== */
+.ef-launch-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: calc(16px + env(safe-area-inset-top, 0px))
+    calc(14px + env(safe-area-inset-right, 0px))
+    calc(16px + env(safe-area-inset-bottom, 0px))
+    calc(14px + env(safe-area-inset-left, 0px));
+  background: radial-gradient(
+    ellipse at 50% 48%,
+    rgba(8, 15, 20, 0.24) 0%,
+    rgba(7, 13, 18, 0.56) 100%
+  );
+  pointer-events: auto;
+  z-index: 29;
+}
+
+.ef-launch-card {
+  width: 404px;
+  max-width: calc(100vw - 24px);
+  max-height: calc(100dvh - 28px);
+  overflow-y: auto;
+  background: rgba(12, 20, 26, 0.86);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-top: 3px solid var(--ef-orange);
+  border-radius: 6px;
+  padding: 18px 18px 14px;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 22px 58px rgba(0, 0, 0, 0.58);
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+}
+
+.ef-launch-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ef-launch-brand {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ef-launch-kicker {
+  font-family: var(--ef-font-mono);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.18em;
+  color: var(--ef-orange-soft);
+  text-transform: uppercase;
+}
+
+.ef-launch-title {
+  margin: 0;
+  font-size: 24px;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+  color: #f7fafb;
+  line-height: 1.1;
+}
+
+.ef-launch-sub {
+  margin-top: 3px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--ef-text-muted);
+  line-height: 1.35;
+}
+
+.ef-launch-close {
+  appearance: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--ef-text);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.ef-launch-close:hover {
+  background: rgba(243, 114, 51, 0.24);
+  border-color: var(--ef-orange);
+}
+
+.ef-launch-primary-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 9px;
+}
+
+.ef-launch-btn {
+  appearance: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  padding: 11px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: left;
+  transition: transform 0.1s ease, background 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.ef-launch-btn:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
+.ef-launch-btn.is-solo {
+  background: linear-gradient(135deg, rgba(243, 114, 51, 0.94), rgba(235, 134, 62, 0.92));
+  border: 1px solid rgba(255, 186, 138, 0.65);
+  color: #101920;
+  box-shadow: 0 6px 20px rgba(243, 114, 51, 0.26);
+}
+
+.ef-launch-btn.is-solo:hover:not(:disabled) {
+  background: linear-gradient(135deg, #fb8345, #f6a05c);
+  transform: translateY(-1px);
+}
+
+.ef-launch-btn.is-host {
+  background: rgba(92, 225, 230, 0.14);
+  border: 1px solid rgba(92, 225, 230, 0.54);
+  color: #eff9fa;
+}
+
+.ef-launch-btn.is-host:hover:not(:disabled) {
+  background: rgba(92, 225, 230, 0.24);
+  border-color: var(--ef-cyan);
+  transform: translateY(-1px);
+}
+
+.ef-launch-btn-title {
+  font-family: var(--ef-font-mono);
+  font-size: 12.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.ef-launch-btn-sub {
+  font-size: 10px;
+  font-weight: 600;
+  opacity: 0.82;
+}
+
+.ef-launch-lobbies {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding-top: 10px;
+  border-top: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.ef-launch-lobbies-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ef-launch-lobbies-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ef-launch-lobbies-label {
+  font-family: var(--ef-font-mono);
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--ef-text-muted);
+}
+
+.ef-launch-lobbies-count {
+  font-family: var(--ef-font-mono);
+  font-size: 9.5px;
+  font-weight: 800;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(56, 242, 139, 0.12);
+  border: 1px solid rgba(56, 242, 139, 0.35);
+  color: var(--ef-emerald);
+}
+
+.ef-launch-refresh-btn {
+  appearance: none;
+  padding: 3px 8px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: var(--ef-text-muted);
+  font-family: var(--ef-font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.ef-launch-refresh-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.3);
+  color: #f4f7f8;
+}
+
+.ef-launch-lobbies-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 152px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.ef-lobby-empty {
+  padding: 13px 10px;
+  border-radius: 4px;
+  border: 1px dashed rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.02);
+  text-align: center;
+  font-size: 11px;
+  color: var(--ef-text-muted);
+}
+
+.ef-lobby-empty.is-error {
+  border-color: rgba(246, 183, 60, 0.36);
+  color: #ffd37a;
+}
+
+.ef-lobby-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.ef-lobby-info {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ef-lobby-name {
+  font-size: 12px;
+  font-weight: 800;
+  color: #f4f7f8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ef-lobby-meta {
+  font-family: var(--ef-font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  color: var(--ef-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ef-lobby-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+}
+
+.ef-lobby-pilots {
+  font-family: var(--ef-font-mono);
+  font-size: 10px;
+  font-weight: 800;
+  color: var(--ef-emerald);
+}
+
+.ef-lobby-pilots.is-full {
+  color: #ff9c75;
+}
+
+.ef-lobby-join-btn {
+  appearance: none;
+  padding: 5px 11px;
+  border-radius: 3px;
+  background: rgba(56, 242, 139, 0.16);
+  border: 1px solid rgba(56, 242, 139, 0.62);
+  color: var(--ef-emerald);
+  font-family: var(--ef-font-mono);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.ef-lobby-join-btn:hover:not(:disabled) {
+  background: rgba(56, 242, 139, 0.3);
+  border-color: var(--ef-emerald);
+}
+
+.ef-lobby-join-btn:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
+  background: rgba(255, 255, 255, 0.05);
+  border-color: rgba(255, 255, 255, 0.14);
+  color: var(--ef-text-dim);
+}
+
+.ef-launch-footer {
+  font-family: var(--ef-font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--ef-text-dim);
+  text-align: center;
+}
+
+/* ==========================================================================
+   12. Victory / Defeat / Intermission / Offline Overlays
    ========================================================================== */
 .ef-overlay {
   position: absolute;
@@ -2024,6 +2495,16 @@ body {
   100% { opacity: 0; transform: translateY(-24px) scale(0.97); }
 }
 
+@keyframes efSmokeShift {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(0.9); }
+}
+
+@keyframes efHeatPulse {
+  0%, 100% { filter: brightness(1); }
+  50% { filter: brightness(1.26); }
+}
+
 /* ==========================================================================
    Responsive Scaling (1280x720, 1920x1080, and compact screens)
    ========================================================================== */
@@ -2080,5 +2561,60 @@ body {
   .ef-jit-pill {
     font-size: 10px;
     padding: 5px 11px;
+  }
+}
+
+@media (max-width: 640px) {
+  .ef-launch-card {
+    width: 358px;
+    padding: 14px 14px 12px;
+    gap: 10px;
+  }
+  .ef-launch-title {
+    font-size: 20px;
+  }
+  .ef-launch-sub {
+    font-size: 10.5px;
+  }
+  .ef-launch-btn {
+    padding: 9px 10px;
+  }
+  .ef-launch-btn-title {
+    font-size: 11.5px;
+  }
+  .ef-launch-lobbies-list {
+    max-height: 164px;
+  }
+}
+
+@media (max-height: 500px) {
+  .ef-launch-overlay {
+    padding: 8px 12px;
+  }
+  .ef-launch-card {
+    width: 448px;
+    max-height: calc(100dvh - 16px);
+    padding: 11px 14px 10px;
+    gap: 8px;
+  }
+  .ef-launch-title {
+    font-size: 18px;
+  }
+  .ef-launch-sub {
+    font-size: 10px;
+    margin-top: 1px;
+  }
+  .ef-launch-btn {
+    padding: 7px 10px;
+  }
+  .ef-launch-lobbies {
+    padding-top: 7px;
+    gap: 5px;
+  }
+  .ef-launch-lobbies-list {
+    max-height: 98px;
+  }
+  .ef-lobby-row {
+    padding: 6px 8px;
   }
 }

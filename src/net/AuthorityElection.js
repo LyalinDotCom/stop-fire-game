@@ -133,8 +133,9 @@ export class AuthorityElection {
       this.onLostHost?.({ epoch: this.epoch });
     }
 
-    // If lease is already expired or abdicated, schedule tiered contention takeover.
-    if (val && val.leaseUntil <= now && !amLiveHost && this.canBeHost()) {
+    // If lease is missing, expired, or abdicated, schedule tiered contention takeover.
+    const needsElection = !val || val.leaseUntil <= now;
+    if (needsElection && !amLiveHost && this.canBeHost()) {
       this._scheduleTakeover();
     } else if (val && val.leaseUntil > now) {
       this._cancelTakeover();
@@ -206,8 +207,8 @@ export class AuthorityElection {
       return;
     }
 
-    // Non-host: watch for expired authority lease.
-    if (this.authority && this.authority.leaseUntil <= now) {
+    // Non-host: watch for missing or expired authority lease.
+    if (!this.authority || this.authority.leaseUntil <= now) {
       this.syncing = true;
       if (this.canBeHost()) {
         if (this._takeoverScheduledAt && now >= this._takeoverScheduledAt) {
@@ -259,7 +260,15 @@ export class AuthorityElection {
     try {
       const res = await this.adapter.runTransaction(this.path, (cur) => {
         const now = this.adapter.now();
-        if (!cur || cur.leaseUntil > now) return undefined;
+        if (!cur) {
+          return {
+            uid,
+            epoch: 1,
+            rev: 0,
+            leaseUntil: now + AUTHORITY_LEASE_MS,
+          };
+        }
+        if (cur.leaseUntil > now) return undefined;
         return {
           uid,
           epoch: cur.epoch + 1,

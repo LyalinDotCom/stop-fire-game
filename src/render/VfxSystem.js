@@ -39,6 +39,7 @@ const COL_WAKE_CYAN = new THREE.Color('#8ec8d2');
 const COL_RETICLE_LOCK = new THREE.Color('#38f28b');
 const COL_RETICLE_NEAR = new THREE.Color('#f6b73c');
 const COL_RETICLE_CLEAR = new THREE.Color('#66d9ff');
+const COL_RETICLE_DANGER = new THREE.Color('#ff4d45');
 
 const COL_RING_DIRECT_A = new THREE.Color('#38f28b');
 const COL_RING_DIRECT_B = new THREE.Color('#66f7ff');
@@ -125,6 +126,70 @@ function createDropReticleTexture() {
     ctx.lineTo(x1, y1);
     ctx.stroke();
   }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/**
+ * Builds a wide, airy dashed mist-dispersion reticle texture shown when flying TOO HIGH (> 58m AGL)
+ * to visually communicate wind-sheared load misting.
+ */
+function createWideMistReticleTexture() {
+  const size = 256;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+  const cx = size / 2;
+  const cy = size / 2;
+
+  ctx.clearRect(0, 0, size, size);
+
+  const grad = ctx.createRadialGradient(cx, cy, 24, cx, cy, 118);
+  grad.addColorStop(0, 'rgba(255, 255, 255, 0.08)');
+  grad.addColorStop(0.62, 'rgba(255, 255, 255, 0.16)');
+  grad.addColorStop(0.92, 'rgba(255, 255, 255, 0.22)');
+  grad.addColorStop(1, 'rgba(255, 255, 255, 0.0)');
+  ctx.fillStyle = grad;
+  ctx.beginPath();
+  ctx.arc(cx, cy, 118, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Wide broken mist outer ring
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.90)';
+  ctx.lineWidth = 7;
+  ctx.setLineDash([14, 16]);
+  ctx.beginPath();
+  ctx.arc(cx, cy, 110, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Secondary scattered mist ring
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.62)';
+  ctx.lineWidth = 4;
+  ctx.setLineDash([8, 14]);
+  ctx.beginPath();
+  ctx.arc(cx, cy, 74, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Hollow center crosshair (not concentrated!)
+  ctx.setLineDash([]);
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.72)';
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(cx - 18, cy);
+  ctx.lineTo(cx - 6, cy);
+  ctx.moveTo(cx + 6, cy);
+  ctx.lineTo(cx + 18, cy);
+  ctx.moveTo(cx, cy - 18);
+  ctx.lineTo(cx, cy - 6);
+  ctx.moveTo(cx, cy + 6);
+  ctx.lineTo(cx, cy + 18);
+  ctx.stroke();
 
   const tex = new THREE.CanvasTexture(canvas);
   tex.colorSpace = THREE.SRGBColorSpace;
@@ -260,6 +325,7 @@ export class VfxSystem {
     this._wetMistAccum = 0;
     this._wakeAccum = 0;
     this._remoteDropAccum = 0;
+    this._ashAccum = 0;
     this._rngState = 1337;
 
     this._initEmberBeds();
@@ -496,6 +562,7 @@ export class VfxSystem {
 
   _initDropReticle() {
     this._reticleTex = createDropReticleTexture();
+    this._reticleMistTex = createWideMistReticleTexture();
     this._corridorTex = createDropCorridorTexture();
 
     this.reticleGroup = new THREE.Group();
@@ -721,9 +788,9 @@ export class VfxSystem {
       this._waterPos[o3 + 1] = y + spreadY;
       this._waterPos[o3 + 2] = z + spreadZ;
 
-      this._waterVel[o3] = vx * 0.88 + (this._rand() - 0.5) * 3.0;
-      this._waterVel[o3 + 1] = vy - 3.6 - this._rand() * 2.0;
-      this._waterVel[o3 + 2] = vz * 0.88 + (this._rand() - 0.5) * 3.0;
+      this._waterVel[o3] = vx * 0.99 + (this._rand() - 0.5) * 2.4;
+      this._waterVel[o3 + 1] = vy - 0.8 - this._rand() * 1.4;
+      this._waterVel[o3 + 2] = vz * 0.99 + (this._rand() - 0.5) * 2.4;
 
       this._waterWind[o2] = windVx || 0;
       this._waterWind[o2 + 1] = windVz || 0;
@@ -1023,7 +1090,7 @@ export class VfxSystem {
   /**
    * Advances all VFX pools and updates GPU buffers for the current frame.
    */
-  update({ dt, elapsed, localAircraft, remotePlanes, fireSnapshot, showDropReticle, dropPreview }) {
+  update({ dt, elapsed, localAircraft, remotePlanes, fireSnapshot, showDropReticle, dropPreview, atmosphere = null }) {
     const safeDt = Math.min(dt || 0.016, 0.05);
     const terrain = this.terrain;
     const gs = terrain.gridSize;
@@ -1032,6 +1099,9 @@ export class VfxSystem {
     const cellHeights = terrain.cellHeights;
     const windVx = fireSnapshot ? (fireSnapshot.windVx || 0) : 0;
     const windVz = fireSnapshot ? (fireSnapshot.windVz || 0) : 0;
+    const smokeDensity = atmosphere ? Math.max(0, Math.min(1, atmosphere.smokeDensity || 0)) : 0;
+    const turbulence = atmosphere ? Math.max(0, Math.min(1, atmosphere.turbulence || 0)) : 0;
+    const heatDanger = atmosphere ? Math.max(0, Math.min(1, atmosphere.heatDanger || 0)) : 0;
 
     // 1. Update organic animated flames + radial ground ember beds
     this._flameMat.uniforms.uTime.value = elapsed;
@@ -1077,9 +1147,9 @@ export class VfxSystem {
       }
     }
 
-    // 3. Emit lingering wet-firebreak cooling mist (state 13)
+    // 3. Emit lingering wet-firebreak cooling mist (state 13) — clearly steaming dark-teal firebreaks
     if (this._wetCount > 0) {
-      const mistRate = Math.min(34, 4 + this._wetCount * 0.16);
+      const mistRate = Math.min(54, 8 + this._wetCount * 0.28);
       this._wetMistAccum += safeDt * mistRate;
       while (this._wetMistAccum >= 1.0) {
         this._wetMistAccum -= 1.0;
@@ -1087,21 +1157,45 @@ export class VfxSystem {
         const idx = this._wetCells[pick];
         const gx = idx % gs;
         const gz = (idx / gs) | 0;
-        const wx = (gx + 0.5) * cs - half + (this._rand() - 0.5) * cs * 0.75;
-        const wz = (gz + 0.5) * cs - half + (this._rand() - 0.5) * cs * 0.75;
+        const wx = (gx + 0.5) * cs - half + (this._rand() - 0.5) * cs * 0.72;
+        const wz = (gz + 0.5) * cs - half + (this._rand() - 0.5) * cs * 0.72;
         const wy = cellHeights[idx];
 
         this._spawnSteamParticle(
           wx,
-          wy + 1.4,
+          wy + 1.5,
           wz,
-          windVx * 0.25,
-          2.6 + this._rand() * 2.2,
-          windVz * 0.25,
-          2.6 + this._rand() * 1.4,
-          2.2 + this._rand() * 1.5,
+          windVx * 0.24,
+          3.4 + this._rand() * 2.8,
+          windVz * 0.24,
+          2.8 + this._rand() * 1.4,
+          2.5 + this._rand() * 1.6,
           COL_STEAM_WET_MIST,
-          0.4
+          0.38
+        );
+      }
+    }
+
+    // 3b. Cockpit smoke plume ash specks whipping past aircraft when flying inside smoke/turbulence
+    if (localAircraft && !localAircraft.crashed && (smokeDensity > 0.06 || turbulence > 0.12)) {
+      const ashIntensity = Math.max(smokeDensity, turbulence * 0.75);
+      this._ashAccum += safeDt * (24 + ashIntensity * 90);
+      const yawRad = (localAircraft.yawDeg || 0) * (Math.PI / 180);
+      const fx = Math.sin(yawRad);
+      const fz = -Math.cos(yawRad);
+      const rx = Math.cos(yawRad);
+      const rz = Math.sin(yawRad);
+      while (this._ashAccum >= 1.0) {
+        this._ashAccum -= 1.0;
+        const ahead = 8 + this._rand() * 24;
+        const side = (this._rand() - 0.5) * 26;
+        const up = (this._rand() - 0.5) * 14;
+        this._spawnEmberSpark(
+          localAircraft.x + fx * ahead + rx * side,
+          localAircraft.y + up,
+          localAircraft.z + fz * ahead + rz * side,
+          windVx * 0.6 - fx * 6.0,
+          windVz * 0.6 - fz * 6.0
         );
       }
     }
@@ -1148,10 +1242,10 @@ export class VfxSystem {
     this._updateWakes(safeDt);
     this._updateImpactRings(safeDt);
 
-    // 6. Impossible-to-miss terrain-draped Drop Corridor + Target Reticle
+    // 6. Impossible-to-miss terrain-draped Drop Corridor + Altitude-Aware Target Reticle
     const hasWater = !localAircraft || ((localAircraft.tankPct ?? 100) > 0.25 && !localAircraft.crashed);
     if (showDropReticle && dropPreview && hasWater) {
-      this._updateDropReticle(dropPreview, localAircraft, elapsed);
+      this._updateDropReticle(dropPreview, localAircraft, elapsed, heatDanger);
     } else {
       this.reticleGroup.visible = false;
     }
@@ -1194,19 +1288,20 @@ export class VfxSystem {
       for (let t = 0; t < countHere && flameIdx < MAX_FLAMES; t++) {
         const key = cellIdx * 17 + t * 53;
         const rAng = hash1(key + 1.3) * Math.PI * 2;
-        const rDist = (t === 0 ? 0.14 : 0.28 + hash1(key + 7.9) * 0.34) * cs;
+        // Tightened sub-cell scatter so carved wet firebreaks show a crisp gap immediately
+        const rDist = (t === 0 ? 0.12 : 0.22 + hash1(key + 7.9) * 0.20) * cs;
         const wx = cx + Math.cos(rAng) * rDist;
         const wz = cz + Math.sin(rAng) * rDist;
         const wy = terrain.getHeight ? terrain.getHeight(wx, wz) : cellHeights[cellIdx];
 
         const phase = hash1(key + 19.7);
         const rotY = hash1(key + 31.1) * Math.PI * 2;
-        const widthVar = 0.78 + hash1(key + 41.3) * 0.58;
-        const heightVar = 0.72 + hash1(key + 59.9) * 0.65;
+        const widthVar = 0.76 + hash1(key + 41.3) * 0.48;
+        const heightVar = 0.74 + hash1(key + 59.9) * 0.56;
 
-        const baseScale = (0.72 + normI * 0.92) * (cs / 16.0);
-        const sx = baseScale * widthVar * (t === 0 ? 1.12 : 0.86);
-        const sy = (0.58 + normI * 1.15) * heightVar * (t === 0 ? 1.18 : 0.84);
+        const baseScale = (0.58 + normI * 0.94) * (cs / 16.0);
+        const sx = baseScale * widthVar * (t === 0 ? 1.08 : 0.84);
+        const sy = (0.38 + normI * 1.28) * heightVar * (t === 0 ? 1.18 : 0.84);
 
         this._pos.set(wx, wy - 0.55, wz);
         this._euler.set(0, rotY, 0, 'YXZ');
@@ -1216,7 +1311,7 @@ export class VfxSystem {
 
         this.flameMesh.setMatrixAt(flameIdx, this._mat);
         this._flamePhaseArr[flameIdx] = phase;
-        this._flameIntArr[flameIdx] = 0.25 + normI * 0.95;
+        this._flameIntArr[flameIdx] = 0.22 + normI * 0.98;
         flameIdx++;
       }
     }
@@ -1226,7 +1321,7 @@ export class VfxSystem {
     this._flamePhaseAttr.needsUpdate = true;
     this._flameIntAttr.needsUpdate = true;
 
-    // Soft overlapping radial ember beds under active fire + pulsing amber spot warnings
+    // Soft radial ember beds tight to burning cells so extinguished wet trenches stay vividly dark-teal
     const bedStride = burnCount > MAX_EMBER_BEDS - 120
       ? Math.ceil(burnCount / (MAX_EMBER_BEDS - 120))
       : 1;
@@ -1236,13 +1331,13 @@ export class VfxSystem {
       const normI = this._burnIntensity[i] / 12.0;
       const gx = cellIdx % gs;
       const gz = (cellIdx / gs) | 0;
-      const jx = (hash1(cellIdx * 3.1 + 2.0) - 0.5) * cs * 0.32;
-      const jz = (hash1(cellIdx * 7.3 + 5.0) - 0.5) * cs * 0.32;
+      const jx = (hash1(cellIdx * 3.1 + 2.0) - 0.5) * cs * 0.22;
+      const jz = (hash1(cellIdx * 7.3 + 5.0) - 0.5) * cs * 0.22;
       const wx = (gx + 0.5) * cs - half + jx;
       const wz = (gz + 0.5) * cs - half + jz;
       const wy = Math.max(terrain.waterLevel + 0.25, (terrain.getHeight ? terrain.getHeight(wx, wz) : cellHeights[cellIdx]) + 0.45);
 
-      const diam = cs * (1.45 + normI * 0.65);
+      const diam = cs * (1.12 + normI * 0.34);
       this._pos.set(wx, wy, wz);
       this._euler.set(0, hash1(cellIdx * 11.7) * Math.PI * 2, 0, 'YXZ');
       this._quat.setFromEuler(this._euler);
@@ -1285,7 +1380,7 @@ export class VfxSystem {
     this._bedModeAttr.needsUpdate = true;
   }
 
-  _updateDropReticle(dropPreview, localAircraft, elapsed) {
+  _updateDropReticle(dropPreview, localAircraft, elapsed, heatDanger = 0) {
     const terrain = this.terrain;
     const ix = Number.isFinite(dropPreview.impactX) ? dropPreview.impactX : dropPreview.x;
     const iz = Number.isFinite(dropPreview.impactZ) ? dropPreview.impactZ : dropPreview.z;
@@ -1294,20 +1389,70 @@ export class VfxSystem {
       return;
     }
 
-    const r = Math.max(14, Math.min(72, dropPreview.radiusM ?? dropPreview.radius ?? 28));
+    const agl = localAircraft && Number.isFinite(localAircraft.agl) ? localAircraft.agl : 36;
+    const altZone =
+      dropPreview.altZone === 'optimal' ||
+      dropPreview.altZone === 'too_high' ||
+      dropPreview.altZone === 'too_low'
+        ? dropPreview.altZone
+        : agl > 58
+          ? 'too_high'
+          : agl < 16
+            ? 'too_low'
+            : 'optimal';
+
+    const r = Math.max(14, Math.min(88, dropPreview.radiusM ?? dropPreview.radius ?? 28));
     const onTarget = Boolean(dropPreview.onTarget || (dropPreview.fireCellsInTarget > 0));
     const nearDist = Number.isFinite(dropPreview.nearFireDistM) ? dropPreview.nearFireDistM : Infinity;
     const isNear = !onTarget && nearDist < 80;
+    const isTooHigh = altZone === 'too_high';
+    const isLowDanger = (altZone === 'too_low' && (onTarget || nearDist < 90)) || heatDanger > 0.22;
 
-    // Select reticle color & pulse dynamics
-    const targetCol = onTarget ? COL_RETICLE_LOCK : isNear ? COL_RETICLE_NEAR : COL_RETICLE_CLEAR;
-    const pulse = onTarget
-      ? 0.5 + 0.5 * Math.sin(elapsed * 11.0)
-      : isNear
-        ? 0.5 + 0.5 * Math.sin(elapsed * 6.5)
-        : 0.5 + 0.5 * Math.sin(elapsed * 3.5);
+    // Swap concentrated CCIP ring vs wide dashed mist ring when flying too high
+    const desiredTex = isTooHigh ? this._reticleMistTex : this._reticleTex;
+    if (this._reticleMat.map !== desiredTex) {
+      this._reticleMat.map = desiredTex;
+      this._reticleMat.needsUpdate = true;
+    }
+    if (this._haloMat.map !== desiredTex) {
+      this._haloMat.map = desiredTex;
+      this._haloMat.needsUpdate = true;
+    }
 
-    const ringScale = r * (onTarget ? (1.02 + pulse * 0.14) : isNear ? (1.0 + pulse * 0.06) : 1.0);
+    // Select altitude-envelope reticle color & pulse dynamics:
+    // - Low over fire / thermal danger -> flashing CRIMSON RED
+    // - Too high (> 58 m) -> wide dashed AMBER mist ring
+    // - Optimal (18-52 m) & onTarget -> glowing EMERALD GREEN lock
+    // - Near fire -> AMBER; Clear ground -> CYAN-WHITE
+    const targetCol = isLowDanger
+      ? COL_RETICLE_DANGER
+      : isTooHigh
+        ? COL_RETICLE_NEAR
+        : onTarget
+          ? COL_RETICLE_LOCK
+          : isNear
+            ? COL_RETICLE_NEAR
+            : COL_RETICLE_CLEAR;
+
+    const pulse = isLowDanger
+      ? 0.5 + 0.5 * Math.sin(elapsed * 16.0)
+      : onTarget && !isTooHigh
+        ? 0.5 + 0.5 * Math.sin(elapsed * 11.0)
+        : isTooHigh || isNear
+          ? 0.5 + 0.5 * Math.sin(elapsed * 6.0)
+          : 0.5 + 0.5 * Math.sin(elapsed * 3.5);
+
+    const ringScale = r * (
+      isTooHigh
+        ? (1.14 + pulse * 0.06)
+        : isLowDanger
+          ? (0.96 + pulse * 0.10)
+          : onTarget
+            ? (1.02 + pulse * 0.14)
+            : isNear
+              ? (1.0 + pulse * 0.06)
+              : 1.0
+    );
 
     // Heading basis
     const yawRad = localAircraft ? (localAircraft.yawDeg || 0) * (Math.PI / 180) : 0;
@@ -1335,7 +1480,15 @@ export class VfxSystem {
     }
     rPos.needsUpdate = true;
     this._reticleMat.color.copy(targetCol);
-    this._reticleMat.opacity = onTarget ? (0.84 + pulse * 0.16) : isNear ? (0.74 + pulse * 0.14) : (0.60 + pulse * 0.12);
+    this._reticleMat.opacity = isLowDanger
+      ? (0.82 + pulse * 0.18)
+      : isTooHigh
+        ? (0.58 + pulse * 0.16)
+        : onTarget
+          ? (0.86 + pulse * 0.14)
+          : isNear
+            ? (0.74 + pulse * 0.14)
+            : (0.60 + pulse * 0.12);
 
     // 2. Drape Drop Corridor strip (corridorStart -> corridorEnd) directly onto terrain
     let csX = Number.isFinite(dropPreview.corridorStartX) ? dropPreview.corridorStartX : ix - fwdX * r * 0.6;
@@ -1357,16 +1510,14 @@ export class VfxSystem {
     }
     const dirX = cdx / Math.max(1, cLen);
     const dirZ = cdz / Math.max(1, cLen);
-    // Right perpendicular to corridor direction
     const cRightX = -dirZ;
     const cRightZ = dirX;
-    const halfWidth = r * 0.62;
+    const halfWidth = r * (isTooHigh ? 0.72 : 0.60);
 
     const cPos = this._corridorGeo.attributes.position;
     const cCols = CORRIDOR_SEGS_W + 1;
     const cRows = CORRIDOR_SEGS_L + 1;
     for (let j = 0; j < cRows; j++) {
-      // PlaneGeometry j=0 is top (+y), j=segs is bottom (-y); map so start->end aligns with chevrons
       const t = 1.0 - j / CORRIDOR_SEGS_L;
       const baseX = csX + cdx * t;
       const baseZ = csZ + cdz * t;
@@ -1381,9 +1532,15 @@ export class VfxSystem {
     cPos.needsUpdate = true;
 
     this._corridorTex.repeat.set(1, Math.max(1.2, cLen / Math.max(24, r * 1.2)));
-    this._corridorTex.offset.y = -(elapsed * (onTarget ? 2.4 : 1.3)) % 1;
+    this._corridorTex.offset.y = -(elapsed * (onTarget && !isTooHigh ? 2.4 : 1.2)) % 1;
     this._corridorMat.color.copy(targetCol);
-    this._corridorMat.opacity = onTarget ? (0.72 + pulse * 0.22) : isNear ? (0.58 + pulse * 0.14) : (0.44 + pulse * 0.10);
+    this._corridorMat.opacity = isTooHigh
+      ? (0.36 + pulse * 0.10)
+      : onTarget
+        ? (0.72 + pulse * 0.22)
+        : isNear
+          ? (0.58 + pulse * 0.14)
+          : (0.44 + pulse * 0.10);
 
     // 3. Canopy-clearance halo + center pipper beacon (never hidden by pine crowns!)
     const centerGroundY = Math.max(terrain.waterLevel + 0.4, terrain.getHeight(ix, iz));
@@ -1393,22 +1550,30 @@ export class VfxSystem {
     this.reticleHaloMesh.rotation.set(0, -yawRad, 0);
     this.reticleHaloMesh.scale.set(ringScale * 0.88, 1.0, ringScale * 1.04);
     this._haloMat.color.copy(targetCol);
-    this._haloMat.opacity = onTarget ? (0.68 + pulse * 0.28) : isNear ? (0.44 + pulse * 0.14) : 0.26;
+    this._haloMat.opacity = isLowDanger
+      ? (0.65 + pulse * 0.30)
+      : isTooHigh
+        ? (0.38 + pulse * 0.12)
+        : onTarget
+          ? (0.68 + pulse * 0.28)
+          : isNear
+            ? (0.44 + pulse * 0.14)
+            : 0.26;
 
     // Vertical center pipper column connecting ground to canopy halo
     this.reticleBeaconMesh.position.set(ix, centerGroundY + 0.6, iz);
     this.reticleBeaconMesh.scale.set(onTarget ? 1.35 : 0.9, canopyH + 2.5, onTarget ? 1.35 : 0.9);
     this._beaconMat.color.copy(targetCol);
-    this._beaconMat.opacity = onTarget ? (0.56 + pulse * 0.28) : isNear ? 0.34 : 0.20;
+    this._beaconMat.opacity = isTooHigh ? 0.22 : onTarget ? (0.56 + pulse * 0.28) : isNear ? 0.34 : 0.20;
 
-    // 4. Expanding emerald lock-on wave when ON TARGET
-    if (onTarget) {
-      const wave = (elapsed * 1.65) % 1.0;
+    // 4. Expanding lock-on wave when optimal ON TARGET (or danger pulse when too low over fire)
+    if ((onTarget && !isTooHigh) || isLowDanger) {
+      const wave = (elapsed * (isLowDanger ? 2.2 : 1.65)) % 1.0;
       const pScale = r * (0.75 + wave * 0.78);
       this.reticlePulseMesh.visible = true;
       this.reticlePulseMesh.position.set(ix, centerGroundY + canopyH + 0.4, iz);
       this.reticlePulseMesh.scale.set(pScale, 1.0, pScale);
-      this._pulseRingMat.color.copy(COL_RETICLE_LOCK);
+      this._pulseRingMat.color.copy(isLowDanger ? COL_RETICLE_DANGER : COL_RETICLE_LOCK);
       this._pulseRingMat.opacity = (1.0 - wave) * 0.88;
     } else {
       this.reticlePulseMesh.visible = false;
@@ -1682,6 +1847,7 @@ export class VfxSystem {
     this._reticleGeo.dispose();
     this._reticleMat.dispose();
     this._reticleTex.dispose();
+    if (this._reticleMistTex) this._reticleMistTex.dispose();
     this._haloGeo.dispose();
     this._haloMat.dispose();
     this._pulseRingMat.dispose();

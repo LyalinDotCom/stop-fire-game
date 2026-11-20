@@ -115,6 +115,18 @@ export class AudioEngine {
 
     this._scoopGain = null;
 
+    // Layer 8-10: Airframe turbulence buffet, dense smoke wind whoosh & choppy rough scoop
+    this._turbBuffetFilter = null;
+    this._turbBuffetLfo = null;
+    this._turbBuffetGain = null;
+    this._turbRattleFilter = null;
+    this._turbRattleLfo = null;
+    this._turbRattleGain = null;
+    this._smokeWhooshFilter = null;
+    this._smokeWhooshGain = null;
+    this._scoopRoughLfo = null;
+    this._scoopRoughGain = null;
+
     // Music playback state
     this._musicRequested = false;
     this._musicUrl = MUSIC_TRACK_URL;
@@ -132,11 +144,15 @@ export class AudioEngine {
     // Edge-detection & debounce state
     this._wasReleasing = false;
     this._wasBounced = false;
+    this._wasScoopRough = false;
     this._wasTargetLocked = false;
+    this._thermalWarnAccum = 0;
     this._lastChimeMs = 0;
     this._lastTargetPipMs = 0;
     this._lastTreeHitMs = 0;
     this._lastCrashMs = 0;
+    this._lastRoughSlapMs = 0;
+    this._lastThermalPipMs = 0;
   }
 
   unlock() {
@@ -410,6 +426,106 @@ export class AudioEngine {
     scoopHpMix.connect(scoopGain);
     scoopGain.connect(comp);
     this._scoopGain = scoopGain;
+
+    // Layer 6c: Choppy Rough Lake Scoop Pontoon Slap (modulated low-mid pink noise)
+    const roughSrc = this._createLoopingNoise(ctx, this._pinkBuf);
+    const roughBp = ctx.createBiquadFilter();
+    roughBp.type = 'bandpass';
+    roughBp.frequency.value = 340;
+    roughBp.Q.value = 1.4;
+
+    const roughAm = ctx.createGain();
+    roughAm.gain.value = 0.55;
+    const roughLfo = ctx.createOscillator();
+    roughLfo.type = 'sawtooth';
+    roughLfo.frequency.value = 8.5;
+    const roughLfoDepth = ctx.createGain();
+    roughLfoDepth.gain.value = 0.45;
+    roughLfo.connect(roughLfoDepth);
+    roughLfoDepth.connect(roughAm.gain);
+    roughLfo.start(0);
+    this._sources.push(roughLfo);
+
+    const roughOut = ctx.createGain();
+    roughOut.gain.value = 0.0;
+    roughSrc.connect(roughBp);
+    roughBp.connect(roughAm);
+    roughAm.connect(roughOut);
+    roughOut.connect(comp);
+    this._scoopRoughLfo = roughLfo;
+    this._scoopRoughGain = roughOut;
+
+    // Layer 8: Airframe Turbulence Buffet Rattle (low hull shudder + cockpit panel chatter)
+    const buffetSrc = this._createLoopingNoise(ctx, this._pinkBuf);
+    const buffetBp = ctx.createBiquadFilter();
+    buffetBp.type = 'bandpass';
+    buffetBp.frequency.value = 135;
+    buffetBp.Q.value = 2.1;
+
+    const buffetAm = ctx.createGain();
+    buffetAm.gain.value = 0.55;
+    const buffetLfo = ctx.createOscillator();
+    buffetLfo.type = 'triangle';
+    buffetLfo.frequency.value = 9.5;
+    const buffetLfoDepth = ctx.createGain();
+    buffetLfoDepth.gain.value = 0.45;
+    buffetLfo.connect(buffetLfoDepth);
+    buffetLfoDepth.connect(buffetAm.gain);
+    buffetLfo.start(0);
+    this._sources.push(buffetLfo);
+
+    const buffetOut = ctx.createGain();
+    buffetOut.gain.value = 0.0;
+    buffetSrc.connect(buffetBp);
+    buffetBp.connect(buffetAm);
+    buffetAm.connect(buffetOut);
+    buffetOut.connect(comp);
+    this._turbBuffetFilter = buffetBp;
+    this._turbBuffetLfo = buffetLfo;
+    this._turbBuffetGain = buffetOut;
+
+    const rattleSrc = this._createLoopingNoise(ctx, this._whiteBuf);
+    const rattleBp = ctx.createBiquadFilter();
+    rattleBp.type = 'bandpass';
+    rattleBp.frequency.value = 880;
+    rattleBp.Q.value = 3.2;
+
+    const rattleAm = ctx.createGain();
+    rattleAm.gain.value = 0.5;
+    const rattleLfo = ctx.createOscillator();
+    rattleLfo.type = 'sawtooth';
+    rattleLfo.frequency.value = 16.0;
+    const rattleLfoDepth = ctx.createGain();
+    rattleLfoDepth.gain.value = 0.48;
+    rattleLfo.connect(rattleLfoDepth);
+    rattleLfoDepth.connect(rattleAm.gain);
+    rattleLfo.start(0);
+    this._sources.push(rattleLfo);
+
+    const rattleOut = ctx.createGain();
+    rattleOut.gain.value = 0.0;
+    rattleSrc.connect(rattleBp);
+    rattleBp.connect(rattleAm);
+    rattleAm.connect(rattleOut);
+    rattleOut.connect(comp);
+    this._turbRattleFilter = rattleBp;
+    this._turbRattleLfo = rattleLfo;
+    this._turbRattleGain = rattleOut;
+
+    // Layer 9: Dense Smoke Plume Convective Wind Whoosh
+    const smokeSrc = this._createLoopingNoise(ctx, this._pinkBuf);
+    const smokeBp = ctx.createBiquadFilter();
+    smokeBp.type = 'bandpass';
+    smokeBp.frequency.value = 340;
+    smokeBp.Q.value = 0.95;
+
+    const smokeOut = ctx.createGain();
+    smokeOut.gain.value = 0.0;
+    smokeSrc.connect(smokeBp);
+    smokeBp.connect(smokeOut);
+    smokeOut.connect(comp);
+    this._smokeWhooshFilter = smokeBp;
+    this._smokeWhooshGain = smokeOut;
   }
 
   _canPlaySfx() {
@@ -853,19 +969,28 @@ export class AudioEngine {
     releasing = false,
     nearestFireDist = 9999,
     bounced = false,
+    turbulence = 0,
+    smokeDensity = 0,
+    heatDanger = 0,
+    scoopRough = false,
   } = {}) {
     if (!this._initialized || !this._ctx || this._disposed) return;
     if (this._ctx.state !== 'running') return;
 
     const now = this._ctx.currentTime;
     const smooth = 0.04;
+    const turb = clamp(Number(turbulence) || 0, 0, 1);
+    const smoke = clamp(Number(smokeDensity) || 0, 0, 1);
+    const heat = clamp(Number(heatDanger) || 0, 0, 1);
+    const roughAmt = typeof scoopRough === 'number' ? clamp(scoopRough, 0, 1) : scoopRough ? 1 : 0;
+    const isScoopRough = Boolean(scooping && roughAmt > 0.05);
 
-    // Layer 1: Ambient wind bed (420 - 780 Hz)
+    // Layer 1: Ambient wind bed (420 - 780 Hz; thickens subtly in dense smoke)
     const speedNorm = clamp((airspeedKmh - 115) / 95, 0, 1);
     const windNorm = clamp(windSpeedKt / 28, 0, 1);
-    const windFreq = 420 + 230 * speedNorm + 130 * windNorm;
-    const windVol = 0.032 + 0.03 * speedNorm + 0.025 * windNorm;
-    this._windFilter.frequency.setTargetAtTime(windFreq, now, 0.08);
+    const windFreq = 420 + 230 * speedNorm + 130 * windNorm - 90 * smoke;
+    const windVol = 0.032 + 0.03 * speedNorm + 0.025 * windNorm + 0.032 * smoke;
+    this._windFilter.frequency.setTargetAtTime(clamp(windFreq, 280, 920), now, 0.08);
     this._windGain.gain.setTargetAtTime(windVol, now, 0.08);
 
     // Layer 2: Engine / Propeller drone (±12% RPM modulation, -4% scoop dip)
@@ -881,12 +1006,12 @@ export class AudioEngine {
     this._propWashFilter.frequency.setTargetAtTime(175 + 75 * rpmNorm, now, smooth);
     this._propWashGain.gain.setTargetAtTime(0.042 + 0.028 * rpmNorm, now, smooth);
 
-    // Layer 3: Proximity wildfire roar (< 280 m)
+    // Layer 3: Proximity wildfire roar (< 280 m, boosted by convective heat danger)
     const fireProx = nearestFireDist < 280 ? clamp(1 - nearestFireDist / 280, 0, 1) : 0;
-    const fireEnergy = fireProx * fireProx;
-    this._fireRoarGain.gain.setTargetAtTime(fireEnergy * 0.34, now, 0.09);
-    this._fireCrackleGain.gain.setTargetAtTime(fireEnergy * 0.14, now, 0.09);
-    this._fireCrackleLfo.frequency.setTargetAtTime(12 + 18 * fireProx, now, 0.15);
+    const fireEnergy = Math.max(fireProx * fireProx, heat * 0.85);
+    this._fireRoarGain.gain.setTargetAtTime(fireEnergy * 0.36, now, 0.09);
+    this._fireCrackleGain.gain.setTargetAtTime(Math.max(fireEnergy * 0.14, heat * 0.2), now, 0.09);
+    this._fireCrackleLfo.frequency.setTargetAtTime(12 + 18 * Math.max(fireProx, heat), now, 0.15);
 
     // Layer 4: Water drop whoosh (1400 -> 320 Hz over 1.25 s)
     if (releasing) {
@@ -905,8 +1030,48 @@ export class AudioEngine {
     }
     this._wasReleasing = Boolean(releasing);
 
-    // Layer 6: Lake scoop skim burst
-    this._scoopGain.gain.setTargetAtTime(scooping ? 0.2 : 0.0, now, 0.035);
+    // Layer 6: Lake scoop skim burst + Layer 6c choppy rough pontoon slap
+    this._scoopGain.gain.setTargetAtTime(scooping ? (isScoopRough ? 0.24 : 0.2) : 0.0, now, 0.035);
+    if (this._scoopRoughGain && this._scoopRoughLfo) {
+      this._scoopRoughGain.gain.setTargetAtTime(isScoopRough ? 0.22 * roughAmt : 0.0, now, 0.04);
+      this._scoopRoughLfo.frequency.setTargetAtTime(7.5 + 4.0 * speedNorm, now, 0.08);
+    }
+    if (isScoopRough && !this._wasScoopRough) {
+      this.playScoopRoughSlap();
+    }
+    this._wasScoopRough = isScoopRough;
+
+    // Layer 8: Airframe turbulence buffet rattle (hull shudder + panel chatter)
+    if (this._turbBuffetGain && this._turbRattleGain) {
+      const turbCurve = turb > 0.04 ? Math.pow(turb, 1.15) : 0;
+      this._turbBuffetFilter.frequency.setTargetAtTime(115 + 95 * turb, now, 0.06);
+      this._turbBuffetLfo.frequency.setTargetAtTime(7.5 + 9.0 * turb, now, 0.08);
+      this._turbBuffetGain.gain.setTargetAtTime(turbCurve * 0.28, now, 0.06);
+
+      this._turbRattleFilter.frequency.setTargetAtTime(760 + 420 * turb, now, 0.06);
+      this._turbRattleLfo.frequency.setTargetAtTime(13.0 + 11.0 * turb, now, 0.08);
+      this._turbRattleGain.gain.setTargetAtTime(turbCurve * 0.095, now, 0.06);
+    }
+
+    // Layer 9: Dense smoke plume rushing convective wind whoosh
+    if (this._smokeWhooshGain && this._smokeWhooshFilter) {
+      const smokeCurve = smoke > 0.04 ? Math.pow(smoke, 1.1) : 0;
+      this._smokeWhooshFilter.frequency.setTargetAtTime(260 + 260 * smoke + 90 * speedNorm, now, 0.08);
+      this._smokeWhooshGain.gain.setTargetAtTime(smokeCurve * 0.23, now, 0.08);
+    }
+
+    // Layer 10: Thermal heat cockpit caution beeper (cadence accelerates with heatDanger)
+    if (heat > 0.22) {
+      const intervalSec = clamp(0.95 - (heat - 0.22) * 0.85, 0.28, 0.95);
+      this._thermalWarnAccum += Math.max(0, dt);
+      if (this._thermalWarnAccum >= intervalSec) {
+        this._thermalWarnAccum = 0;
+        this.playThermalWarningPip(heat);
+      }
+    } else {
+      // Arm to beep quickly on next sudden dip into flames
+      this._thermalWarnAccum = 0.72;
+    }
 
     // Terrain bounce scrape on rising edge (kept for backwards compatibility)
     if (bounced && !this._wasBounced) {
@@ -916,6 +1081,93 @@ export class AudioEngine {
   }
 
   // ---- One-Shot Procedural Cues ----
+
+  // Cockpit Master Thermal Caution tone when flying dangerously low over active flames
+  playThermalWarningPip(intensity = 0.5) {
+    if (!this._canPlaySfx()) return;
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (nowMs - this._lastThermalPipMs < 240) return;
+    this._lastThermalPipMs = nowMs;
+
+    const lvl = clamp(Number(intensity) || 0.5, 0.2, 1);
+    const now = this._ctx.currentTime;
+    const freqs = lvl > 0.65 ? [1046.5, 1396.9] : [987.8];
+    const peakGain = 0.085 + 0.065 * lvl;
+
+    for (let i = 0; i < freqs.length; i++) {
+      const t = now + i * 0.075;
+      const osc = this._ctx.createOscillator();
+      const gain = this._ctx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(freqs[i], t);
+
+      gain.gain.setValueAtTime(0.0001, t);
+      gain.gain.linearRampToValueAtTime(peakGain, t + 0.005);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.068);
+
+      osc.connect(gain);
+      gain.connect(this._compressor);
+      osc.start(t);
+      osc.stop(t + 0.075);
+      osc.onended = () => {
+        osc.disconnect();
+        gain.disconnect();
+      };
+    }
+  }
+
+  // Rough/banked lake scoop wave slap + spray jolt
+  playScoopRoughSlap() {
+    if (!this._canPlaySfx()) return;
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    if (nowMs - this._lastRoughSlapMs < 420) return;
+    this._lastRoughSlapMs = nowMs;
+
+    const now = this._ctx.currentTime;
+
+    // Pontoon hull slap thump
+    const thump = this._ctx.createOscillator();
+    const tGain = this._ctx.createGain();
+    thump.type = 'triangle';
+    thump.frequency.setValueAtTime(145, now);
+    thump.frequency.exponentialRampToValueAtTime(56, now + 0.14);
+    tGain.gain.setValueAtTime(0.0001, now);
+    tGain.gain.linearRampToValueAtTime(0.2, now + 0.008);
+    tGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.16);
+    thump.connect(tGain);
+    tGain.connect(this._compressor);
+    thump.start(now);
+    thump.stop(now + 0.18);
+    thump.onended = () => {
+      thump.disconnect();
+      tGain.disconnect();
+    };
+
+    // Sharp water spray slap burst
+    const spraySrc = this._ctx.createBufferSource();
+    spraySrc.buffer = this._whiteBuf;
+    const bp = this._ctx.createBiquadFilter();
+    bp.type = 'bandpass';
+    bp.frequency.setValueAtTime(1450, now);
+    bp.frequency.exponentialRampToValueAtTime(520, now + 0.22);
+    bp.Q.value = 1.2;
+
+    const sGain = this._ctx.createGain();
+    sGain.gain.setValueAtTime(0.0001, now);
+    sGain.gain.linearRampToValueAtTime(0.22, now + 0.012);
+    sGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.24);
+
+    spraySrc.connect(bp);
+    bp.connect(sGain);
+    sGain.connect(this._compressor);
+    spraySrc.start(now);
+    spraySrc.stop(now + 0.26);
+    spraySrc.onended = () => {
+      spraySrc.disconnect();
+      bp.disconnect();
+      sGain.disconnect();
+    };
+  }
 
   // Unmistakable Drop Outcome Cues: 'direct' | 'partial' | 'miss'
   playDropOutcome(outcome = 'miss', cellsExtinguished = 0) {

@@ -619,6 +619,86 @@ export const RADIO_CLIPS = Object.freeze([
     "text": "We saw that bird go down! Reserve tanker launching now — get back up here, pilot!",
     "url": "./audio/radio/crash_respawn_03.mp3",
     "durationMs": 5290
+  },
+  {
+    "id": "drop_too_high_01",
+    "category": "drop_too_high",
+    "speaker": "AIR ATTACK 1",
+    "freq": "122.925",
+    "urgency": "warn",
+    "text": "Way too high, Tanker! Wind sheared that load into mist — drop down to thirty meters!",
+    "url": "./audio/radio/drop_too_high_01.mp3",
+    "durationMs": 5346
+  },
+  {
+    "id": "drop_too_high_02",
+    "category": "drop_too_high",
+    "speaker": "LOOKOUT 04",
+    "freq": "168.650",
+    "urgency": "warn",
+    "text": "Water evaporated before hitting the crown! Descend into the twenty-five to fifty meter window!",
+    "url": "./audio/radio/drop_too_high_02.mp3",
+    "durationMs": 5478
+  },
+  {
+    "id": "drop_too_high_03",
+    "category": "drop_too_high",
+    "speaker": "HOTSHOT ALPHA",
+    "freq": "168.200",
+    "urgency": "warn",
+    "text": "We barely felt mist down here! Come in lower over the ridge so that curtain punches through!",
+    "url": "./audio/radio/drop_too_high_03.mp3",
+    "durationMs": 6208
+  },
+  {
+    "id": "turbulence_smoke_01",
+    "category": "turbulence_smoke",
+    "speaker": "AIR ATTACK 1",
+    "freq": "122.925",
+    "urgency": "warn",
+    "text": "Heavy convective turbulence in the smoke column! Watch for updrafts and hold your wings level!",
+    "url": "./audio/radio/turbulence_smoke_01.mp3",
+    "durationMs": 5163
+  },
+  {
+    "id": "turbulence_smoke_02",
+    "category": "turbulence_smoke",
+    "speaker": "LOOKOUT 04",
+    "freq": "168.650",
+    "urgency": "warn",
+    "text": "Dense smoke plume across the head — keep airspeed up and watch for thermal shear!",
+    "url": "./audio/radio/turbulence_smoke_02.mp3",
+    "durationMs": 4295
+  },
+  {
+    "id": "turbulence_smoke_03",
+    "category": "turbulence_smoke",
+    "speaker": "DISPATCH",
+    "freq": "122.925",
+    "urgency": "warn",
+    "text": "Advisory for all tankers: severe thermal lift over the active core. Avoid skimming inside the flames!",
+    "url": "./audio/radio/turbulence_smoke_03.mp3",
+    "durationMs": 7073
+  },
+  {
+    "id": "scoop_rough_01",
+    "category": "scoop_rough",
+    "speaker": "AIR ATTACK 1",
+    "freq": "122.925",
+    "urgency": "normal",
+    "text": "Choppy scoop, Tanker! Level your wings and ease the throttle for a faster lake pickup.",
+    "url": "./audio/radio/scoop_rough_01.mp3",
+    "durationMs": 4515
+  },
+  {
+    "id": "scoop_rough_02",
+    "category": "scoop_rough",
+    "speaker": "DISPATCH",
+    "freq": "122.925",
+    "urgency": "normal",
+    "text": "Rough water contact on the skim — keep wings level and steady speed for maximum intake!",
+    "url": "./audio/radio/scoop_rough_02.mp3",
+    "durationMs": 6021
   }
 ]);
 

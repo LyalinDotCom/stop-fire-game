@@ -5,6 +5,10 @@ export const PROTOCOL_VERSION = 1;
 export const RING_SIZE = 16;
 export const MAX_SLOTS = 100;
 export const CALLSIGN_MAX = 16;
+export const LOBBY_FRESH_MS = 30000;
+export const HOSTABLE_WORLD_IDS = Object.freeze(
+  Array.from({ length: 18 }, (_, i) => `megabasin-${String(i + 1).padStart(2, '0')}`)
+);
 export const EMULATOR_PORTS = Object.freeze({ auth: 9461, database: 9462 });
 
 export const WORLD_ID_RE = /^megabasin-(0[1-9]|1[0-9]|20)$/;
@@ -103,9 +107,11 @@ export function parseNetQuery(search = globalThis.location?.search ?? '') {
     }
   }
 
-  // ?world=megabasin-01..20
+  // ?lobby=megabasin-01..20 or ?world=megabasin-01..20
+  const rawLobby = (params.get('lobby') ?? '').trim();
   const rawWorld = (params.get('world') ?? '').trim();
-  const worldId = WORLD_ID_RE.test(rawWorld) ? rawWorld : DEFAULT_WORLD_ID;
+  const lobbyId = WORLD_ID_RE.test(rawLobby) ? rawLobby : null;
+  const worldId = lobbyId || (WORLD_ID_RE.test(rawWorld) ? rawWorld : DEFAULT_WORLD_ID);
 
   // ?tab -> browserSessionPersistence (distinct anonymous UID per tab)
   const tab = params.has('tab') && params.get('tab') !== '0' && params.get('tab') !== 'false';
@@ -131,6 +137,7 @@ export function parseNetQuery(search = globalThis.location?.search ?? '') {
     emu,
     emulatorPorts,
     worldId,
+    lobbyId,
     tab,
     loopback,
     mode,

@@ -187,7 +187,7 @@ export class HostBroadcaster {
     }
   }
 
-  async start({ isFailover = false } = {}) {
+  async start({ isFailover = false, forceFreshMission = false } = {}) {
     if (this.running) return;
     this.running = true;
 
@@ -226,7 +226,7 @@ export class HostBroadcaster {
 
     if (planesNode && Number.isInteger(planesNode.q)) {
       this.planesSeq = planesNode.q;
-      if (planesNode.p) {
+      if (!forceFreshMission && planesNode.p) {
         try {
           const decoded = decodePlanes(planesNode.p);
           for (const p of decoded) {
@@ -256,7 +256,18 @@ export class HostBroadcaster {
       }
     }
 
-    if (fireKey && typeof fireKey.d === 'string') {
+    if (forceFreshMission) {
+      // Starting a brand-new hosted lobby on a fresh or stale shard:
+      // keep our fresh Operation 01 FireSim, only advance seq past any prior RTDB entries.
+      let maxQ = Number.isInteger(fireKey?.q) ? fireKey.q : 0;
+      if (fireRing && typeof fireRing === 'object') {
+        for (const entry of Object.values(fireRing)) {
+          if (entry && Number.isInteger(entry.q) && entry.q > maxQ) maxQ = entry.q;
+        }
+      }
+      this.fireSeq = maxQ;
+      this._pilots.clear();
+    } else if (fireKey && typeof fireKey.d === 'string') {
       try {
         const keyState = decodeFireKey(fireKey.d);
         if (
@@ -302,6 +313,10 @@ export class HostBroadcaster {
     const epochAdvanced = !fireKey || this.epoch > (fireKey.e | 0);
     if (epochAdvanced || !this._lastFireKeyAt || now - this._lastFireKeyAt >= PACING_MS.fireKey) {
       await this.publishFireKey().catch(() => {});
+    }
+    const metaEpochAdvanced = !metaNode || this.epoch > (metaNode.e | 0);
+    if (forceFreshMission && (metaEpochAdvanced || !this._lastMetaAt || now - this._lastMetaAt >= PACING_MS.meta)) {
+      await this.publishMeta().catch(() => {});
     }
     if (!this._lastIndexAt || now - this._lastIndexAt >= PACING_MS.worldsIndex) {
       await this.publishWorldsIndex().catch(() => {});
@@ -377,7 +392,20 @@ export class HostBroadcaster {
     const activeSlots = new Set();
     let activeManualPilots = 0;
 
-    for (const [slotKey, slotObj] of Object.entries(this._slots)) {
+    // Build slot list, ensuring local Host pilot is ALWAYS processed even before onValue(slots) echoes back.
+    const slotEntries = Object.entries(this._slots);
+    if (
+      this.localSlotId !== null &&
+      this._localAircraft &&
+      !this._slots[String(this.localSlotId)]
+    ) {
+      slotEntries.push([
+        String(this.localSlotId),
+        { uid: this.adapter.uid, leaseUntil: now + 40000 },
+      ]);
+    }
+
+    for (const [slotKey, slotObj] of slotEntries) {
       if (!slotObj || typeof slotObj.uid !== 'string') continue;
       if (typeof slotObj.leaseUntil === 'number' && slotObj.leaseUntil <= now) continue;
 
@@ -387,8 +415,10 @@ export class HostBroadcaster {
 
       const uid = slotObj.uid;
       let pilot = this._pilots.get(slotId);
+      const isLocalHostPilot =
+        (slotId === this.localSlotId || uid === this.adapter.uid) && !!this._localAircraft;
 
-      if (slotId === this.localSlotId && this._localAircraft) {
+      if (isLocalHostPilot) {
         const a = this._localAircraft;
         const isCrashed = !!a.crashed;
         if (!pilot) {
@@ -410,7 +440,7 @@ export class HostBroadcaster {
             flags: 0,
             lastInputT: now,
             lastDropSeq: this._localDropSeq,
-            dropBurstTimer: 0,
+            dropBurstTimer: (!isCrashed && a.releasing) ? MIN_DROP_BURST_SEC : 0,
           };
           this._pilots.set(slotId, pilot);
         } else {
@@ -426,9 +456,7 @@ export class HostBroadcaster {
             pilot.z = a.z;
           } else {
             if (pilot.crashed) {
-              // Respawned cleanly after crash cycle — reset tank to local post-respawn level.
               pilot.crashed = false;
-              pilot.tankPct = a.tankPct ?? 0;
             }
             if (isDropSeqNewer(this._localDropSeq, pilot.lastDropSeq)) {
               pilot.dropBurstTimer = Math.max(pilot.dropBurstTimer, MIN_DROP_BURST_SEC);
@@ -441,6 +469,9 @@ export class HostBroadcaster {
             pilot.pitchDeg = a.pitchDeg;
             pilot.rollDeg = a.rollDeg;
             pilot.speedKmh = a.speedKmh;
+            // Host is authoritative for its own plane — ALWAYS keep tankPct synced with FlightModel
+            // so Host water drops are NEVER silently blocked by a tankPct desync!
+            pilot.tankPct = typeof a.tankPct === 'number' ? a.tankPct : pilot.tankPct;
             pilot.releasing = !!a.releasing;
             pilot.scooping = !!a.scooping;
           }
@@ -593,7 +624,7 @@ export class HostBroadcaster {
         continue;
       }
 
-      // Authoritative scoop validation: tracks FlightModel forgiving water scoop ceiling dynamically.
+      // Authoritative scoop validation: tracks FlightModel forgiving water scoop ceiling & optimal/rough scoop rate.
       const maxScoopAgl = (FLIGHT_CONSTANTS.SCOOP_EXIT_AGL ?? 11.5) + 0.5;
       const overWater = this.terrain?.isWater ? this.terrain.isWater(pilot.x, pilot.z) : false;
       const waterLevel = this.terrain?.waterLevel ?? 12.0;
@@ -602,14 +633,29 @@ export class HostBroadcaster {
       pilot.scooping = validScoop;
 
       if (validScoop) {
-        pilot.tankPct = Math.min(100, pilot.tankPct + FLIGHT_CONSTANTS.SCOOP_RATE * dt);
+        if (!isLocalHostPilot) {
+          const optRoll = FLIGHT_CONSTANTS.SCOOP_OPTIMAL_MAX_ROLL_DEG ?? 16;
+          const optMinSpd = FLIGHT_CONSTANTS.SCOOP_OPTIMAL_MIN_SPEED_KMH ?? 120;
+          const optMaxSpd = FLIGHT_CONSTANTS.SCOOP_OPTIMAL_MAX_SPEED_KMH ?? 175;
+          const isOptimalScoop =
+            Math.abs(pilot.rollDeg || 0) < optRoll &&
+            pilot.speedKmh >= optMinSpd &&
+            pilot.speedKmh <= optMaxSpd;
+          const scoopRate = isOptimalScoop
+            ? (FLIGHT_CONSTANTS.SCOOP_RATE_OPTIMAL ?? FLIGHT_CONSTANTS.SCOOP_RATE ?? 75)
+            : (FLIGHT_CONSTANTS.SCOOP_RATE_ROUGH ?? 30);
+          pilot.tankPct = Math.min(100, pilot.tankPct + scoopRate * dt);
+        }
         pilot.dropBurstTimer = 0;
       }
 
       // Authoritative drop validation honoring minimum 0.25 s burst triggered by dropSeq increment.
       const burstActive = pilot.dropBurstTimer > 0;
       const wantsRelease = pilot.releasing || burstActive;
-      const validRelease = wantsRelease && pilot.tankPct > 0.1 && !validScoop;
+      const hasWater = isLocalHostPilot
+        ? (pilot.releasing || pilot.tankPct > 0.1)
+        : (pilot.tankPct > 0.1);
+      const validRelease = wantsRelease && hasWater && !validScoop;
       pilot.releasing = validRelease;
 
       if (burstActive) {
@@ -617,17 +663,34 @@ export class HostBroadcaster {
       }
 
       if (validRelease) {
-        pilot.tankPct = Math.max(0, pilot.tankPct - FLIGHT_CONSTANTS.DROP_RATE * dt);
-        const speedMs = pilot.speedKmh * KMH_TO_MS;
-        const yawRad = pilot.yawDeg * DEG_TO_RAD;
-        const pitchRad = pilot.pitchDeg * DEG_TO_RAD;
-        const cosP = Math.cos(pitchRad);
-        const vx = Math.sin(yawRad) * cosP * speedMs;
-        const vy = Math.sin(pitchRad) * speedMs;
-        const vz = -Math.cos(yawRad) * cosP * speedMs;
+        if (!isLocalHostPilot) {
+          pilot.tankPct = Math.max(0, pilot.tankPct - FLIGHT_CONSTANTS.DROP_RATE * dt);
+        }
+        let vx;
+        let vy;
+        let vz;
+        if (
+          isLocalHostPilot &&
+          this._localAircraft &&
+          typeof this._localAircraft.vx === 'number' &&
+          typeof this._localAircraft.vy === 'number' &&
+          typeof this._localAircraft.vz === 'number'
+        ) {
+          vx = this._localAircraft.vx;
+          vy = this._localAircraft.vy;
+          vz = this._localAircraft.vz;
+        } else {
+          const speedMs = pilot.speedKmh * KMH_TO_MS;
+          const yawRad = pilot.yawDeg * DEG_TO_RAD;
+          const pitchRad = pilot.pitchDeg * DEG_TO_RAD;
+          const cosP = Math.cos(pitchRad);
+          vx = Math.sin(yawRad) * cosP * speedMs;
+          vy = Math.sin(pitchRad) * speedMs;
+          vz = -Math.cos(yawRad) * cosP * speedMs;
+        }
         const groundY = this.terrain?.getHeight ? this.terrain.getHeight(pilot.x, pilot.z) : waterLevel;
         const releaseAgl = Math.max(4, pilot.y - Math.max(groundY, waterLevel));
-        this.fireSim.spawnWaterParcel(slotId, pilot.x, pilot.y, pilot.z, vx, vy, vz, releaseAgl);
+        this.fireSim.spawnWaterParcel(slotId, pilot.x, pilot.y - 1.4, pilot.z, vx, vy, vz, releaseAgl);
       }
     }
 

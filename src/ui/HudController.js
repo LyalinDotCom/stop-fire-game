@@ -1,8 +1,9 @@
 // Minimal, Streamlined Native-Resolution Tactical HUD Orchestrator for EMBER FRONT
 // Strictly uses DOM APIs and textContent (zero innerHTML, zero inline scripts).
-// Zero permanent keybind bars or Solo/MP mode splits — corner widgets + JIT hints + auto-hiding VHF radio.
+// Corner widgets + atmosphere vignettes + altitude JIT coaching + auto-hiding VHF radio + sleek Launch Overlay.
 
 import { LIVERIES } from '../config/liveries.js';
+import { OPERATIONS } from '../config/operations.js';
 import { TacticalMap } from './TacticalMap.js';
 import { WorldCallouts } from './WorldCallouts.js';
 import { SettingsDrawer, sanitizeCallsign } from './SettingsDrawer.js';
@@ -110,6 +111,10 @@ function shortestAngleStep(current, target) {
   return current + diff;
 }
 
+function clamp01(v) {
+  return v <= 0 ? 0 : v >= 1 ? 1 : v;
+}
+
 function resolveRadioAccent(urgency, category) {
   const u = String(urgency || '').toLowerCase();
   const c = String(category || '').toLowerCase();
@@ -121,7 +126,9 @@ function resolveRadioAccent(urgency, category) {
     c === 'help_cabin' ||
     c === 'cabin_at_risk' ||
     c === 'damage_hit' ||
-    c === 'crash_respawn'
+    c === 'crash_respawn' ||
+    c === 'heat_warning' ||
+    c === 'thermal_heat'
   ) {
     return 'is-urgent';
   }
@@ -133,7 +140,10 @@ function resolveRadioAccent(urgency, category) {
     u === 'warning' ||
     u.startsWith('miss') ||
     c.startsWith('miss') ||
-    c === 'hit_partial'
+    c === 'hit_partial' ||
+    c === 'drop_too_high' ||
+    c === 'misted_high' ||
+    c === 'scoop_rough'
   ) {
     return 'is-warn';
   }
@@ -158,19 +168,24 @@ function formatFreq(freq) {
 function resolveConnStatus(netState) {
   if (!netState) return 'connecting';
   if (
+    netState.connStatus === 'solo' ||
+    netState.connStatus === 'host' ||
     netState.connStatus === 'online' ||
     netState.connStatus === 'connecting' ||
     netState.connStatus === 'offline_full' ||
     netState.connStatus === 'offline_error'
   ) {
+    if (netState.connStatus === 'online' && netState.status === 'host') return 'host';
     return netState.connStatus;
   }
+  if (netState.mode === 'solo' || netState.status === 'solo') return 'solo';
   if (netState.status === 'syncing') return 'connecting';
   if (netState.status === 'offline' || netState.offlineFallback) {
     const reason = String(netState.offlineReason || '').toLowerCase();
     return reason.includes('full') || reason.includes('100') ? 'offline_full' : 'offline_error';
   }
-  if (netState.status === 'host' || netState.status === 'live') return 'online';
+  if (netState.status === 'host') return 'host';
+  if (netState.status === 'live') return 'online';
   return 'connecting';
 }
 
@@ -182,6 +197,11 @@ export class HudController {
     onNextOperation,
     onReplay,
     onResumeLive,
+    onLaunchSolo,
+    onHostLobby,
+    onJoinLobby,
+    onRefreshLobbies,
+    onCopyInviteLink,
   } = {}) {
     this._callbacks = {
       onToggleAudio,
@@ -190,6 +210,11 @@ export class HudController {
       onNextOperation,
       onReplay,
       onResumeLive,
+      onLaunchSolo,
+      onHostLobby,
+      onJoinLobby,
+      onRefreshLobbies,
+      onCopyInviteLink,
     };
 
     this._root =
@@ -204,11 +229,22 @@ export class HudController {
     this._overlayCountdownEl = null;
     this._toastTimers = new Set();
 
-    // JIT hint state
+    // JIT hint & atmosphere vignette state
     this._wasAutopilot = true;
     this._manualHintUntilMs = 0;
+    this._roughScoopUntilMs = 0;
     this._lastHullHp = 100;
     this._lastConnStatus = null;
+    this._smokeVis = 0;
+    this._heatVis = 0;
+
+    // Launch / Lobby browser overlay state
+    this._launchOpen = false;
+    this._launchCanDismiss = false;
+    this._launchBusy = false;
+    this._lobbies = [];
+    this._lobbiesLoading = false;
+    this._lobbiesError = null;
 
     // Outcome toast & peripheral flash timers
     this._outcomeHideTimer = null;
@@ -222,6 +258,15 @@ export class HudController {
     // 1. 3D-Projected World Callouts Layer (behind HUD widgets)
     this._callouts = new WorldCallouts();
     this._root.appendChild(this._callouts.el);
+
+    // 1b. Dynamic Cockpit Smoke Plume Haze & Thermal Heat Caution Vignettes
+    this._smokeVignetteEl = el('div', 'ef-smoke-vignette');
+    this._smokeVignetteEl.style.opacity = '0';
+    this._root.appendChild(this._smokeVignetteEl);
+
+    this._heatVignetteEl = el('div', 'ef-heat-vignette');
+    this._heatVignetteEl.style.opacity = '0';
+    this._root.appendChild(this._heatVignetteEl);
 
     // 2. Peripheral Edge Flash Layer (direct hit emerald glow / damage red flash)
     this._flashEl = el('div', 'ef-hud-flash');
@@ -247,14 +292,24 @@ export class HudController {
     this._tacticalMap = new TacticalMap();
     this._root.appendChild(this._tacticalMap.el);
 
-    // 9. Non-blocking Crash Respawn Banner Overlay
+    // 9. Sleek Minimal Launch Overlay (Solo / Host Lobby / Join Live Lobby over DEMO FLIGHT)
+    this._buildLaunchOverlay();
+
+    // 10. Non-blocking Crash Respawn Banner Overlay
     this._buildCrashOverlay();
 
-    // 10. Slide-Over Settings, Audio Mixer, Controls & Live Squadron Drawer
+    // 11. Slide-Over Settings, Audio Mixer, Controls & Live Squadron Drawer
     this._drawer = new SettingsDrawer({
       onSettingChange: (key, val) => {
         if (key === 'audioMuted') {
           this.setAudioMuted(Boolean(val));
+        } else if (key === 'copyInviteLink' && this._callbacks.onCopyInviteLink) {
+          this._callbacks.onCopyInviteLink(val);
+        } else if (key === 'hostLobby' && this._callbacks.onHostLobby) {
+          this._callbacks.onHostLobby();
+        } else if (key === 'openLaunch') {
+          this.showLaunchOverlay(true, { canDismiss: true });
+          if (this._callbacks.onRefreshLobbies) this._callbacks.onRefreshLobbies();
         }
         if (this._callbacks.onSettingChange) this._callbacks.onSettingChange(key, val);
       },
@@ -265,7 +320,7 @@ export class HudController {
     this._root.appendChild(this._drawer.backdropEl);
     this._root.appendChild(this._drawer.drawerEl);
 
-    // 11. Full Mission Overlay container (Victory / Defeat / Intermission / Offline)
+    // 12. Full Mission Overlay container (Victory / Defeat / Intermission / Offline)
     this._overlayEl = el('div', 'ef-overlay ef-hidden');
     this._root.appendChild(this._overlayEl);
   }
@@ -542,6 +597,251 @@ export class HudController {
     this._root.appendChild(this._jitWrapEl);
   }
 
+  _buildLaunchOverlay() {
+    const overlay = el('div', 'ef-launch-overlay ef-hidden');
+    overlay.setAttribute('data-launch-overlay', 'true');
+    overlay.setAttribute('aria-hidden', 'true');
+
+    const card = el('section', 'ef-launch-card');
+    card.setAttribute('aria-label', 'Ember Front Launch and Live Lobbies');
+
+    // Header
+    const head = el('div', 'ef-launch-head');
+    const brand = el('div', 'ef-launch-brand');
+    brand.appendChild(el('div', 'ef-launch-kicker', 'AERIAL FIRE RESPONSE UNIT'));
+    brand.appendChild(el('h1', 'ef-launch-title', 'EMBER FRONT'));
+    brand.appendChild(
+      el('div', 'ef-launch-sub', 'Skim lakes to scoop · Drop at 25–50 m AGL · Protect cabins')
+    );
+    head.appendChild(brand);
+
+    const closeBtn = el('button', 'ef-launch-close ef-hidden', '×');
+    closeBtn.type = 'button';
+    closeBtn.setAttribute('aria-label', 'Resume flight');
+    closeBtn.setAttribute('data-action', 'close-launch');
+    closeBtn.addEventListener('click', () => {
+      if (this._launchCanDismiss && !this._launchBusy) {
+        this.showLaunchOverlay(false);
+      }
+    });
+    this._launchCloseBtn = closeBtn;
+    head.appendChild(closeBtn);
+    card.appendChild(head);
+
+    // Primary Mode Buttons: FLY SOLO & HOST LOBBY
+    const primaryGrid = el('div', 'ef-launch-primary-grid');
+
+    const soloBtn = el('button', 'ef-launch-btn is-solo');
+    soloBtn.type = 'button';
+    soloBtn.setAttribute('data-action', 'launch-solo');
+    soloBtn.appendChild(el('span', 'ef-launch-btn-title', 'FLY SOLO'));
+    soloBtn.appendChild(el('span', 'ef-launch-btn-sub', 'Instant local mission'));
+    soloBtn.addEventListener('click', () => {
+      if (this._launchBusy) return;
+      if (this._callbacks.onLaunchSolo) {
+        this._callbacks.onLaunchSolo();
+      } else {
+        this.showLaunchOverlay(false);
+      }
+    });
+    this._launchSoloBtn = soloBtn;
+    primaryGrid.appendChild(soloBtn);
+
+    const hostBtn = el('button', 'ef-launch-btn is-host');
+    hostBtn.type = 'button';
+    hostBtn.setAttribute('data-action', 'launch-host');
+    hostBtn.appendChild(el('span', 'ef-launch-btn-title', 'HOST LOBBY'));
+    hostBtn.appendChild(el('span', 'ef-launch-btn-sub', 'Live co-op + invite link'));
+    hostBtn.addEventListener('click', () => {
+      if (this._launchBusy) return;
+      if (this._callbacks.onHostLobby) {
+        this._callbacks.onHostLobby();
+      } else {
+        this.showLaunchOverlay(false);
+      }
+    });
+    this._launchHostBtn = hostBtn;
+    primaryGrid.appendChild(hostBtn);
+
+    card.appendChild(primaryGrid);
+
+    // Live Lobbies Directory Section
+    const lobbiesWrap = el('div', 'ef-launch-lobbies');
+    const lobbiesHead = el('div', 'ef-launch-lobbies-head');
+
+    const lobbiesMeta = el('div', 'ef-launch-lobbies-meta');
+    lobbiesMeta.appendChild(el('span', 'ef-launch-lobbies-label', 'LIVE LOBBIES'));
+    this._lobbiesCountEl = el('span', 'ef-launch-lobbies-count', '0');
+    lobbiesMeta.appendChild(this._lobbiesCountEl);
+    lobbiesHead.appendChild(lobbiesMeta);
+
+    const refreshBtn = el('button', 'ef-launch-refresh-btn', '↻ REFRESH');
+    refreshBtn.type = 'button';
+    refreshBtn.setAttribute('data-action', 'refresh-lobbies');
+    refreshBtn.setAttribute('aria-label', 'Refresh live lobbies');
+    refreshBtn.addEventListener('click', () => {
+      if (this._launchBusy) return;
+      if (this._callbacks.onRefreshLobbies) this._callbacks.onRefreshLobbies();
+    });
+    this._launchRefreshBtn = refreshBtn;
+    lobbiesHead.appendChild(refreshBtn);
+    lobbiesWrap.appendChild(lobbiesHead);
+
+    this._lobbiesListEl = el('div', 'ef-launch-lobbies-list');
+    lobbiesWrap.appendChild(this._lobbiesListEl);
+    card.appendChild(lobbiesWrap);
+
+    this._launchFooterEl = el('div', 'ef-launch-footer', 'Live DEMO FLIGHT active in background');
+    card.appendChild(this._launchFooterEl);
+
+    overlay.appendChild(card);
+    this._launchEl = overlay;
+    this._root.appendChild(overlay);
+    this._renderLobbiesList();
+  }
+
+  /**
+   * Shows or hides the sleek translucent launch & live lobby browser card over live DEMO FLIGHT.
+   */
+  showLaunchOverlay(visible, { lobbies, loading, error, canDismiss, statusText } = {}) {
+    const show = Boolean(visible);
+    this._launchOpen = show;
+    if (typeof canDismiss === 'boolean') {
+      this._launchCanDismiss = canDismiss;
+    }
+    this._launchCloseBtn.classList.toggle('ef-hidden', !this._launchCanDismiss);
+
+    if (lobbies !== undefined || loading !== undefined || error !== undefined) {
+      this.setLobbies(lobbies !== undefined ? lobbies : this._lobbies, {
+        loading: loading !== undefined ? Boolean(loading) : this._lobbiesLoading,
+        error: error !== undefined ? error : this._lobbiesError,
+      });
+    }
+    if (typeof statusText === 'string') {
+      this._launchFooterEl.textContent = statusText;
+    } else if (!this._launchBusy) {
+      this._launchFooterEl.textContent = this._launchCanDismiss
+        ? 'Select a mode or press × to return to current flight'
+        : 'Live DEMO FLIGHT active in background';
+    }
+
+    this._launchEl.classList.toggle('ef-hidden', !show);
+    this._launchEl.setAttribute('aria-hidden', show ? 'false' : 'true');
+    if (show) {
+      this._setJitHint(null, '');
+    }
+  }
+
+  isLaunchOverlayOpen() {
+    return this._launchOpen;
+  }
+
+  /**
+   * Updates the Live Lobbies list shown inside the Launch Overlay (strictly DOM textContent).
+   */
+  setLobbies(lobbies, { loading = false, error = null } = {}) {
+    this._lobbies = Array.isArray(lobbies) ? lobbies.slice(0, 20) : [];
+    this._lobbiesLoading = Boolean(loading);
+    this._lobbiesError = error ? String(error) : null;
+    this._renderLobbiesList();
+  }
+
+  /**
+   * Disables/re-enables Launch Overlay action buttons during lobby create/join transitions.
+   */
+  setLaunchBusy(busyText = null) {
+    const busy = Boolean(busyText);
+    this._launchBusy = busy;
+    this._launchSoloBtn.disabled = busy;
+    this._launchHostBtn.disabled = busy;
+    this._launchRefreshBtn.disabled = busy;
+    if (busyText) {
+      this._launchFooterEl.textContent = String(busyText);
+    } else {
+      this._launchFooterEl.textContent = this._launchCanDismiss
+        ? 'Select a mode or press × to return to current flight'
+        : 'Live DEMO FLIGHT active in background';
+    }
+    this._renderLobbiesList();
+  }
+
+  _renderLobbiesList() {
+    if (!this._lobbiesListEl) return;
+    this._lobbiesListEl.replaceChildren();
+    this._lobbiesCountEl.textContent = String(this._lobbies.length);
+
+    if (this._lobbiesLoading) {
+      this._lobbiesListEl.appendChild(
+        el('div', 'ef-lobby-empty', 'Scanning live airspace frequencies...')
+      );
+      return;
+    }
+
+    if (this._lobbiesError && this._lobbies.length === 0) {
+      this._lobbiesListEl.appendChild(
+        el('div', 'ef-lobby-empty is-error', this._lobbiesError)
+      );
+      return;
+    }
+
+    if (this._lobbies.length === 0) {
+      this._lobbiesListEl.appendChild(
+        el('div', 'ef-lobby-empty', 'No active lobbies — Host one!')
+      );
+      return;
+    }
+
+    for (let i = 0; i < this._lobbies.length; i++) {
+      const item = this._lobbies[i];
+      if (!item) continue;
+      const worldId = String(item.worldId || item.id || item.lobbyId || `lobby-${i + 1}`);
+      const opIdx = Number.isInteger(item.opIndex) ? item.opIndex : null;
+      const opFallback = opIdx !== null && OPERATIONS[opIdx] ? OPERATIONS[opIdx].name : 'Cinderpine Basin';
+      const title = String(item.opName || item.title || item.name || opFallback);
+      const hostRaw = item.hostCallsign || item.hostName || item.host || '';
+      const hostText = hostRaw ? sanitizeCallsign(String(hostRaw), '') : '';
+      const pilots = Math.max(0, Math.floor(item.pilotsCount ?? item.pilots ?? item.players ?? 1));
+      const cap = Math.max(1, Math.floor(item.pilotsCap ?? item.cap ?? item.maxPilots ?? 100));
+      const isFull = Boolean(item.full) || pilots >= cap;
+      const codeLabel = String(item.code || item.shortId || worldId).slice(0, 18);
+
+      const row = el('div', 'ef-lobby-row');
+      const info = el('div', 'ef-lobby-info');
+      info.appendChild(el('div', 'ef-lobby-name', title));
+
+      const metaParts = [];
+      if (hostText) metaParts.push(`HOST ${hostText}`);
+      else metaParts.push(codeLabel);
+      if (Number.isFinite(item.burningPct)) {
+        metaParts.push(`FIRE ${item.burningPct.toFixed(0)}%`);
+      }
+      info.appendChild(el('div', 'ef-lobby-meta', metaParts.join(' · ')));
+      row.appendChild(info);
+
+      const right = el('div', 'ef-lobby-right');
+      const pilotsChip = el('span', `ef-lobby-pilots${isFull ? ' is-full' : ''}`, `${pilots}/${cap}`);
+      right.appendChild(pilotsChip);
+
+      const joinBtn = el('button', 'ef-lobby-join-btn', isFull ? 'FULL' : 'JOIN');
+      joinBtn.type = 'button';
+      joinBtn.disabled = isFull || this._launchBusy;
+      joinBtn.setAttribute('data-action', 'join-lobby');
+      joinBtn.setAttribute('data-world-id', worldId);
+      joinBtn.addEventListener('click', () => {
+        if (isFull || this._launchBusy) return;
+        if (this._callbacks.onJoinLobby) {
+          this._callbacks.onJoinLobby(worldId, item);
+        } else {
+          this.showLaunchOverlay(false);
+        }
+      });
+      right.appendChild(joinBtn);
+
+      row.appendChild(right);
+      this._lobbiesListEl.appendChild(row);
+    }
+  }
+
   _buildCrashOverlay() {
     this._crashEl = el('div', 'ef-crash-banner ef-hidden');
     this._crashEl.setAttribute('aria-live', 'assertive');
@@ -620,6 +920,34 @@ export class HudController {
     const cells = Math.max(0, Math.round(outcomeObj.cellsExtinguished ?? outcomeObj.cells ?? 0));
     const cooled = Math.max(0, Math.round(outcomeObj.cellsCooled ?? 0));
     const pts = Math.max(0, Math.round(outcomeObj.pointsAwarded ?? outcomeObj.pts ?? 0));
+    const dropQuality = String(outcomeObj.dropQuality || 'optimal').toLowerCase();
+    const isMistedHigh = dropQuality === 'misted_high';
+    const releaseAgl = Number.isFinite(outcomeObj.releaseAgl) ? Math.round(outcomeObj.releaseAgl) : null;
+
+    if (isMistedHigh) {
+      const aglNote = releaseAgl ? `${releaseAgl}m AGL` : '> 58m AGL';
+      if (norm === 'direct' || norm === 'hit' || norm === 'partial') {
+        const cellWord = cells === 1 ? 'CELL' : 'CELLS';
+        const impactText = cells > 0 ? `−${cells} ${cellWord}` : cooled > 0 ? `${cooled} COOLED` : 'WEAK MIST';
+        const main = `◐ MISTED (TOO HIGH — FLY LOWER)  ${impactText}  •  +${pts} PTS`;
+        this._showCenterBanner(
+          'is-partial',
+          main,
+          `Released at ${aglNote} — descend to 25–50m AGL for full knockdown`,
+          OUTCOME_DISPLAY_MS
+        );
+        this._triggerEdgeFlash('is-partial', 560);
+      } else {
+        this._showCenterBanner(
+          'is-miss',
+          '✕ MISTED (TOO HIGH — FLY LOWER)',
+          `Water evaporated at ${aglNote} — descend to 25–50m AGL before dropping`,
+          OUTCOME_DISPLAY_MS
+        );
+        this._triggerEdgeFlash('is-miss', 520);
+      }
+      return;
+    }
 
     if (norm === 'direct' || norm === 'hit') {
       const cellWord = cells === 1 ? 'FIRE CELL' : 'FIRE CELLS';
@@ -645,7 +973,7 @@ export class HudController {
           : '';
 
       let headline = `✕ DROP MISSED — OFF TARGET${loc}`;
-      let hint = 'Wait for green ON TARGET ground lock before dropping';
+      let hint = 'Wait for green ON TARGET ground lock at 25–50m AGL';
       if (missType === 'overshot' || missType === 'overshoot') {
         headline = `✕ DROP MISSED — OVERSHOT FIRE HEAD${loc}`;
         hint = 'Release a beat earlier on your next pass';
@@ -671,19 +999,38 @@ export class HudController {
   }
 
   /**
-   * Triggers brief red damage flash + tree strike caution toast when the plane takes hull damage.
+   * Triggers brief choppy scoop coaching hint when banking steeply on the water surface.
    */
-  showDamageFlash(damage = 30, hp = 70) {
+  showScoopRoughHint(durationMs = 1800) {
+    const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    this._roughScoopUntilMs = Math.max(this._roughScoopUntilMs, nowMs + durationMs);
+  }
+
+  /**
+   * Triggers brief red damage flash + caution toast when the plane takes hull damage
+   * from a tree strike (`kind = 'tree'`) or low-altitude thermal heat (`kind = 'heat'`).
+   */
+  showDamageFlash(damage = 30, hp = 70, kind = 'tree') {
     const safeHp = Math.max(0, Math.round(hp));
     const dmg = Math.max(0, Math.round(damage));
+    const k = String(kind || 'tree').toLowerCase();
     this._triggerEdgeFlash('is-damage', 680);
     if (safeHp > 0) {
-      this._showCenterBanner(
-        'is-damage',
-        `⚠ TREE STRIKE  −${dmg}% HULL  •  INTEGRITY ${safeHp}%`,
-        'Pull up — clear the alpine treetops!',
-        2000
-      );
+      if (k === 'heat' || k === 'thermal') {
+        this._showCenterBanner(
+          'is-damage',
+          `⚠ THERMAL HEAT  −${dmg}% HULL  •  INTEGRITY ${safeHp}%`,
+          'Pull up — climb above 25m AGL out of the fire core!',
+          1800
+        );
+      } else {
+        this._showCenterBanner(
+          'is-damage',
+          `⚠ TREE STRIKE  −${dmg}% HULL  •  INTEGRITY ${safeHp}%`,
+          'Pull up — clear the alpine treetops!',
+          2000
+        );
+      }
     }
   }
 
@@ -692,7 +1039,11 @@ export class HudController {
    */
   showCrashOverlay({ reason = 'terrain', crashTimer = 3.5, maxTimer = 3.5 } = {}) {
     const r = String(reason || 'terrain').toLowerCase();
-    const label = r.includes('tree') ? 'TREE STRIKE' : 'TERRAIN IMPACT';
+    const label = r.includes('heat') || r.includes('thermal')
+      ? 'THERMAL OVERLOAD'
+      : r.includes('tree')
+        ? 'TREE STRIKE'
+        : 'TERRAIN IMPACT';
     const rem = Math.max(0, Number.isFinite(crashTimer) ? crashTimer : 0);
     const pct = Math.max(0, Math.min(100, (1 - rem / Math.max(0.1, maxTimer)) * 100));
     this._crashTitleEl.textContent = `AIRFRAME LOST — ${label}`;
@@ -855,16 +1206,49 @@ export class HudController {
     remotePlanes,
     settings,
     dropPreview,
+    atmosphere,
   } = {}) {
     const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
-    // 1. Compact Top-Left Operation & Online / Offline Status Pill
+    // 0. Cockpit Smoke Haze & Thermal Heat Vignettes
+    const smokeDensity = clamp01(
+      (atmosphere && typeof atmosphere.smokeDensity === 'number' ? atmosphere.smokeDensity : null) ??
+        (aircraft && typeof aircraft.smokeDensity === 'number' ? aircraft.smokeDensity : 0)
+    );
+    const heatDanger = clamp01(
+      (atmosphere && typeof atmosphere.heatDanger === 'number' ? atmosphere.heatDanger : null) ??
+        (aircraft && typeof aircraft.heatDanger === 'number' ? aircraft.heatDanger : 0)
+    );
+    const turbulence = clamp01(
+      (atmosphere && typeof atmosphere.turbulence === 'number' ? atmosphere.turbulence : null) ??
+        (aircraft && typeof aircraft.turbulence === 'number' ? aircraft.turbulence : 0)
+    );
+
+    const targetSmokeOp = smokeDensity > 0.03 ? Math.min(0.78, Math.pow(smokeDensity, 0.85) * 0.78) : 0;
+    const nextSmokeOp = this._smokeVis + (targetSmokeOp - this._smokeVis) * 0.22;
+    if (Math.abs(nextSmokeOp - this._smokeVis) > 0.004 || (targetSmokeOp === 0 && this._smokeVis !== 0)) {
+      this._smokeVis = targetSmokeOp === 0 && nextSmokeOp < 0.01 ? 0 : nextSmokeOp;
+      this._smokeVignetteEl.style.opacity = this._smokeVis.toFixed(3);
+    }
+    this._smokeVignetteEl.classList.toggle('is-turbulent', turbulence > 0.25);
+
+    const targetHeatOp = heatDanger > 0.05 ? Math.min(0.92, Math.pow(heatDanger, 0.78) * 0.92) : 0;
+    const nextHeatOp = this._heatVis + (targetHeatOp - this._heatVis) * 0.26;
+    if (Math.abs(nextHeatOp - this._heatVis) > 0.004 || (targetHeatOp === 0 && this._heatVis !== 0)) {
+      this._heatVis = targetHeatOp === 0 && nextHeatOp < 0.01 ? 0 : nextHeatOp;
+      this._heatVignetteEl.style.opacity = this._heatVis.toFixed(3);
+    }
+    this._heatVignetteEl.classList.toggle('is-active', heatDanger > 0.2);
+
+    // 1. Compact Top-Left Operation & Solo / Host / Online / Offline Status Pill
     const status = (netState && netState.status) || 'live';
     const connStatus = resolveConnStatus(netState);
     const pilotsCount = Math.max(1, netState && typeof netState.pilotsCount === 'number' ? netState.pilotsCount : 1);
     const pilotsCap = (netState && netState.pilotsCap) || 100;
+    const isHost = connStatus === 'host' || (connStatus === 'online' && status === 'host');
 
     this._airspacePill.classList.remove(
+      'status-solo',
       'status-online',
       'status-host',
       'status-connecting',
@@ -873,14 +1257,18 @@ export class HudController {
     );
     this._airspacePill.setAttribute('data-conn-status', connStatus);
 
-    if (connStatus === 'online') {
+    if (connStatus === 'solo') {
+      this._airspacePill.classList.add('status-solo');
+      this._airspaceText.textContent = 'SOLO · LOCAL';
+      this._airspacePill.title = 'Solo Local Mission — Open Settings to host a live co-op lobby';
+    } else if (isHost) {
+      this._airspacePill.classList.add('status-host');
+      this._airspaceText.textContent = `HOST · ${pilotsCount}/${pilotsCap}`;
+      this._airspacePill.title = `Hosting Live Lobby — ${pilotsCount}/${pilotsCap} pilots`;
+    } else if (connStatus === 'online') {
       this._airspacePill.classList.add('status-online');
-      if (status === 'host') this._airspacePill.classList.add('status-host');
       this._airspaceText.textContent = `ONLINE · ${pilotsCount}/${pilotsCap}`;
-      this._airspacePill.title =
-        status === 'host'
-          ? `Online (Airspace Host) — ${pilotsCount}/${pilotsCap} pilots`
-          : `Online — Live Shared Airspace (${pilotsCount}/${pilotsCap} pilots)`;
+      this._airspacePill.title = `Online — Live Shared Airspace (${pilotsCount}/${pilotsCap} pilots)`;
     } else if (connStatus === 'connecting') {
       this._airspacePill.classList.add('status-connecting');
       this._airspaceText.textContent = 'CONNECTING';
@@ -888,11 +1276,11 @@ export class HudController {
     } else if (connStatus === 'offline_full') {
       this._airspacePill.classList.add('status-offline-full');
       this._airspaceText.textContent = 'OFFLINE · FULL';
-      this._airspacePill.title = 'Airspace Full (100/100) — Playing Offline Local Mission. Reload to retry live.';
+      this._airspacePill.title = 'Airspace Full (100/100) — Playing Offline Local Mission. Host a lobby or retry.';
     } else {
       this._airspacePill.classList.add('status-offline-error');
       this._airspaceText.textContent = 'OFFLINE · LOCAL';
-      this._airspacePill.title = 'Live Airspace Unavailable — Playing Offline Local Mission. Reload to retry live.';
+      this._airspacePill.title = 'Live Airspace Unavailable — Playing Offline Local Mission.';
     }
 
     // One-shot ~5s JIT Fallback Notice whenever dropping into offline local fallback
@@ -900,14 +1288,14 @@ export class HudController {
       if (connStatus === 'offline_full') {
         this._showCenterBanner(
           'is-offline-notice',
-          'AIRSPACE FULL (100/100) — PLAYING OFFLINE • RELOAD TO RETRY LIVE',
+          'AIRSPACE FULL (100/100) — PLAYING OFFLINE • OPEN SETTINGS TO HOST OR RETRY',
           '',
           5200
         );
       } else if (connStatus === 'offline_error') {
         this._showCenterBanner(
           'is-offline-notice',
-          'LIVE AIRSPACE UNAVAILABLE — PLAYING OFFLINE • RELOAD TO RETRY LIVE',
+          'LIVE AIRSPACE UNAVAILABLE — PLAYING OFFLINE • OPEN SETTINGS TO RETRY',
           '',
           5200
         );
@@ -1057,9 +1445,13 @@ export class HudController {
       const queueBanner = netState && netState.queueBanner ? netState.queueBanner : null;
       const idleCountdown = netState && netState.idleCountdown > 0 ? netState.idleCountdown : null;
       const onTarget = Boolean(dropPreview && (dropPreview.onTarget || (dropPreview.fireCellsInTarget > 0)));
+      const nearDist = dropPreview && Number.isFinite(dropPreview.nearFireDistM) ? dropPreview.nearFireDistM : Infinity;
+      const altZone = (dropPreview && dropPreview.altZone) || 'optimal';
+      const aglDisplay = Math.max(0, Math.round((dropPreview && Number.isFinite(dropPreview.releaseAgl) ? dropPreview.releaseAgl : aircraft.agl) || 0));
       const isTouch = this._isTouchUiActive();
+      const isRoughScoop = aircraft.scoopQuality === 'rough' || nowMs < this._roughScoopUntilMs;
 
-      if (aircraft.crashed) {
+      if (this._launchOpen || aircraft.crashed) {
         this._setJitHint(null, '');
       } else if (aircraft.outOfBounds) {
         this._setJitHint('is-warn', 'RETURNING TO BASIN AIRSPACE');
@@ -1073,12 +1465,25 @@ export class HudController {
           isTouch ? 'DEMO FLIGHT — Tap to take control' : 'DEMO FLIGHT — Press any key to take control',
           true
         );
+      } else if (heatDanger > 0.2 || (altZone === 'too_low' && (onTarget || nearDist < 95))) {
+        this._setJitHint('is-danger', '▲ PULL UP — THERMAL HEAT');
       } else if (aircraft.scooping) {
-        this._setJitHint('is-scoop', `≈ SCOOPING LAKE — TANK ${Math.round(tank)}%`);
+        if (isRoughScoop) {
+          this._setJitHint('is-warn', `〰 CHOPPY SCOOP (${Math.round(tank)}%) — LEVEL WINGS (< 16°)`);
+        } else {
+          this._setJitHint('is-scoop', `≈ SCOOPING LAKE — TANK ${Math.round(tank)}%`);
+        }
       } else if (tank <= 0.5) {
         this._setJitHint('is-empty', '▼ TANK EMPTY — Skim the lake (< 9m AGL) to scoop water');
-      } else if (onTarget && tank > 0.5) {
-        this._setJitHint('is-locked', isTouch ? '◉ ON TARGET — TAP DROP' : '◉ ON TARGET — PRESS SPACE');
+      } else if (tank > 0.5 && altZone === 'too_high' && (onTarget || nearDist < 135)) {
+        this._setJitHint('is-warn', `▼ TOO HIGH (${aglDisplay}m) — DESCEND TO 25–50m`);
+      } else if (tank > 0.5 && onTarget) {
+        this._setJitHint(
+          'is-locked',
+          isTouch
+            ? `◉ OPTIMAL DROP (${aglDisplay}m) — TAP DROP`
+            : `◉ OPTIMAL DROP (${aglDisplay}m) — SPACE`
+        );
       } else if (hullPct < 40) {
         this._setJitHint('is-danger', '⚠ HULL LOW — CLEAR TREETOPS');
       } else if (nowMs < this._manualHintUntilMs) {

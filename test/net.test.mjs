@@ -10,6 +10,7 @@ import { generateTerrain } from '../src/sim/TerrainGen.js';
 
 import { HostBroadcaster } from '../src/net/HostBroadcaster.js';
 import { Link, STALL_KICK_SEC } from '../src/net/Link.js';
+import { buildLobbyInviteUrl, listLiveLobbies, pickHostableShard } from '../src/net/LobbyDirectory.js';
 import { createLoopbackSession } from '../src/net/LoopbackBots.js';
 import { MockRtdbHub } from '../src/net/MockRtdbAdapter.js';
 import { PlaneInterpolator, shortestAngleDeltaDeg } from '../src/net/PlaneInterpolator.js';
@@ -1152,6 +1153,7 @@ test('Live MP wire codecs: dropOutcomes + opIndex round-trip strictly within RTD
       missDirCompass: '',
       missDistM: 0,
       cabinSaved: true,
+      dropQuality: 'optimal',
     },
     {
       slotId: 12,
@@ -1165,6 +1167,7 @@ test('Live MP wire codecs: dropOutcomes + opIndex round-trip strictly within RTD
       missDirCompass: 'NE',
       missDistM: 42,
       cabinSaved: false,
+      dropQuality: 'optimal',
     },
     {
       slotId: 33,
@@ -1178,6 +1181,7 @@ test('Live MP wire codecs: dropOutcomes + opIndex round-trip strictly within RTD
       missDirCompass: 'SW',
       missDistM: 118,
       cabinSaved: false,
+      dropQuality: 'optimal',
     },
   ];
 
@@ -1767,4 +1771,238 @@ test('#50: Laggy Host tracks publish stall wait and self-abdicates when writes s
   hub.simulateBlackHole('stall-host', false);
   await peerSess.stop();
   await hostSess.stop();
+});
+
+// ============================================================================
+// 10. #60 HOST & REPLICA WATER DROP EXTINGUISHMENT + LOBBY HOSTING/DISCOVERY
+// ============================================================================
+test('#60: Both Host AND remote Replica water drops extinguish fire cells and sync back to all clients', async () => {
+  const op0 = OPERATIONS[0];
+  const hostTerrain = generateTerrain(op0);
+  const repTerrain = generateTerrain(op0);
+  const hostSim = new FireSim(hostTerrain, { isMegaBasin: true });
+  const repSim = new FireSim(repTerrain, { isMegaBasin: true });
+
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const hostAdapter = hub.createClient('drop-host');
+  const repAdapter = hub.createClient('drop-rep');
+
+  const hostOutcomes = [];
+  const repOutcomes = [];
+
+  const hostSess = new WorldSession({
+    adapter: hostAdapter, terrain: hostTerrain, fireSim: hostSim, opConfig: op0,
+    worldId: WORLD_ID, buildHash: BUILD_HASH, callsign: 'DHOST', colorIdx: 0,
+    disableRealTimers: true,
+    onDropOutcomes: (list) => hostOutcomes.push(...list),
+  });
+  const repSess = new WorldSession({
+    adapter: repAdapter, terrain: repTerrain, fireSim: repSim, opConfig: op0,
+    worldId: WORLD_ID, buildHash: BUILD_HASH, callsign: 'DREP', colorIdx: 1,
+    disableRealTimers: true,
+    onDropOutcomes: (list) => repOutcomes.push(...list),
+  });
+
+  await hostSess.start();
+  const hClaim = await hostSess.requestManualControl();
+  assert.equal(hClaim.seated, true);
+  assert.equal(await hostSess.waitUntilHostReady(2000), true, 'Host must hydrate cleanly');
+
+  await repSess.start();
+  const rClaim = await repSess.requestManualControl();
+  assert.equal(rClaim.seated, true);
+  assert.notEqual(rClaim.slotId, hClaim.slotId);
+  await new Promise((r) => setTimeout(r, 15));
+
+  // Phase 1: Host drops water directly over active fire head at optimal 32 m AGL!
+  const head1 = hostSim.getSnapshot().fireHead;
+  assert.ok(head1, 'expected initial fire head');
+  const ground1 = Math.max(hostTerrain.waterLevel, hostTerrain.getHeight(head1.x, head1.z));
+  const burningBefore = hostSim.getSnapshot().burningCount;
+
+  // Position slightly south of fire head flying north so ballistic parcel lands dead-center on fireHead
+  const hostAircraft = {
+    x: head1.x,
+    y: ground1 + 32,
+    z: head1.z + 55,
+    yawDeg: 0,
+    pitchDeg: 0,
+    rollDeg: 0,
+    speedKmh: 158,
+    vx: 0,
+    vy: 0,
+    vz: -158 / 3.6,
+    tankPct: 100,
+    releasing: true,
+    scooping: false,
+    autopilot: false,
+    crashed: false,
+  };
+
+  for (let i = 0; i < 32; i++) {
+    hub.advanceTime(100);
+    // Keep plane advancing north along drop run for first 0.8 s, then stop releasing while parcels land
+    hostAircraft.z -= (158 / 3.6) * 0.1;
+    hostAircraft.releasing = i < 8;
+    if (hostAircraft.releasing) hostAircraft.tankPct = Math.max(0, hostAircraft.tankPct - 8);
+    hostSess.sendLocalState(hostAircraft, 1);
+    hostSess.step(0.1, hub.now());
+    repSess.step(0.1, hub.now());
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+  await new Promise((r) => setTimeout(r, 15));
+
+  const hostBurnAfterP1 = hostSim.getSnapshot().burningCount;
+  const repBurnAfterP1 = repSim.getSnapshot().burningCount;
+  assert.ok(
+    burningBefore - hostBurnAfterP1 >= 8,
+    `Host water drop must extinguish >= 8 cells (before=${burningBefore}, after=${hostBurnAfterP1})`
+  );
+  assert.ok(hostSim.missionScore > 0, `Host missionScore must increase (got ${hostSim.missionScore})`);
+  assert.ok(
+    Math.abs(repBurnAfterP1 - hostBurnAfterP1) <= 3,
+    `Replica must receive Host extinguishment via fireRing (host=${hostBurnAfterP1}, rep=${repBurnAfterP1})`
+  );
+  assert.ok(hostOutcomes.some((o) => o.slotId === hClaim.slotId && o.cellsExtinguished >= 5), 'Host dropOutcome emitted');
+  assert.ok(repOutcomes.some((o) => o.slotId === hClaim.slotId && o.cellsExtinguished >= 5), 'Replica received Host dropOutcome');
+
+  // Phase 2: Remote Replica drops water over active fire head via in/$uid -> HostBroadcaster -> FireSim -> fireRing!
+  const head2 = hostSim.getSnapshot().fireHead;
+  assert.ok(head2, 'expected remaining fire head for Replica pass');
+  const ground2 = Math.max(hostTerrain.waterLevel, hostTerrain.getHeight(head2.x, head2.z));
+  const burningMid = hostSim.getSnapshot().burningCount;
+  const scoreMid = hostSim.missionScore;
+
+  const repAircraft = {
+    x: head2.x,
+    y: ground2 + 32,
+    z: head2.z + 55,
+    yawDeg: 0,
+    pitchDeg: 0,
+    rollDeg: 0,
+    speedKmh: 158,
+    tankPct: 100,
+    releasing: true,
+    scooping: false,
+    autopilot: false,
+    crashed: false,
+  };
+
+  for (let i = 0; i < 36; i++) {
+    hub.advanceTime(100);
+    repAircraft.z -= (158 / 3.6) * 0.1;
+    repAircraft.releasing = i < 10;
+    repSess.sendLocalState(repAircraft, 1);
+    hostSess.step(0.1, hub.now());
+    repSess.step(0.1, hub.now());
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+  await new Promise((r) => setTimeout(r, 15));
+
+  const hostBurnAfterP2 = hostSim.getSnapshot().burningCount;
+  const repBurnAfterP2 = repSim.getSnapshot().burningCount;
+  assert.ok(
+    burningMid - hostBurnAfterP2 >= 5,
+    `Remote Replica water drop must extinguish >= 5 cells on Host (mid=${burningMid}, after=${hostBurnAfterP2})`
+  );
+  assert.ok(hostSim.missionScore > scoreMid, 'Remote Replica drop must award missionScore');
+  assert.ok(
+    Math.abs(repBurnAfterP2 - hostBurnAfterP2) <= 3,
+    `Remote Replica fire grid must sync its own extinguishment (host=${hostBurnAfterP2}, rep=${repBurnAfterP2})`
+  );
+  assert.ok(
+    repOutcomes.some((o) => o.slotId === rClaim.slotId && o.cellsExtinguished >= 5),
+    'Remote Replica must receive its own synced dropOutcome back via fireRing'
+  );
+
+  await repSess.stop();
+  await hostSess.stop();
+});
+
+test('#60: LobbyDirectory lists only live lobbies, picks unused/stale shard, and forceFreshMission resets stale shard', async () => {
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const now = hub.now();
+
+  // Seed active lobby megabasin-01, stale dead lobby megabasin-02, and staging megabasin-20
+  await bootstrapWorld(hub, 'active-host', 'megabasin-01');
+  hub._root.worldsIndex = {
+    'megabasin-01': {
+      name: 'Cinderpine Basin', mode: 'megabasin', players: 3, cap: 100,
+      buildHash: BUILD_HASH, protocolVersion: 1, updatedAt: now - 2000, expiresAt: now + WORLD_TTL_MS,
+    },
+    'megabasin-02': {
+      name: 'Ashen Caldera', mode: 'megabasin', players: 1, cap: 100,
+      buildHash: BUILD_HASH, protocolVersion: 1, updatedAt: now - 90000, expiresAt: now + WORLD_TTL_MS,
+    },
+    'megabasin-20': {
+      name: 'Staging', mode: 'megabasin', players: 1, cap: 100,
+      buildHash: BUILD_HASH, protocolVersion: 1, updatedAt: now - 1000, expiresAt: now + WORLD_TTL_MS,
+    },
+  };
+
+  // Seed stale megabasin-02 with expired authority & old dead fireKey (cabin 0 destroyed = 0 HP)
+  await bootstrapWorld(hub, 'old-host', 'megabasin-02');
+  hub._root.worlds['megabasin-02'].authority.leaseUntil = now - 10000;
+  hub._root.worlds['megabasin-02'].fireKey = {
+    e: 1,
+    q: 42,
+    t: now - 90000,
+    d: encodeFireKey({
+      gridSize: 128,
+      cells: new Uint8Array(128 * 128),
+      cabinHp: Uint8Array.from([0, 0, 100, 100, 100, 100, 100, 100, 100, 100]),
+      windDirDeg: 90, windSpeedKt: 12, wave: 1, opIndex: 2, missionScore: 9999,
+      status: 'active', intermissionTimer: 0, slotScores: new Map(),
+    }),
+  };
+
+  const client = hub.createClient('new-host');
+  const live = await listLiveLobbies(client);
+  assert.equal(live.length, 1, 'must list only fresh active non-staging lobbies');
+  assert.equal(live[0].worldId, 'megabasin-01');
+  assert.equal(live[0].players, 3);
+
+  const picked = await pickHostableShard(client);
+  assert.equal(picked.worldId, 'megabasin-03', 'must pick unused megabasin-03 without stealing active megabasin-01');
+  assert.equal(picked.isFresh, true);
+  assert.equal(
+    buildLobbyInviteUrl('megabasin-03', { origin: 'https://ember-front-rtdb.web.app', pathname: '/' }),
+    'https://ember-front-rtdb.web.app/?lobby=megabasin-03'
+  );
+
+  // Host a fresh mission on stale megabasin-02 -> must NOT resurrect dead opIndex=2 / cabinHp=0!
+  const op0 = OPERATIONS[0];
+  const terrain = generateTerrain(op0);
+  const freshSim = new FireSim(terrain, { isMegaBasin: true });
+  const freshHostSess = new WorldSession({
+    adapter: client, terrain, fireSim: freshSim, opConfig: op0,
+    worldId: 'megabasin-02', buildHash: BUILD_HASH, callsign: 'NEWHOST', colorIdx: 0,
+    forceFreshMission: true, disableRealTimers: true,
+  });
+  await freshHostSess.start();
+  await freshHostSess.requestManualControl();
+  assert.equal(await freshHostSess.waitUntilHostReady(2000), true, 'new Host must take over stale shard cleanly');
+  assert.equal(freshHostSess.opIndex, 0, 'forceFreshMission must stay on fresh Operation 01');
+  assert.equal(freshSim.cabinHp[0], 100, 'forceFreshMission must NOT resurrect old destroyed cabins');
+  const keyDecoded = decodeFireKey(hub.inspect('worlds/megabasin-02/fireKey/d'));
+  assert.equal(keyDecoded.opIndex, 0);
+  assert.equal(keyDecoded.cabinHp[0], 100);
+  assert.equal(hub.inspect('worldsIndex/megabasin-02/players'), 1);
+
+  await freshHostSess.stop();
+});
+
+test('#60: dropQuality (optimal / misted_high / low_risk) round-trips through fireRing wire codec', () => {
+  const outcomes = [
+    { slotId: 1, impactX: 10, impactZ: 20, cellsExtinguished: 18, cellsCooled: 4, pointsAwarded: 1260, outcome: 'direct', missType: 'none', missDirCompass: '', missDistM: 0, cabinSaved: false, dropQuality: 'optimal' },
+    { slotId: 2, impactX: 30, impactZ: -40, cellsExtinguished: 1, cellsCooled: 3, pointsAwarded: 70, outcome: 'partial', missType: 'none', missDirCompass: '', missDistM: 0, cabinSaved: false, dropQuality: 'misted_high' },
+    { slotId: 3, impactX: -50, impactZ: 60, cellsExtinguished: 7, cellsCooled: 2, pointsAwarded: 490, outcome: 'direct', missType: 'none', missDirCompass: '', missDistM: 0, cabinSaved: true, dropQuality: 'low_risk' },
+  ];
+  const wire = encodeFireDelta({ windDirDeg: 90, windSpeedKt: 12, dropOutcomes: outcomes, missionScore: 1820, wave: 1, opIndex: 0 });
+  const dec = decodeFireDelta(wire);
+  assert.equal(dec.dropOutcomes[0].dropQuality, 'optimal');
+  assert.equal(dec.dropOutcomes[1].dropQuality, 'misted_high');
+  assert.equal(dec.dropOutcomes[2].dropQuality, 'low_risk');
 });

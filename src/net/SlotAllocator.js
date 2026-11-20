@@ -76,6 +76,7 @@ export class SlotAllocator {
 
     this._lastRenewAt = 0;
     this._lastRosterAt = 0;
+    this._claimedAt = 0;
     this._lastActiveAt = this._nowFn();
     this._idleVacated = false;
     this._idleOfflined = false;
@@ -90,6 +91,11 @@ export class SlotAllocator {
 
   get isSeated() {
     return this.slotId !== null && this.hasSlot;
+  }
+
+  /** True within 5 s of claiming a slot (guards against stale RTDB onValue(slots) cache ticks). */
+  get recentlyClaimed() {
+    return this.isSeated && this._claimedAt > 0 && (this._nowFn() - this._claimedAt) < 5000;
   }
 
   setConnId(connId) {
@@ -195,6 +201,7 @@ export class SlotAllocator {
           this.hasRoster = true;
           this._lastRenewAt = existingSlot.at || now;
           this._lastRosterAt = existingSlot.at || now;
+          this._claimedAt = this._nowFn();
           this.callsign = sanitizeCallsign(callsign, defaultCallsign(existingSlotVal));
           this.markActive();
           return { seated: true, slotId: existingSlotVal, createdWorld: false, queued: false };
@@ -289,6 +296,7 @@ export class SlotAllocator {
           this.hasRoster = true;
           this._lastRenewAt = tNow;
           this._lastRosterAt = tNow;
+          this._claimedAt = this._nowFn();
           this.callsign = cleanName;
           this.markActive();
           return { seated: true, slotId: s, createdWorld: creatingWorld, queued: false };

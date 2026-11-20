@@ -11,10 +11,10 @@ const COL_RIDGE_HIGH = new THREE.Color('#78637f');
 const COL_PEAK_MID = new THREE.Color('#7f6585');
 const COL_PEAK_HIGH = new THREE.Color('#9c788e');
 
-const COL_CHARRED_GROUND = new THREE.Color('#211c1a');
+const COL_CHARRED_GROUND = new THREE.Color('#1f1a18');
 const COL_BURNING_GROUND = new THREE.Color('#78280e');
 const COL_BURNING_HOT = new THREE.Color('#bf4814');
-const COL_WET_TINT = new THREE.Color('#165a6e');
+const COL_WET_TINT = new THREE.Color('#0f6a82');
 
 // Bright neutral tint colors for textured cabins so cabin-wood.png keeps full weathered contrast
 const COL_CABIN_WALL_TEX = new THREE.Color('#f4ece2');
@@ -775,18 +775,20 @@ export class WorldMeshes {
 
   /**
    * Computes smoothly blended corner RGB color at vertex corner (vx, vz)
-   * by averaging the up to 4 neighboring cells around that vertex (eliminates blocky square cells).
+   * by averaging the up to 4 neighboring cells around that vertex (eliminates blocky square cells),
+   * weighting wet firebreaks higher so carved dark-teal trenches stay vividly legible next to flames.
    */
   _writeSmoothCellVertices(gx, gz) {
     const gs = this._gridSize;
     const curr = this._cellCurrentColors;
+    const states = this._cellStates;
     const colorArr = this._terrainColorAttr.array;
 
     const sampleCorner = (vx, vz, outOffset) => {
       let r = 0;
       let g = 0;
       let b = 0;
-      let count = 0;
+      let totalW = 0;
       for (let dz = -1; dz <= 0; dz++) {
         const cz = vz + dz;
         if (cz < 0 || cz >= gs) continue;
@@ -794,14 +796,16 @@ export class WorldMeshes {
         for (let dx = -1; dx <= 0; dx++) {
           const cx = vx + dx;
           if (cx < 0 || cx >= gs) continue;
-          const o = (rowOff + cx) * 3;
-          r += curr[o];
-          g += curr[o + 1];
-          b += curr[o + 2];
-          count++;
+          const cIdx = rowOff + cx;
+          const w = states[cIdx] === 13 ? 2.4 : 1.0;
+          const o = cIdx * 3;
+          r += curr[o] * w;
+          g += curr[o + 1] * w;
+          b += curr[o + 2] * w;
+          totalW += w;
         }
       }
-      const inv = count > 0 ? 1 / count : 1;
+      const inv = totalW > 0 ? 1 / totalW : 1;
       colorArr[outOffset] = r * inv;
       colorArr[outOffset + 1] = g * inv;
       colorArr[outOffset + 2] = b * inv;
@@ -890,10 +894,10 @@ export class WorldMeshes {
         g = bg + (heatG - bg) * t;
         b = bb + (heatB - bb) * t;
       } else if (st === 13) {
-        // Distinct dark wet teal firebreak trench clearly visible from the air
-        r = br * 0.34 + COL_WET_TINT.r * 0.66;
-        g = bg * 0.34 + COL_WET_TINT.g * 0.66;
-        b = bb * 0.34 + COL_WET_TINT.b * 0.66;
+        // Unmistakable soaked dark-teal wet firebreak trench visible from high altitude
+        r = br * 0.22 + COL_WET_TINT.r * 0.78;
+        g = bg * 0.22 + COL_WET_TINT.g * 0.78;
+        b = bb * 0.22 + COL_WET_TINT.b * 0.78;
       } else if (st === 15) {
         // Ember warning warm amber ground glow
         r = Math.min(1, br * 1.25 + 0.14);

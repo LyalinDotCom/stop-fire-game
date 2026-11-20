@@ -84,6 +84,9 @@ async function verifyAssets() {
     'operation_advance',
     'damage_hit',
     'crash_respawn',
+    'drop_too_high',
+    'turbulence_smoke',
+    'scoop_rough',
   ];
   for (const cat of requiredCategories) {
     if (!RADIO_CLIPS_BY_CATEGORY[cat] || RADIO_CLIPS_BY_CATEGORY[cat].length === 0) {
@@ -118,6 +121,19 @@ async function smokeTestRuntime() {
   engine.playTargetLockPip(false);
   engine.playTreeHit();
   engine.playCrash();
+  engine.playThermalWarningPip(0.8);
+  engine.playScoopRoughSlap();
+  engine.update({
+    dt: 1 / 60,
+    airspeedKmh: 165,
+    throttle: 0.7,
+    windSpeedKt: 16,
+    scooping: true,
+    scoopRough: true,
+    turbulence: 0.75,
+    smokeDensity: 0.8,
+    heatDanger: 0.6,
+  });
 
   const events = [];
   const radio = new RadioManager(engine);
@@ -137,6 +153,22 @@ async function smokeTestRuntime() {
   const crashClip = radio.trigger('plane_crash', { priority: 'high' });
   if (!crashClip || crashClip.category !== 'crash_respawn') {
     throw new Error('Expected plane_crash alias to map to crash_respawn');
+  }
+  const highDropClip = radio.trigger('misted_high');
+  if (!highDropClip || highDropClip.category !== 'drop_too_high') {
+    throw new Error('Expected misted_high alias to map to drop_too_high');
+  }
+  const turbClip = radio.trigger('turbulence_smoke');
+  if (!turbClip || turbClip.category !== 'turbulence_smoke') {
+    throw new Error('Expected turbulence_smoke clip to trigger');
+  }
+  const turbRepeat = radio.trigger('turbulence_smoke');
+  if (turbRepeat !== null) {
+    throw new Error('Expected immediate repeat of turbulence_smoke to be suppressed by cooldown');
+  }
+  const roughClip = radio.trigger('scoop_rough');
+  if (!roughClip || roughClip.category !== 'scoop_rough') {
+    throw new Error('Expected scoop_rough clip to trigger');
   }
 
   // Cooldown suppression check (normal priority immediate repeat of help_cabin)

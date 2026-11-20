@@ -11,7 +11,7 @@ import { PlaneInterpolator } from './PlaneInterpolator.js';
 import { Presence } from './Presence.js';
 import { SlotAllocator, computeEntrySpawnPose } from './SlotAllocator.js';
 import { StreamClient } from './StreamClient.js';
-import { MAX_SLOTS, defaultCallsign, getBuildHash, sanitizeCallsign } from './config.js';
+import { MAX_SLOTS, PACING_MS, defaultCallsign, getBuildHash, sanitizeCallsign } from './config.js';
 import { encodeInput } from './protocol.js';
 
 const INPUT_SEND_INTERVAL_MS = 250; // 4 Hz nominal (safely above 180 ms server pacing rule)
@@ -32,6 +32,7 @@ export class WorldSession {
     colorIdx = 0,
     mode = 'mp',
     fallbackOnFull = false,
+    forceFreshMission = false,
     connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS,
     onStatusChange = null,
     onScoreEvents = null,
@@ -63,6 +64,7 @@ export class WorldSession {
     this.colorIdx = Math.max(0, Math.min(15, Math.floor(colorIdx) || 0));
     this.mode = mode;
     this.fallbackOnFull = Boolean(fallbackOnFull);
+    this._forceFreshMission = Boolean(forceFreshMission);
     this.connectTimeoutMs = connectTimeoutMs;
 
     this.onStatusChange = onStatusChange;
@@ -100,7 +102,9 @@ export class WorldSession {
     this._inputSeqConnId = null;
     this._latestAircraft = null;
     this._latestDropSeq = 0;
+    this._lastSentDropSeq = 0;
     this._idleCountdown = null;
+    this._hostReadyResolvers = [];
 
     this.link = null;
     this.presence = null;
@@ -207,19 +211,19 @@ export class WorldSession {
       opIndex: this.opIndex,
       nowFn,
       onOperationChange: async (nextOpIndex, keyState) => {
-        if (!this.isHost) {
+        if (!this.isHost && !this._forceFreshMission) {
           this.opIndex = nextOpIndex;
           await this.onOperationChange?.(nextOpIndex, keyState);
         }
       },
       onFireKey: (keyState) => {
-        if (!this.isHost && this.fireSim && keyState.gridSize === this.fireSim.gridSize) {
+        if (!this.isHost && !this._forceFreshMission && this.fireSim && keyState.gridSize === this.fireSim.gridSize) {
           this.fireSim.applyExternalKey(keyState);
           this.onFireSync?.({ full: true, dirtyIndices: null });
         }
       },
       onFireDelta: (delta) => {
-        if (!this.isHost && this.fireSim) {
+        if (!this.isHost && !this._forceFreshMission && this.fireSim) {
           const dirty = this.fireSim.applyExternalDelta(delta);
           // Drain FireSim's replica drop outcome mirror so it doesn't accumulate;
           // drop outcomes are delivered once via StreamClient.onDropOutcomes below.
@@ -243,7 +247,8 @@ export class WorldSession {
       },
       onSlots: (slots) => {
         // Reconcile eviction: if Host evicted our slot, unseat locally instead of spamming in/$uid!
-        if (this.allocator.isSeated) {
+        // Ignore stale pre-claim snapshots arriving within 5 s of claim().
+        if (this.allocator.isSeated && !this.allocator.recentlyClaimed) {
           const mine = slots?.[String(this.allocator.slotId)];
           if (!mine || mine.uid !== this.adapter.uid) {
             this.allocator.markEvicted();
@@ -380,9 +385,49 @@ export class WorldSession {
       this.host.setLocalAircraft(this._latestAircraft, this._latestDropSeq);
     }
 
-    this.host.start({ isFailover }).then(() => {
+    const forceFresh = this._forceFreshMission;
+    this._forceFreshMission = false;
+
+    this.host.start({ isFailover, forceFreshMission: forceFresh }).then(() => {
       this._updateStatus();
-    }).catch(() => {});
+      const waiters = this._hostReadyResolvers.splice(0);
+      for (const resolve of waiters) resolve(true);
+    }).catch(() => {
+      const waiters = this._hostReadyResolvers.splice(0);
+      for (const resolve of waiters) resolve(false);
+    });
+  }
+
+  /** Wait until this client is active & hydrated as authoritative Host (used by HOST LOBBY). */
+  async waitUntilHostReady(timeoutMs = 5000) {
+    if (this.stopped) return false;
+    if (this.isHost && this.host?.hydrated) return true;
+    if (!this.election?.isHost && this.allocator?.isSeated) {
+      await this.election?.attemptTakeover().catch(() => false);
+    }
+    if (this.isHost && this.host?.hydrated) return true;
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (ok) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(ok);
+      };
+      const timer = setTimeout(() => done(Boolean(this.isHost && this.host?.hydrated)), timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+      this._hostReadyResolvers.push(done);
+    });
+  }
+
+  /** Keep latest local aircraft reference synced to HostBroadcaster even before seating finishes. */
+  setLocalAircraft(aircraft, dropSeq = 0) {
+    if (!aircraft) return;
+    this._latestAircraft = aircraft;
+    this._latestDropSeq = dropSeq;
+    if (this.host?.running) {
+      this.host.setLocalAircraft(aircraft, dropSeq);
+    }
   }
 
   _stopHost() {
@@ -525,7 +570,9 @@ export class WorldSession {
     if (this.isHost) return;
 
     const now = this.adapter.now();
-    if (now - this._lastInputSentAt < INPUT_SEND_INTERVAL_MS) return;
+    const urgentDrop = dropSeq !== this._lastSentDropSeq;
+    const minInterval = urgentDrop ? (PACING_MS.input + 15) : INPUT_SEND_INTERVAL_MS;
+    if (now - this._lastInputSentAt < minInterval) return;
 
     if (this._inputSeqConnId !== connId) {
       this._inputSeq = 0;
@@ -537,6 +584,7 @@ export class WorldSession {
       : aircraft;
     const d = encodeInput(wireState, dropSeq);
     this._lastInputSentAt = now;
+    this._lastSentDropSeq = dropSeq;
     const path = `worlds/${this.worldId}/in/${this.adapter.uid}`;
     if (!this._inputInFlightSince) this._inputInFlightSince = this._nowPerf();
 
@@ -602,9 +650,12 @@ export class WorldSession {
         });
     }
 
-    const pilotsCount = this.stream ? this.stream.getSeatedCount(this.adapter.now()) : (slotId !== null ? 1 : 0);
+    const pilotsCount = Math.max(
+      slotId !== null ? 1 : 0,
+      this.stream ? this.stream.getSeatedCount(this.adapter.now()) : 0
+    );
 
-    let connStatus = 'online';
+    let connStatus = this.isHost ? 'host' : 'online';
     if (this._offlineKind === 'offline_full') {
       connStatus = 'offline_full';
     } else if (this._offlineKind === 'offline_error' || this.offlineFallback) {
@@ -617,6 +668,8 @@ export class WorldSession {
       mode: this.mode,
       status: this._status,
       connStatus,
+      isHost: this.isHost,
+      worldId: this.worldId,
       offlineReason: this._offlineReason,
       opIndex: this.opIndex,
       pilotsCount,
