@@ -1,0 +1,273 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "worldsIndex": {
+      ".read": "(auth !== null && query.orderByChild === 'updatedAt' && query.limitToLast <= 20)",
+      ".indexOn": [
+        "updatedAt"
+      ],
+      "$w": {
+        ".write": "(auth !== null && $w.matches(/^megabasin-(0[1-9]|1[0-9]|20)$/) && newData.exists() && (auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && (!data.exists() || now - data.child('updatedAt').val() >= 5000))",
+        ".validate": "($w.matches(/^megabasin-(0[1-9]|1[0-9]|20)$/) && newData.hasChildren(['name', 'mode', 'players', 'cap', 'buildHash', 'protocolVersion', 'updatedAt', 'expiresAt']) && newData.child('updatedAt').val() === now)",
+        "name": {
+          ".validate": "(newData.isString() && newData.val().length >= 1 && newData.val().length <= 48)"
+        },
+        "mode": {
+          ".validate": "newData.val() === 'megabasin'"
+        },
+        "players": {
+          ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 0 && newData.val() <= 100)"
+        },
+        "cap": {
+          ".validate": "((newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 100) && newData.val() === root.child('worlds').child($w).child('config').child('cap').val())"
+        },
+        "buildHash": {
+          ".validate": "(newData.isString() && newData.val().matches(/^[0-9a-f]{12}$/) && newData.val() === root.child('worlds').child($w).child('config').child('buildHash').val())"
+        },
+        "protocolVersion": {
+          ".validate": "newData.val() === 1"
+        },
+        "updatedAt": {
+          ".validate": "newData.val() === now"
+        },
+        "expiresAt": {
+          ".validate": "(newData.isNumber() && newData.val() > now && newData.val() <= now + 86400000 && newData.val() === root.child('worlds').child($w).child('config').child('expiresAt').val())"
+        },
+        "$other": {
+          ".validate": false
+        }
+      }
+    },
+    "worlds": {
+      "$w": {
+        ".validate": "$w.matches(/^megabasin-(0[1-9]|1[0-9]|20)$/)",
+        "config": {
+          ".read": "auth !== null",
+          ".write": "(auth !== null && !data.exists() && newData.exists() && newData.parent().child('authority/uid').val() === auth.uid && newData.parent().child('authority/epoch').val() === 1)",
+          ".validate": "(newData.hasChildren(['mode', 'mapId', 'cap', 'protocolVersion', 'buildHash', 'createdAt', 'expiresAt']) && newData.child('createdAt').val() === now)",
+          "mode": {
+            ".validate": "newData.val() === 'megabasin'"
+          },
+          "mapId": {
+            ".validate": "(newData.isString() && newData.val().matches(/^[a-z0-9_-]{2,24}$/))"
+          },
+          "cap": {
+            ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 100)"
+          },
+          "protocolVersion": {
+            ".validate": "newData.val() === 1"
+          },
+          "buildHash": {
+            ".validate": "(newData.isString() && newData.val().matches(/^[0-9a-f]{12}$/))"
+          },
+          "createdAt": {
+            ".validate": "newData.val() === now"
+          },
+          "expiresAt": {
+            ".validate": "(newData.isNumber() && newData.val() > now && newData.val() <= now + 86400000)"
+          },
+          "$other": {
+            ".validate": false
+          }
+        },
+        "authority": {
+          ".read": "auth !== null",
+          ".write": "(auth !== null && newData.exists() && (newData.parent().child('uidToSlot').child(auth.uid).exists() && newData.parent().child('slots').child(newData.parent().child('uidToSlot').child(auth.uid).val() + '').child('uid').val() === auth.uid) && ((!data.exists() && newData.parent().child('config').exists() && newData.child('uid').val() === auth.uid && newData.child('epoch').val() === 1 && newData.child('rev').val() === 0 && (newData.child('leaseUntil').val() > now + 4000 && newData.child('leaseUntil').val() <= now + 10000)) || (data.exists() && newData.child('rev').val() === data.child('rev').val() + 1 && ((data.child('uid').val() === auth.uid && data.child('leaseUntil').val() > now && newData.child('uid').val() === auth.uid && newData.child('epoch').val() === data.child('epoch').val() && (newData.child('leaseUntil').val() > now + 4000 && newData.child('leaseUntil').val() <= now + 10000)) || (data.child('uid').val() === auth.uid && data.child('leaseUntil').val() > now && newData.child('uid').val() === auth.uid && newData.child('epoch').val() === data.child('epoch').val() && newData.child('leaseUntil').val() === now) || (data.child('leaseUntil').val() <= now && newData.child('uid').val() === auth.uid && newData.child('epoch').val() === data.child('epoch').val() + 1 && (newData.child('leaseUntil').val() > now + 4000 && newData.child('leaseUntil').val() <= now + 10000))))))",
+          ".validate": "newData.hasChildren(['uid', 'epoch', 'rev', 'leaseUntil'])",
+          "uid": {
+            ".validate": "(newData.isString() && newData.val().length >= 1 && newData.val().length <= 128)"
+          },
+          "epoch": {
+            ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 1000000000)"
+          },
+          "rev": {
+            ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 0 && newData.val() <= 1000000000)"
+          },
+          "leaseUntil": {
+            ".validate": "newData.isNumber()"
+          },
+          "$other": {
+            ".validate": false
+          }
+        },
+        "slots": {
+          ".read": "auth !== null",
+          "$slot": {
+            ".write": "(auth !== null && $slot.matches(/^([0-9]|[1-9][0-9])$/) && ((!newData.exists() && data.exists() && ((data.child('uid').val() === auth.uid && !newData.parent().parent().child('uidToSlot').child(auth.uid).exists()) || ((auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && (data.child('leaseUntil').val() <= now || (root.child('worlds').child($w).child('presence').child(data.child('uid').val()).child('away').val() === true && now - root.child('worlds').child($w).child('presence').child(data.child('uid').val()).child('at').val() >= 15000))))) || (newData.exists() && newData.child('uid').val() === auth.uid && newData.child('at').val() === now && (newData.child('leaseUntil').val() > now + 15000 && newData.child('leaseUntil').val() <= now + 45000) && newData.parent().parent().child('uidToSlot').child(auth.uid).val() + '' === $slot && (((!data.exists() || data.child('leaseUntil').val() <= now) && newData.parent().parent().child('config').exists() && newData.parent().parent().child('roster').child($slot).exists()) || (data.exists() && data.child('uid').val() === auth.uid && now - data.child('at').val() >= 10000)))))",
+            ".validate": "($slot.matches(/^([0-9]|[1-9][0-9])$/) && newData.hasChildren(['uid', 'conn', 'at', 'leaseUntil']) && newData.child('at').val() === now)",
+            "uid": {
+              ".validate": "(newData.isString() && newData.val() === auth.uid)"
+            },
+            "conn": {
+              ".validate": "(newData.isString() && newData.val().matches(/^[A-Za-z0-9]{12}$/))"
+            },
+            "at": {
+              ".validate": "newData.val() === now"
+            },
+            "leaseUntil": {
+              ".validate": "(newData.isNumber() && newData.val() > now + 15000 && newData.val() <= now + 45000)"
+            },
+            "$other": {
+              ".validate": false
+            }
+          }
+        },
+        "uidToSlot": {
+          "$uid": {
+            ".read": "(auth !== null && (auth.uid === $uid || auth.uid === root.child('worlds').child($w).child('authority').child('uid').val()))",
+            ".write": "(auth !== null && ((auth.uid === $uid && newData.exists() && (newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 0 && newData.val() <= 99) && (!data.exists() || data.val() === newData.val() || newData.parent().parent().child('slots').child(data.val() + '').child('uid').val() !== auth.uid) && newData.parent().parent().child('slots').child(newData.val() + '').child('uid').val() === auth.uid && newData.parent().parent().child('roster').child(newData.val() + '').exists()) || (!newData.exists() && data.exists() && ((auth.uid === $uid && !newData.parent().parent().child('slots').child(data.val() + '').exists()) || ((auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && (!newData.parent().parent().child('slots').child(data.val() + '').exists() || newData.parent().parent().child('slots').child(data.val() + '').child('uid').val() !== $uid))))))",
+            ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 0 && newData.val() <= 99)"
+          }
+        },
+        "roster": {
+          ".read": "auth !== null",
+          "$slot": {
+            ".write": "(auth !== null && $slot.matches(/^([0-9]|[1-9][0-9])$/) && ((!newData.exists() && data.exists() && ((root.child('worlds').child($w).child('slots').child($slot).child('uid').val() === auth.uid && !newData.parent().parent().child('slots').child($slot).exists()) || ((auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && !newData.parent().parent().child('slots').child($slot).exists()))) || (newData.exists() && newData.child('uid').val() === auth.uid && newData.child('at').val() === now && newData.parent().parent().child('slots').child($slot).child('uid').val() === auth.uid && (!data.exists() || now - data.child('at').val() >= 1000))))",
+            ".validate": "($slot.matches(/^([0-9]|[1-9][0-9])$/) && newData.hasChildren(['uid', 'name', 'color', 'at']) && newData.child('at').val() === now)",
+            "uid": {
+              ".validate": "(newData.isString() && newData.val() === auth.uid)"
+            },
+            "name": {
+              ".validate": "(newData.isString() && newData.val().matches(/^[A-Za-z0-9][A-Za-z0-9 _.'-]{0,15}$/))"
+            },
+            "color": {
+              ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 0 && newData.val() <= 15)"
+            },
+            "at": {
+              ".validate": "newData.val() === now"
+            },
+            "$other": {
+              ".validate": false
+            }
+          }
+        },
+        "presence": {
+          ".read": "(auth !== null && auth.uid === root.child('worlds').child($w).child('authority').child('uid').val())",
+          "$uid": {
+            ".read": "(auth !== null && auth.uid === $uid)",
+            ".write": "(auth !== null && ((!newData.exists() && data.exists() && (auth.uid === $uid || ((auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && !newData.parent().parent().child('uidToSlot').child($uid).exists() && (data.child('away').val() === true || now - data.child('at').val() >= 15000)))) || (auth.uid === $uid && newData.exists() && newData.child('at').val() === now && ((!newData.child('away').exists() && (!data.exists() || now - data.child('at').val() >= 1000 || (data.child('away').val() === true && now - data.child('at').val() >= 100))) || (newData.child('away').val() === true && data.exists() && data.child('conn').val() === newData.child('conn').val() && !data.child('away').exists())))))",
+            ".validate": "(newData.hasChildren(['conn', 'at']) && newData.child('at').val() === now)",
+            "conn": {
+              ".validate": "(newData.isString() && newData.val().matches(/^[A-Za-z0-9]{12}$/))"
+            },
+            "at": {
+              ".validate": "newData.val() === now"
+            },
+            "away": {
+              ".validate": "newData.val() === true"
+            },
+            "$other": {
+              ".validate": false
+            }
+          }
+        },
+        "in": {
+          ".read": "(auth !== null && auth.uid === root.child('worlds').child($w).child('authority').child('uid').val())",
+          "$uid": {
+            ".read": "(auth !== null && auth.uid === $uid)",
+            ".write": "(auth !== null && ((!newData.exists() && data.exists() && (auth.uid === $uid || ((auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && !newData.parent().parent().child('uidToSlot').child($uid).exists()))) || (auth.uid === $uid && newData.exists() && root.child('worlds').child($w).child('uidToSlot').child($uid).exists() && root.child('worlds').child($w).child('presence').child($uid).child('conn').val() === newData.child('c').val() && !root.child('worlds').child($w).child('presence').child($uid).child('away').exists() && newData.child('t').val() === now && (!data.exists() || (now - data.child('t').val() >= 180 && (newData.child('s').val() > data.child('s').val() || (newData.child('c').val() !== data.child('c').val() && newData.child('s').val() === 1)))))))",
+            ".validate": "(newData.hasChildren(['s', 't', 'c', 'd']) && newData.child('t').val() === now)",
+            "s": {
+              ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 1000000000)"
+            },
+            "t": {
+              ".validate": "newData.val() === now"
+            },
+            "c": {
+              ".validate": "(newData.isString() && newData.val().matches(/^[A-Za-z0-9]{12}$/))"
+            },
+            "d": {
+              ".validate": "(newData.isString() && newData.val().length >= 1 && newData.val().length <= 72)"
+            },
+            "$other": {
+              ".validate": false
+            }
+          }
+        },
+        "planes": {
+          ".read": "auth !== null",
+          ".write": "(auth !== null && newData.exists() && (auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && newData.child('e').val() === root.child('worlds').child($w).child('authority').child('epoch').val())",
+          ".validate": "(newData.hasChildren(['e', 'q', 't', 'p']) && newData.child('t').val() === now && (!data.exists() || newData.child('e').val() > data.child('e').val() || (newData.child('e').val() === data.child('e').val() && newData.child('q').val() > data.child('q').val())))",
+          "e": {
+            ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 1000000000)"
+          },
+          "q": {
+            ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 0 && newData.val() <= 1000000000)"
+          },
+          "t": {
+            ".validate": "newData.val() === now"
+          },
+          "p": {
+            ".validate": "(newData.isString() && newData.val().length <= 1650)"
+          },
+          "$other": {
+            ".validate": false
+          }
+        },
+        "fireRing": {
+          ".read": "auth !== null",
+          "$slot": {
+            ".write": "(auth !== null && newData.exists() && (auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && newData.child('e').val() === root.child('worlds').child($w).child('authority').child('epoch').val())",
+            ".validate": "($slot.matches(/^([0-9]|1[0-5])$/) && newData.hasChildren(['e', 'q', 't', 'd']) && newData.child('t').val() === now && newData.child('q').val() % 16 + '' === $slot)",
+            "e": {
+              ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 1000000000)"
+            },
+            "q": {
+              ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 1000000000)"
+            },
+            "t": {
+              ".validate": "newData.val() === now"
+            },
+            "d": {
+              ".validate": "(newData.isString() && newData.val().length >= 1 && newData.val().length <= 2048)"
+            },
+            "$other": {
+              ".validate": false
+            }
+          }
+        },
+        "fireKey": {
+          ".read": "auth !== null",
+          ".write": "(auth !== null && newData.exists() && (auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && newData.child('e').val() === root.child('worlds').child($w).child('authority').child('epoch').val() && (!data.exists() || now - data.child('t').val() >= 4000))",
+          ".validate": "(newData.hasChildren(['e', 'q', 't', 'd']) && newData.child('t').val() === now)",
+          "e": {
+            ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 1000000000)"
+          },
+          "q": {
+            ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 0 && newData.val() <= 1000000000)"
+          },
+          "t": {
+            ".validate": "newData.val() === now"
+          },
+          "d": {
+            ".validate": "(newData.isString() && newData.val().length >= 1 && newData.val().length <= 12288)"
+          },
+          "$other": {
+            ".validate": false
+          }
+        },
+        "meta": {
+          ".read": "auth !== null",
+          ".write": "(auth !== null && newData.exists() && (auth.uid === root.child('worlds').child($w).child('authority').child('uid').val() && root.child('worlds').child($w).child('authority').child('leaseUntil').val() > now) && newData.child('e').val() === root.child('worlds').child($w).child('authority').child('epoch').val() && (!data.exists() || now - data.child('t').val() >= 800))",
+          ".validate": "(newData.hasChildren(['e', 't', 'd']) && newData.child('t').val() === now)",
+          "e": {
+            ".validate": "(newData.isNumber() && newData.val() % 1 === 0 && newData.val() >= 1 && newData.val() <= 1000000000)"
+          },
+          "t": {
+            ".validate": "newData.val() === now"
+          },
+          "d": {
+            ".validate": "(newData.isString() && newData.val().length >= 1 && newData.val().length <= 1024)"
+          },
+          "$other": {
+            ".validate": false
+          }
+        },
+        "$other": {
+          ".validate": false
+        }
+      }
+    }
+  }
+}

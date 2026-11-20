@@ -1,0 +1,353 @@
+/**
+ * InputManager — Unified Keyboard, Gamepad API, and opt-in Mouse-Yoke input
+ * for EMBER FRONT — Aerial Fire Response Unit.
+ *
+ * Polarity matches docs/INTERFACES.md §3 & docs/gamespec.md §2:
+ *   pitch: -1 (nose down) .. +1 (nose up)  [default: W = -1, S = +1; flipped when invertPitch=true]
+ *   roll:  -1 (bank left) .. +1 (bank right) [A = -1, D = +1]
+ *   throttleDelta: -1 (Q / LT) .. +1 (E / RT)
+ *   drop: boolean (SPACE / A / RB / Mouse-Yoke LMB)
+ *   dropJustPressed: boolean (rising edge consumed each sample())
+ */
+
+const FLIGHT_CODES = new Set([
+  'KeyW',
+  'KeyA',
+  'KeyS',
+  'KeyD',
+  'KeyQ',
+  'KeyE',
+  'Space',
+  'ArrowUp',
+  'ArrowDown',
+  'ArrowLeft',
+  'ArrowRight',
+]);
+
+function isEditableTarget(target) {
+  if (!target || typeof target !== 'object') return false;
+  const tag = target.tagName ? target.tagName.toUpperCase() : '';
+  if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (target.isContentEditable) return true;
+  return false;
+}
+
+function applyDeadzone(val, dz = 0.15) {
+  const abs = Math.abs(val);
+  if (abs <= dz) return 0;
+  const scaled = (abs - dz) / (1 - dz);
+  return Math.sign(val) * Math.min(1, scaled);
+}
+
+export class InputManager {
+  /**
+   * @param {object} opts
+   * @param {HTMLElement} [opts.canvas]
+   * @param {boolean} [opts.invertPitch=false]
+   * @param {boolean} [opts.mouseYoke=false]
+   * @param {() => void} [opts.onFlightKey]
+   * @param {() => void} [opts.onFirstGesture]
+   * @param {() => void} [opts.onToggleMute]
+   * @param {() => void} [opts.onToggleDrawer]
+   * @param {() => void} [opts.onEscape]
+   */
+  constructor(opts = {}) {
+    this._canvas = opts.canvas || null;
+    this._invertPitch = Boolean(opts.invertPitch);
+    this._mouseYoke = Boolean(opts.mouseYoke);
+    this._drawerOpen = false;
+
+    this._onFlightKey = opts.onFlightKey || null;
+    this._onFirstGesture = opts.onFirstGesture || null;
+    this._onToggleMute = opts.onToggleMute || null;
+    this._onToggleDrawer = opts.onToggleDrawer || null;
+    this._onEscape = opts.onEscape || null;
+
+    this._keys = new Set();
+    this._dropJustPressedPending = false;
+    this._prevPadDrop = false;
+    this._mouseDown = false;
+    this._mouseNormX = 0;
+    this._mouseNormY = 0;
+    this._mouseInside = false;
+
+    this._gestureFired = false;
+    this._lastActivityMs = performance.now();
+
+    // Optional programmatic overrides for QA / touch helpers
+    this._overrideDrop = false;
+    this._overrideDropTimer = 0;
+
+    this._handleKeyDown = this._handleKeyDown.bind(this);
+    this._handleKeyUp = this._handleKeyUp.bind(this);
+    this._handleBlur = this._handleBlur.bind(this);
+    this._handlePointerDown = this._handlePointerDown.bind(this);
+    this._handlePointerUp = this._handlePointerUp.bind(this);
+    this._handlePointerMove = this._handlePointerMove.bind(this);
+    this._handlePointerLeave = this._handlePointerLeave.bind(this);
+
+    window.addEventListener('keydown', this._handleKeyDown, { passive: false });
+    window.addEventListener('keyup', this._handleKeyUp);
+    window.addEventListener('blur', this._handleBlur);
+    window.addEventListener('pointerdown', this._handlePointerDown, { passive: true });
+    window.addEventListener('pointerup', this._handlePointerUp, { passive: true });
+    window.addEventListener('pointermove', this._handlePointerMove, { passive: true });
+    document.addEventListener('pointerleave', this._handlePointerLeave);
+  }
+
+  setOptions({ invertPitch, mouseYoke, drawerOpen } = {}) {
+    if (typeof invertPitch === 'boolean') this._invertPitch = invertPitch;
+    if (typeof mouseYoke === 'boolean') {
+      this._mouseYoke = mouseYoke;
+      if (!mouseYoke) this._mouseDown = false;
+    }
+    if (typeof drawerOpen === 'boolean') {
+      this._drawerOpen = drawerOpen;
+      if (drawerOpen) {
+        this._keys.clear();
+        this._mouseDown = false;
+      }
+    }
+  }
+
+  getLastActivityMs() {
+    return this._lastActivityMs;
+  }
+
+  markActivity() {
+    this._lastActivityMs = performance.now();
+  }
+
+  /**
+   * Programmatic drop pulse for automated QA or accessibility buttons.
+   */
+  triggerDropPulse(durationMs = 800) {
+    this._overrideDrop = true;
+    this._overrideDropTimer = Math.max(this._overrideDropTimer, durationMs / 1000);
+    this._dropJustPressedPending = true;
+    this._lastActivityMs = performance.now();
+  }
+
+  _fireFirstGesture() {
+    if (!this._gestureFired) {
+      this._gestureFired = true;
+      if (this._onFirstGesture) this._onFirstGesture();
+    }
+  }
+
+  _handleKeyDown(e) {
+    // Always unlock audio on first user keydown
+    this._fireFirstGesture();
+
+    const editable = isEditableTarget(e.target) || isEditableTarget(document.activeElement);
+
+    if (e.code === 'Escape') {
+      if (editable && document.activeElement && typeof document.activeElement.blur === 'function') {
+        document.activeElement.blur();
+      }
+      if (this._onEscape) this._onEscape();
+      return;
+    }
+
+    // Ignore all flight keys & HUD hotkeys while typing in callsign <input> or other form fields
+    if (editable) return;
+
+    // Ignore modified shortcuts (Ctrl/Cmd/Alt) except Shift+? for drawer
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+    // Drawer toggle: H or ?
+    if (!e.repeat && (e.code === 'KeyH' || e.key === '?' || (e.code === 'Slash' && e.shiftKey))) {
+      e.preventDefault();
+      if (this._onToggleDrawer) this._onToggleDrawer();
+      return;
+    }
+
+    // Mute toggle: M
+    if (!e.repeat && e.code === 'KeyM') {
+      e.preventDefault();
+      if (this._onToggleMute) this._onToggleMute();
+      return;
+    }
+
+    // If settings drawer is open, ignore flight keys so user isn't flying blind
+    if (this._drawerOpen) return;
+
+    if (FLIGHT_CODES.has(e.code)) {
+      if (e.code === 'Space' || e.code.startsWith('Arrow')) {
+        e.preventDefault();
+      }
+      const wasDown = this._keys.has(e.code);
+      this._keys.add(e.code);
+      if (e.code === 'Space' && !wasDown) {
+        this._dropJustPressedPending = true;
+      }
+      this._lastActivityMs = performance.now();
+      if (this._onFlightKey) this._onFlightKey(e.code);
+    }
+  }
+
+  _handleKeyUp(e) {
+    this._keys.delete(e.code);
+  }
+
+  _handleBlur() {
+    this._keys.clear();
+    this._mouseDown = false;
+  }
+
+  _handlePointerDown(e) {
+    this._fireFirstGesture();
+    if (!this._mouseYoke || this._drawerOpen) return;
+    if (e.button !== 0) return;
+    // Only capture drop clicks directly on the game canvas (not HUD buttons)
+    if (this._canvas && e.target !== this._canvas) return;
+    if (!this._mouseDown) {
+      this._dropJustPressedPending = true;
+    }
+    this._mouseDown = true;
+    this._lastActivityMs = performance.now();
+    if (this._onFlightKey) this._onFlightKey('Mouse0');
+  }
+
+  _handlePointerUp(e) {
+    if (e.button === 0) {
+      this._mouseDown = false;
+    }
+  }
+
+  _handlePointerMove(e) {
+    if (!this._mouseYoke || this._drawerOpen) return;
+    const w = window.innerWidth || 1;
+    const h = window.innerHeight || 1;
+    this._mouseNormX = ((e.clientX / w) - 0.5) * 2;
+    this._mouseNormY = ((e.clientY / h) - 0.5) * 2;
+    this._mouseInside = true;
+  }
+
+  _handlePointerLeave() {
+    this._mouseInside = false;
+    this._mouseDown = false;
+  }
+
+  /**
+   * Sample combined keyboard + gamepad + optional mouse-yoke state for one physics step.
+   * @param {number} [dt=1/60]
+   * @returns {{ pitch: number, roll: number, throttleDelta: number, drop: boolean, dropJustPressed: boolean, anyManualInput: boolean }}
+   */
+  sample(dt = 1 / 60) {
+    let pitch = 0;
+    let roll = 0;
+    let throttleDelta = 0;
+    let drop = false;
+    let dropJustPressed = this._dropJustPressedPending;
+    this._dropJustPressedPending = false;
+
+    if (this._overrideDropTimer > 0) {
+      this._overrideDropTimer = Math.max(0, this._overrideDropTimer - dt);
+      if (this._overrideDropTimer === 0) this._overrideDrop = false;
+    }
+
+    if (!this._drawerOpen) {
+      // Keyboard pitch: W = nose down (-1), S = nose up (+1); flipped when invertPitch = true
+      const pitchUp = this._keys.has('KeyS') || this._keys.has('ArrowDown');
+      const pitchDown = this._keys.has('KeyW') || this._keys.has('ArrowUp');
+      let kbPitch = (pitchUp ? 1 : 0) - (pitchDown ? 1 : 0);
+      if (this._invertPitch) kbPitch = -kbPitch;
+      pitch += kbPitch;
+
+      // Keyboard roll: A = left (-1), D = right (+1)
+      const rollRight = this._keys.has('KeyD') || this._keys.has('ArrowRight');
+      const rollLeft = this._keys.has('KeyA') || this._keys.has('ArrowLeft');
+      roll += (rollRight ? 1 : 0) - (rollLeft ? 1 : 0);
+
+      // Keyboard throttle: Q = decrease (-1), E = increase (+1)
+      const throtUp = this._keys.has('KeyE');
+      const throtDown = this._keys.has('KeyQ');
+      throttleDelta += (throtUp ? 1 : 0) - (throtDown ? 1 : 0);
+
+      if (this._keys.has('Space')) drop = true;
+
+      // Optional Mouse-Yoke mode
+      if (this._mouseYoke && this._mouseInside) {
+        const mx = applyDeadzone(this._mouseNormX, 0.06);
+        let my = applyDeadzone(this._mouseNormY, 0.06);
+        if (this._invertPitch) my = -my;
+        if (Math.abs(mx) > Math.abs(roll)) roll = mx;
+        if (Math.abs(my) > Math.abs(pitch)) pitch = my;
+        if (this._mouseDown) drop = true;
+      }
+
+      // Gamepad API (standard mapping: left stick axes 0/1, LT btn 6, RT btn 7, A btn 0, RB btn 5)
+      if (typeof navigator !== 'undefined' && typeof navigator.getGamepads === 'function') {
+        const pads = navigator.getGamepads();
+        if (pads) {
+          for (let i = 0; i < pads.length; i++) {
+            const pad = pads[i];
+            if (!pad || !pad.connected) continue;
+            const gx = applyDeadzone(pad.axes[0] || 0, 0.15);
+            let gy = applyDeadzone(pad.axes[1] || 0, 0.15);
+            if (this._invertPitch) gy = -gy;
+
+            const lt = pad.buttons[6] ? pad.buttons[6].value : 0;
+            const rt = pad.buttons[7] ? pad.buttons[7].value : 0;
+            const gThrottle = (rt > 0.1 ? rt : 0) - (lt > 0.1 ? lt : 0);
+
+            const padDrop = Boolean(
+              (pad.buttons[0] && pad.buttons[0].pressed) ||
+              (pad.buttons[5] && pad.buttons[5].pressed)
+            );
+            if (padDrop && !this._prevPadDrop) {
+              dropJustPressed = true;
+            }
+            this._prevPadDrop = padDrop;
+
+            const padActive = Math.abs(gx) > 0 || Math.abs(gy) > 0 || Math.abs(gThrottle) > 0 || padDrop;
+            if (padActive) {
+              this._fireFirstGesture();
+              this._lastActivityMs = performance.now();
+              if (this._onFlightKey) this._onFlightKey('Gamepad');
+            }
+
+            if (Math.abs(gx) > Math.abs(roll)) roll = gx;
+            if (Math.abs(gy) > Math.abs(pitch)) pitch = gy;
+            if (Math.abs(gThrottle) > Math.abs(throttleDelta)) throttleDelta = gThrottle;
+            if (padDrop) drop = true;
+            break;
+          }
+        }
+      }
+    }
+
+    if (this._overrideDrop) drop = true;
+
+    pitch = Math.max(-1, Math.min(1, pitch));
+    roll = Math.max(-1, Math.min(1, roll));
+    throttleDelta = Math.max(-1, Math.min(1, throttleDelta));
+
+    const anyManualInput =
+      Math.abs(pitch) > 0.01 ||
+      Math.abs(roll) > 0.01 ||
+      Math.abs(throttleDelta) > 0.01 ||
+      drop;
+
+    return {
+      pitch,
+      roll,
+      throttleDelta,
+      drop,
+      dropJustPressed,
+      anyManualInput,
+    };
+  }
+
+  dispose() {
+    window.removeEventListener('keydown', this._handleKeyDown);
+    window.removeEventListener('keyup', this._handleKeyUp);
+    window.removeEventListener('blur', this._handleBlur);
+    window.removeEventListener('pointerdown', this._handlePointerDown);
+    window.removeEventListener('pointerup', this._handlePointerUp);
+    window.removeEventListener('pointermove', this._handlePointerMove);
+    document.removeEventListener('pointerleave', this._handlePointerLeave);
+    this._keys.clear();
+  }
+}

@@ -1,0 +1,1829 @@
+/* ==========================================================================
+   EMBER FRONT — Aerial Fire Response Unit
+   Native-Resolution Tactical Aviation HUD Stylesheet
+   ========================================================================== */
+
+:root {
+  --ef-bar-bg: #0f191f;
+  --ef-bar-border: rgba(197, 212, 186, 0.14);
+  --ef-card-bg: rgba(27, 29, 33, 0.85);
+  --ef-card-bg-strong: rgba(15, 25, 31, 0.94);
+  --ef-card-border: rgba(255, 255, 255, 0.11);
+  --ef-orange: #f37233;
+  --ef-orange-soft: #fb9564;
+  --ef-mint: #c5d4ba;
+  --ef-cyan: #5ce1e6;
+  --ef-cream: #f2ead8;
+  --ef-danger: #ff4d45;
+  --ef-amber: #ffb84d;
+  --ef-text: #eef3f5;
+  --ef-text-muted: #93a3ad;
+  --ef-text-dim: #657680;
+  --ef-font-sans: 'Inter', 'Segoe UI', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  --ef-font-mono: 'JetBrains Mono', 'SFMono-Regular', 'Roboto Mono', Menlo, Consolas, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: #0f191f;
+  color: var(--ef-text);
+  font-family: var(--ef-font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Layer 1: Upscaled 640x360 retro pixelated WebGL viewport */
+#game-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+  background: #1d1e2b;
+  z-index: 1;
+}
+
+/* Layer 2: Native-resolution HUD overlay */
+#hud-root {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  pointer-events: none;
+  user-select: none;
+  overflow: hidden;
+  font-variant-numeric: tabular-nums;
+}
+
+.ef-tabular {
+  font-family: var(--ef-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.ef-hidden {
+  display: none !important;
+}
+
+/* Shared translucent tactical card */
+.ef-card {
+  background: var(--ef-card-bg);
+  border: 1px solid var(--ef-card-border);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.36);
+}
+
+/* ==========================================================================
+   1. Top Header Bar (44px)
+   ========================================================================== */
+.ef-topbar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 44px;
+  background: var(--ef-bar-bg);
+  border-bottom: 1px solid var(--ef-bar-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  pointer-events: auto;
+  z-index: 40;
+}
+
+.ef-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ef-brand-badge {
+  width: 28px;
+  height: 28px;
+  background: var(--ef-orange);
+  clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.28);
+}
+
+.ef-brand-badge svg {
+  width: 18px;
+  height: 18px;
+  fill: #0f191f;
+}
+
+.ef-brand-title {
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  line-height: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.ef-brand-ember {
+  color: #f3f6f8;
+}
+
+.ef-brand-front {
+  color: var(--ef-orange);
+}
+
+.ef-brand-divider {
+  width: 1px;
+  height: 20px;
+  background: rgba(255, 255, 255, 0.16);
+  margin: 0 2px;
+}
+
+.ef-brand-unit {
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  line-height: 1.25;
+  color: var(--ef-text-muted);
+  text-transform: uppercase;
+  display: flex;
+  flex-direction: column;
+}
+
+.ef-topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ef-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.11em;
+  color: var(--ef-mint);
+  text-transform: uppercase;
+}
+
+.ef-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ef-mint);
+  box-shadow: 0 0 8px rgba(197, 212, 186, 0.7);
+  flex-shrink: 0;
+}
+
+.ef-status-pill.status-host {
+  color: var(--ef-orange-soft);
+  border-color: rgba(243, 114, 51, 0.45);
+}
+
+.ef-status-pill.status-host .ef-status-dot {
+  background: var(--ef-orange);
+  box-shadow: 0 0 8px rgba(243, 114, 51, 0.85);
+}
+
+.ef-status-pill.status-syncing {
+  color: var(--ef-amber);
+  border-color: rgba(255, 184, 77, 0.4);
+}
+
+.ef-status-pill.status-syncing .ef-status-dot {
+  background: var(--ef-amber);
+  animation: efPulseDot 1.1s ease-in-out infinite;
+}
+
+.ef-status-pill.status-offline {
+  color: var(--ef-text-muted);
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+.ef-status-pill.status-offline .ef-status-dot {
+  background: var(--ef-text-dim);
+  box-shadow: none;
+}
+
+.ef-pilots-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 9px;
+  background: rgba(92, 225, 230, 0.1);
+  border: 1px solid rgba(92, 225, 230, 0.35);
+  border-radius: 3px;
+  font-family: var(--ef-font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--ef-cyan);
+}
+
+.ef-top-btn {
+  appearance: none;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 3px;
+  color: var(--ef-text);
+  font-family: var(--ef-font-sans);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  height: 28px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.ef-top-btn:hover {
+  background: rgba(255, 255, 255, 0.11);
+  border-color: rgba(255, 255, 255, 0.28);
+}
+
+.ef-top-btn:focus-visible {
+  outline: 2px solid var(--ef-orange);
+  outline-offset: 1px;
+}
+
+.ef-top-btn.is-active {
+  border-color: rgba(243, 114, 51, 0.65);
+  color: var(--ef-orange-soft);
+  background: rgba(243, 114, 51, 0.14);
+}
+
+.ef-top-btn.is-muted {
+  color: var(--ef-text-muted);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+.ef-top-btn-icon {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+  flex-shrink: 0;
+}
+
+.ef-help-btn {
+  width: 28px;
+  padding: 0;
+  justify-content: center;
+  font-family: var(--ef-font-mono);
+  font-size: 13px;
+}
+
+/* ==========================================================================
+   2. Operation Briefing Card (top-left)
+   ========================================================================== */
+.ef-op-card {
+  position: absolute;
+  top: 56px;
+  left: 16px;
+  width: 262px;
+  padding: 11px 13px 10px 14px;
+  border-left: 3px solid var(--ef-orange);
+  border-radius: 2px;
+  z-index: 20;
+}
+
+.ef-op-kicker {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 4px;
+}
+
+.ef-op-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.ef-op-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--ef-orange);
+}
+
+.ef-op-code {
+  font-family: var(--ef-font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--ef-orange-soft);
+  text-transform: uppercase;
+}
+
+.ef-op-title {
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: #f6f8fa;
+  line-height: 1.2;
+}
+
+.ef-op-subtitle {
+  margin-top: 3px;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--ef-text-muted);
+}
+
+.ef-op-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.1);
+  margin: 8px 0 7px;
+}
+
+.ef-op-stats {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.ef-op-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.ef-op-stat-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--ef-text-dim);
+  text-transform: uppercase;
+}
+
+.ef-op-stat-val {
+  font-family: var(--ef-font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ef-cream);
+}
+
+.ef-op-stat-val.is-fire {
+  color: var(--ef-orange-soft);
+}
+
+.ef-op-stat-val.is-risk {
+  color: var(--ef-danger);
+  animation: efRiskPulse 0.9s ease-in-out infinite;
+}
+
+/* ==========================================================================
+   3. Top-Center Compass Ribbon
+   ========================================================================== */
+.ef-compass-wrap {
+  position: absolute;
+  top: 52px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 324px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  z-index: 20;
+}
+
+.ef-compass-window {
+  position: relative;
+  width: 320px;
+  height: 30px;
+  background: rgba(15, 25, 31, 0.78);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 2px;
+  overflow: hidden;
+  mask-image: linear-gradient(to right, transparent 0%, #000 14%, #000 86%, transparent 100%);
+  -webkit-mask-image: linear-gradient(to right, transparent 0%, #000 14%, #000 86%, transparent 100%);
+}
+
+.ef-compass-tape {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  will-change: transform;
+}
+
+.ef-compass-tick {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.ef-compass-tick-mark {
+  width: 1px;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.ef-compass-tick.is-major .ef-compass-tick-mark {
+  height: 9px;
+  background: rgba(255, 255, 255, 0.65);
+}
+
+.ef-compass-tick.is-cardinal .ef-compass-tick-mark {
+  height: 10px;
+  width: 1.5px;
+  background: var(--ef-orange-soft);
+}
+
+.ef-compass-tick-label {
+  margin-top: 2px;
+  font-family: var(--ef-font-mono);
+  font-size: 9.5px;
+  font-weight: 600;
+  color: var(--ef-text-muted);
+  letter-spacing: 0.04em;
+}
+
+.ef-compass-tick.is-cardinal .ef-compass-tick-label {
+  font-size: 10.5px;
+  font-weight: 800;
+  color: #f4f7f8;
+}
+
+.ef-compass-pointer {
+  position: absolute;
+  top: -1px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--ef-orange);
+  z-index: 3;
+}
+
+.ef-compass-readout {
+  margin-top: 3px;
+  padding: 1px 8px 2px;
+  background: var(--ef-bar-bg);
+  border: 1px solid rgba(243, 114, 51, 0.55);
+  border-radius: 2px;
+  font-family: var(--ef-font-mono);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #f6f8fa;
+  line-height: 1.25;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+}
+
+/* ==========================================================================
+   4. Top-Right Wind Vector Card
+   ========================================================================== */
+.ef-wind-card {
+  position: absolute;
+  top: 56px;
+  right: 16px;
+  padding: 9px 13px 9px 11px;
+  border-radius: 2px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 174px;
+  z-index: 20;
+}
+
+.ef-wind-dial {
+  position: relative;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: 1px solid rgba(92, 225, 230, 0.32);
+  background: rgba(15, 25, 31, 0.72);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.ef-wind-dial::after {
+  content: '';
+  position: absolute;
+  inset: 4px;
+  border-radius: 50%;
+  border: 1px dashed rgba(92, 225, 230, 0.18);
+}
+
+.ef-wind-arrow {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  will-change: transform;
+  transition: transform 0.08s linear;
+}
+
+.ef-wind-arrow svg {
+  width: 20px;
+  height: 20px;
+  fill: var(--ef-cyan);
+  filter: drop-shadow(0 0 4px rgba(92, 225, 230, 0.45));
+}
+
+.ef-wind-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ef-wind-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--ef-text-muted);
+  text-transform: uppercase;
+}
+
+.ef-wind-val {
+  font-family: var(--ef-font-mono);
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: var(--ef-cyan);
+  line-height: 1.15;
+}
+
+/* ==========================================================================
+   5. Bottom-Left Flight Telemetry Card
+   ========================================================================== */
+.ef-telemetry-card {
+  position: absolute;
+  bottom: 44px;
+  left: 16px;
+  width: 268px;
+  padding: 10px 13px 11px;
+  border-radius: 2px;
+  z-index: 20;
+}
+
+.ef-telem-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.ef-telem-title {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  color: var(--ef-text-muted);
+  text-transform: uppercase;
+}
+
+.ef-telem-badge {
+  font-family: var(--ef-font-mono);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.09em;
+  padding: 2px 7px;
+  border-radius: 2px;
+  background: rgba(248, 206, 100, 0.16);
+  border: 1px solid rgba(248, 206, 100, 0.45);
+  color: #f8ce64;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.ef-telem-badge.is-releasing {
+  background: rgba(216, 230, 230, 0.22);
+  border-color: #d8e6e6;
+  color: #ffffff;
+  animation: efBadgePulse 0.45s ease-in-out infinite;
+}
+
+.ef-telem-badge.is-scoop {
+  background: rgba(92, 225, 230, 0.22);
+  border-color: var(--ef-cyan);
+  color: var(--ef-cyan);
+  animation: efBadgePulse 0.55s ease-in-out infinite;
+}
+
+.ef-telem-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.ef-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.ef-metric-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--ef-text-dim);
+  text-transform: uppercase;
+}
+
+.ef-metric-readout {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.ef-metric-val {
+  font-family: var(--ef-font-mono);
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1;
+  color: #f5f8fa;
+}
+
+.ef-metric-val.is-warn {
+  color: var(--ef-amber);
+}
+
+.ef-metric-val.is-scoop {
+  color: var(--ef-cyan);
+}
+
+.ef-metric-unit {
+  font-family: var(--ef-font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--ef-text-muted);
+  letter-spacing: 0.05em;
+}
+
+.ef-tank-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+
+.ef-tank-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--ef-text-muted);
+  text-transform: uppercase;
+}
+
+.ef-tank-pct {
+  font-family: var(--ef-font-mono);
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--ef-cyan);
+}
+
+.ef-tank-bar {
+  display: grid;
+  grid-template-columns: repeat(20, 1fr);
+  gap: 2.5px;
+  height: 11px;
+}
+
+.ef-tank-seg {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 1px;
+  transition: background-color 0.08s linear, box-shadow 0.08s linear;
+}
+
+.ef-tank-seg.is-filled {
+  background: var(--ef-cyan);
+  box-shadow: 0 0 6px rgba(92, 225, 230, 0.35);
+}
+
+.ef-tank-bar.is-releasing .ef-tank-seg.is-filled {
+  background: #b6f5f8;
+}
+
+.ef-tank-bar.is-scoop .ef-tank-seg.is-filled {
+  background: #6cf0f5;
+  box-shadow: 0 0 8px rgba(92, 225, 230, 0.7);
+}
+
+/* ==========================================================================
+   6. Bottom-Center Demo Flight & Status Banner
+   ========================================================================== */
+.ef-center-stack {
+  position: absolute;
+  bottom: 46px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  z-index: 20;
+  max-width: 440px;
+}
+
+.ef-notice-pill {
+  padding: 5px 12px;
+  border-radius: 3px;
+  background: rgba(15, 25, 31, 0.9);
+  border: 1px solid rgba(255, 184, 77, 0.55);
+  color: var(--ef-amber);
+  font-family: var(--ef-font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  text-align: center;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+}
+
+.ef-notice-pill.is-boundary {
+  border-color: rgba(243, 114, 51, 0.75);
+  color: var(--ef-orange-soft);
+  animation: efRiskPulse 1s ease-in-out infinite;
+}
+
+.ef-demo-banner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+}
+
+.ef-demo-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 14px;
+  border-radius: 999px;
+  background: rgba(15, 25, 31, 0.88);
+  border: 1px solid rgba(243, 114, 51, 0.55);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.15em;
+  color: #f6f8fa;
+  text-transform: uppercase;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.ef-demo-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ef-orange);
+  box-shadow: 0 0 8px rgba(243, 114, 51, 0.85);
+  animation: efPulseDot 1.3s ease-in-out infinite;
+}
+
+.ef-demo-hint {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: rgba(238, 243, 245, 0.9);
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.85);
+}
+
+/* ==========================================================================
+   7. Bottom-Right Tactical Map (240x150 Canvas)
+   ========================================================================== */
+.ef-map-card {
+  position: absolute;
+  bottom: 44px;
+  right: 16px;
+  padding: 7px 8px 6px;
+  border-radius: 2px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.ef-map-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  color: var(--ef-text-muted);
+  text-transform: uppercase;
+}
+
+.ef-map-north {
+  font-family: var(--ef-font-mono);
+  color: var(--ef-mint);
+  font-weight: 800;
+  letter-spacing: 0.08em;
+}
+
+.ef-map-canvas {
+  display: block;
+  width: 240px;
+  height: 150px;
+  border: 1px solid rgba(197, 212, 186, 0.22);
+  background: #121c21;
+}
+
+.ef-map-legend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 2px;
+  font-family: var(--ef-font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: var(--ef-text-muted);
+}
+
+.ef-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.ef-legend-swatch {
+  width: 7px;
+  height: 7px;
+  display: inline-block;
+  border-radius: 1px;
+}
+
+.ef-legend-swatch.is-water {
+  background: #3a8da0;
+}
+
+.ef-legend-swatch.is-fire {
+  background: #ff6f00;
+}
+
+.ef-legend-swatch.is-cabin {
+  background: var(--ef-cream);
+}
+
+/* ==========================================================================
+   8. Bottom Strip (32px) & Floating Score Toasts
+   ========================================================================== */
+.ef-bottombar {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 32px;
+  background: var(--ef-bar-bg);
+  border-top: 1px solid var(--ef-bar-border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 14px;
+  z-index: 35;
+}
+
+.ef-controls-strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--ef-text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.ef-ctrl-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ef-key {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  font-family: var(--ef-font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  color: #eef3f5;
+  line-height: 1;
+}
+
+.ef-score-cluster {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.ef-score-block {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.ef-score-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  color: var(--ef-text-muted);
+  text-transform: uppercase;
+}
+
+.ef-score-value {
+  font-family: var(--ef-font-mono);
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  color: #f8ce64;
+}
+
+.ef-score-value.is-personal {
+  color: var(--ef-cyan);
+}
+
+.ef-score-divider {
+  width: 1px;
+  height: 14px;
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.ef-toast-anchor {
+  position: absolute;
+  right: 0;
+  bottom: 34px;
+  display: flex;
+  flex-direction: column-reverse;
+  align-items: flex-end;
+  gap: 4px;
+  pointer-events: none;
+  z-index: 38;
+}
+
+.ef-score-toast {
+  padding: 3px 8px;
+  border-radius: 2px;
+  background: rgba(15, 25, 31, 0.9);
+  border: 1px solid rgba(243, 114, 51, 0.6);
+  font-family: var(--ef-font-mono);
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: var(--ef-orange-soft);
+  white-space: nowrap;
+  animation: efToastRise 1.25s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.4);
+}
+
+.ef-score-toast.is-assist {
+  border-color: rgba(92, 225, 230, 0.65);
+  color: var(--ef-cyan);
+}
+
+.ef-score-toast.is-cabin {
+  border-color: rgba(197, 212, 186, 0.85);
+  color: #ffe28a;
+  background: rgba(24, 38, 32, 0.94);
+}
+
+/* ==========================================================================
+   9. 3D-Projected Floating World Callout Pins
+   ========================================================================== */
+.ef-callouts-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 12;
+  overflow: hidden;
+}
+
+.ef-callout {
+  position: absolute;
+  top: 0;
+  left: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  will-change: transform, opacity;
+  opacity: 0;
+  visibility: hidden;
+  transition: opacity 0.12s linear;
+}
+
+.ef-callout.is-visible {
+  opacity: 1;
+  visibility: visible;
+}
+
+.ef-callout-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 8px;
+  border-radius: 2px;
+  background: rgba(15, 25, 31, 0.86);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  font-family: var(--ef-font-mono);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  color: #f3f6f8;
+  white-space: nowrap;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
+}
+
+.ef-callout-stem {
+  width: 1px;
+  height: 18px;
+  background: rgba(255, 255, 255, 0.55);
+}
+
+.ef-callout-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ffffff;
+  box-shadow: 0 0 6px rgba(255, 255, 255, 0.75);
+}
+
+.ef-callout.is-scoop .ef-callout-tag {
+  border-color: rgba(92, 225, 230, 0.65);
+  color: var(--ef-cyan);
+}
+.ef-callout.is-scoop .ef-callout-stem,
+.ef-callout.is-scoop .ef-callout-dot {
+  background: var(--ef-cyan);
+}
+
+.ef-callout.is-fire .ef-callout-tag {
+  border-color: rgba(243, 114, 51, 0.72);
+  color: var(--ef-orange-soft);
+}
+.ef-callout.is-fire .ef-callout-stem,
+.ef-callout.is-fire .ef-callout-dot {
+  background: var(--ef-orange);
+}
+
+.ef-callout.is-settlement .ef-callout-tag {
+  border-color: rgba(242, 234, 216, 0.55);
+  color: var(--ef-cream);
+}
+.ef-callout.is-settlement .ef-callout-stem,
+.ef-callout.is-settlement .ef-callout-dot {
+  background: var(--ef-cream);
+}
+
+.ef-callout.is-risk .ef-callout-tag {
+  background: rgba(56, 16, 14, 0.92);
+  border-color: var(--ef-danger);
+  color: #ffd5cf;
+  animation: efRiskPulse 0.85s ease-in-out infinite;
+}
+.ef-callout.is-risk .ef-callout-stem,
+.ef-callout.is-risk .ef-callout-dot {
+  background: var(--ef-danger);
+  box-shadow: 0 0 8px rgba(255, 77, 69, 0.9);
+}
+
+/* ==========================================================================
+   10. Slide-Over [?] Settings, Operations & Squadron Drawer
+   ========================================================================== */
+.ef-drawer-backdrop {
+  position: absolute;
+  inset: 44px 0 0 0;
+  background: rgba(8, 12, 16, 0.52);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+  z-index: 45;
+}
+
+.ef-drawer-backdrop.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.ef-drawer {
+  position: absolute;
+  top: 44px;
+  right: 0;
+  bottom: 0;
+  width: 404px;
+  max-width: 94vw;
+  background: rgba(15, 25, 31, 0.96);
+  border-left: 1px solid rgba(197, 212, 186, 0.18);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: -12px 0 36px rgba(0, 0, 0, 0.55);
+  transform: translateX(100%);
+  transition: transform 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+  pointer-events: auto;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+}
+
+.ef-drawer.is-open {
+  transform: translateX(0);
+}
+
+.ef-drawer-head {
+  padding: 13px 16px 11px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.ef-drawer-title {
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.13em;
+  color: #f4f7f8;
+  text-transform: uppercase;
+}
+
+.ef-drawer-close {
+  appearance: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--ef-text);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.ef-drawer-close:hover {
+  background: rgba(243, 114, 51, 0.22);
+  border-color: var(--ef-orange);
+}
+
+.ef-drawer-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  background: rgba(0, 0, 0, 0.18);
+}
+
+.ef-drawer-tab {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--ef-text-muted);
+  font-family: var(--ef-font-sans);
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  padding: 10px 6px;
+  cursor: pointer;
+  transition: color 0.14s ease, border-color 0.14s ease, background 0.14s ease;
+}
+
+.ef-drawer-tab:hover {
+  color: #f4f7f8;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.ef-drawer-tab.is-active {
+  color: var(--ef-orange-soft);
+  border-bottom-color: var(--ef-orange);
+  background: rgba(243, 114, 51, 0.08);
+}
+
+.ef-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ef-drawer-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ef-section-heading {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.14em;
+  color: var(--ef-text-muted);
+  text-transform: uppercase;
+}
+
+.ef-mode-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+}
+
+.ef-mode-btn {
+  appearance: none;
+  text-align: left;
+  padding: 9px 11px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  color: var(--ef-text);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+
+.ef-mode-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+.ef-mode-btn.is-active {
+  background: rgba(243, 114, 51, 0.16);
+  border-color: var(--ef-orange);
+}
+
+.ef-mode-name {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: #f4f7f8;
+}
+
+.ef-mode-desc {
+  font-size: 10.5px;
+  color: var(--ef-text-muted);
+  margin-top: 2px;
+}
+
+.ef-mode-tag {
+  font-family: var(--ef-font-mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--ef-mint);
+  flex-shrink: 0;
+}
+
+.ef-mode-btn.is-active .ef-mode-tag {
+  background: var(--ef-orange);
+  color: #0f191f;
+}
+
+.ef-ops-list {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 5px;
+}
+
+.ef-op-btn {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  color: var(--ef-text);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ef-op-btn:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+.ef-op-btn.is-active {
+  border-color: var(--ef-orange);
+  background: rgba(243, 114, 51, 0.15);
+}
+
+.ef-op-btn-num {
+  font-family: var(--ef-font-mono);
+  font-size: 10.5px;
+  font-weight: 800;
+  color: var(--ef-orange-soft);
+  margin-right: 8px;
+}
+
+.ef-op-btn-meta {
+  font-family: var(--ef-font-mono);
+  font-size: 10px;
+  color: var(--ef-text-muted);
+}
+
+.ef-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ef-text-input {
+  flex: 1;
+  height: 34px;
+  padding: 0 10px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  background: rgba(0, 0, 0, 0.34);
+  color: #f6f8fa;
+  font-family: var(--ef-font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+.ef-text-input:focus {
+  outline: none;
+  border-color: var(--ef-cyan);
+  box-shadow: 0 0 0 2px rgba(92, 225, 230, 0.2);
+}
+
+.ef-input-hint {
+  font-size: 10px;
+  color: var(--ef-text-dim);
+}
+
+.ef-livery-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 6px;
+}
+
+.ef-swatch-btn {
+  appearance: none;
+  position: relative;
+  height: 28px;
+  border-radius: 3px;
+  border: 2px solid rgba(255, 255, 255, 0.14);
+  cursor: pointer;
+  padding: 0;
+  overflow: hidden;
+  transition: transform 0.1s ease, border-color 0.12s ease;
+}
+
+.ef-swatch-btn:hover {
+  transform: scale(1.06);
+  border-color: rgba(255, 255, 255, 0.55);
+}
+
+.ef-swatch-btn.is-active {
+  border-color: #ffffff;
+  box-shadow: 0 0 0 2px var(--ef-orange);
+}
+
+.ef-swatch-accent {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  width: 100%;
+  height: 36%;
+}
+
+.ef-livery-caption {
+  font-family: var(--ef-font-mono);
+  font-size: 10.5px;
+  color: var(--ef-text-muted);
+}
+
+.ef-toggle-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ef-toggle-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 7px 10px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--ef-text);
+}
+
+.ef-toggle-row input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--ef-orange);
+  cursor: pointer;
+}
+
+.ef-controls-table {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ef-control-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  font-size: 11.5px;
+}
+
+.ef-control-keys {
+  font-family: var(--ef-font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--ef-cyan);
+}
+
+.ef-tip-box {
+  padding: 10px 12px;
+  border-radius: 3px;
+  background: rgba(92, 225, 230, 0.07);
+  border: 1px solid rgba(92, 225, 230, 0.22);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ef-cream);
+}
+
+/* Squadron Top-10 Leaderboard */
+.ef-lb-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.ef-lb-row {
+  display: grid;
+  grid-template-columns: 28px 14px 1fr 48px 72px;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  font-size: 12px;
+}
+
+.ef-lb-row.is-local {
+  background: rgba(92, 225, 230, 0.12);
+  border-color: rgba(92, 225, 230, 0.45);
+}
+
+.ef-lb-rank {
+  font-family: var(--ef-font-mono);
+  font-weight: 800;
+  color: var(--ef-text-muted);
+}
+
+.ef-lb-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1px solid rgba(0, 0, 0, 0.5);
+}
+
+.ef-lb-name {
+  font-weight: 700;
+  color: #f4f7f8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ef-lb-slot {
+  font-family: var(--ef-font-mono);
+  font-size: 10px;
+  color: var(--ef-text-muted);
+  text-align: right;
+}
+
+.ef-lb-score {
+  font-family: var(--ef-font-mono);
+  font-weight: 800;
+  color: #f8ce64;
+  text-align: right;
+}
+
+.ef-lb-empty {
+  padding: 18px 12px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--ef-text-muted);
+  border: 1px dashed rgba(255, 255, 255, 0.14);
+  border-radius: 3px;
+}
+
+/* ==========================================================================
+   11. Victory / Defeat / Intermission / Offline Overlays
+   ========================================================================== */
+.ef-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(9, 15, 20, 0.72);
+  backdrop-filter: blur(5px);
+  -webkit-backdrop-filter: blur(5px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: auto;
+  z-index: 60;
+  padding: 20px;
+}
+
+.ef-overlay-card {
+  width: 460px;
+  max-width: 94vw;
+  background: var(--ef-card-bg-strong);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  border-top: 3px solid var(--ef-orange);
+  border-radius: 3px;
+  padding: 22px 24px 20px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.65);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.ef-overlay-card.is-victory {
+  border-top-color: var(--ef-mint);
+}
+
+.ef-overlay-card.is-defeat {
+  border-top-color: var(--ef-danger);
+}
+
+.ef-overlay-card.is-intermission {
+  border-top-color: var(--ef-cyan);
+}
+
+.ef-overlay-kicker {
+  font-family: var(--ef-font-mono);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.16em;
+  color: var(--ef-orange-soft);
+  text-transform: uppercase;
+}
+
+.ef-overlay-card.is-victory .ef-overlay-kicker {
+  color: var(--ef-mint);
+}
+
+.ef-overlay-card.is-defeat .ef-overlay-kicker {
+  color: var(--ef-danger);
+}
+
+.ef-overlay-card.is-intermission .ef-overlay-kicker {
+  color: var(--ef-cyan);
+}
+
+.ef-overlay-heading {
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  color: #f6f8fa;
+  margin: 0;
+}
+
+.ef-overlay-sub {
+  font-size: 13px;
+  color: var(--ef-text-muted);
+  margin: -6px 0 0;
+  line-height: 1.4;
+}
+
+.ef-stars-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 26px;
+  line-height: 1;
+}
+
+.ef-star {
+  color: rgba(255, 255, 255, 0.16);
+}
+
+.ef-star.is-earned {
+  color: #f8ce64;
+  text-shadow: 0 0 12px rgba(248, 206, 100, 0.55);
+}
+
+.ef-overlay-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  padding: 11px 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 3px;
+}
+
+.ef-overlay-stat-label {
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  color: var(--ef-text-dim);
+  text-transform: uppercase;
+}
+
+.ef-overlay-stat-val {
+  margin-top: 3px;
+  font-family: var(--ef-font-mono);
+  font-size: 16px;
+  font-weight: 800;
+  color: #f6f8fa;
+}
+
+.ef-overlay-contrib {
+  max-height: 196px;
+  overflow-y: auto;
+}
+
+.ef-overlay-actions {
+  display: flex;
+  gap: 10px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+
+.ef-btn-primary,
+.ef-btn-secondary {
+  appearance: none;
+  padding: 9px 16px;
+  border-radius: 3px;
+  font-family: var(--ef-font-sans);
+  font-size: 11.5px;
+  font-weight: 800;
+  letter-spacing: 0.11em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.14s ease, transform 0.1s ease;
+}
+
+.ef-btn-primary {
+  background: var(--ef-orange);
+  border: 1px solid var(--ef-orange-soft);
+  color: #0f191f;
+}
+
+.ef-btn-primary:hover {
+  background: var(--ef-orange-soft);
+}
+
+.ef-btn-secondary {
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  color: var(--ef-text);
+}
+
+.ef-btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.13);
+}
+
+/* ==========================================================================
+   Animations
+   ========================================================================== */
+@keyframes efPulseDot {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.85);
+  }
+}
+
+@keyframes efRiskPulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.58;
+  }
+}
+
+@keyframes efBadgePulse {
+  0%, 100% {
+    filter: brightness(1);
+  }
+  50% {
+    filter: brightness(1.22);
+  }
+}
+
+@keyframes efToastRise {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.95);
+  }
+  16% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+  75% {
+    opacity: 1;
+    transform: translateY(-16px) scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(-28px) scale(0.97);
+  }
+}
+
+/* ==========================================================================
+   Responsive Scaling (1280x720, 1920x1080, and compact screens)
+   ========================================================================== */
+@media (min-width: 1700px) {
+  .ef-op-card {
+    width: 290px;
+    top: 60px;
+    left: 22px;
+  }
+  .ef-wind-card {
+    top: 60px;
+    right: 22px;
+  }
+  .ef-telemetry-card {
+    width: 292px;
+    bottom: 48px;
+    left: 22px;
+  }
+  .ef-map-card {
+    bottom: 48px;
+    right: 22px;
+  }
+}
+
+@media (max-width: 960px) {
+  .ef-brand-unit,
+  .ef-brand-divider,
+  .ef-controls-strip {
+    display: none;
+  }
+  .ef-compass-wrap {
+    width: 240px;
+  }
+  .ef-compass-window {
+    width: 240px;
+  }
+  .ef-op-card {
+    width: 220px;
+    left: 10px;
+  }
+  .ef-telemetry-card {
+    width: 230px;
+    left: 10px;
+  }
+  .ef-map-card {
+    right: 10px;
+  }
+  .ef-map-canvas {
+    width: 192px;
+    height: 120px;
+  }
+}

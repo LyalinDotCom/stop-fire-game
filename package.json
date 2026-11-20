@@ -1,0 +1,25 @@
+{
+  "name": "ember-front",
+  "version": "0.1.0",
+  "private": true,
+  "description": "EMBER FRONT — Aerial Fire Response Unit. Stylized retro-3D arcade aerial firefighting with 100-player zero-login Firebase RTDB Mega-Basin multiplayer.",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 5180",
+    "build": "vite build",
+    "preview": "vite preview --port 4180",
+    "net:rules": "node tools/net/rules.mjs",
+    "net:rules:check": "node tools/net/rules.mjs --check",
+    "net:admin": "node tools/net/admin.mjs",
+    "test:sim": "node --test test/sim.test.mjs",
+    "test:net": "node --test test/net.test.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "firebase": "^11.6.0",
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "vite": "^6.4.5"
+  }
+}

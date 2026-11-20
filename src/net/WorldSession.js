@@ -1,0 +1,541 @@
+// Top-level multiplayer session orchestrator for EMBER FRONT (docs/INTERFACES.md §6).
+// Coordinates Link, Presence, SlotAllocator, AuthorityElection, HostBroadcaster,
+// StreamClient, and PlaneInterpolator with zero-write DEMO FLIGHT entry,
+// live database.rules.json compliance, seamless Host/Replica failover, and clean teardown.
+
+import { AuthorityElection } from './AuthorityElection.js';
+import { DEFAULT_WORLD_ID } from './firebaseConfig.js';
+import { HostBroadcaster } from './HostBroadcaster.js';
+import { Link } from './Link.js';
+import { PlaneInterpolator } from './PlaneInterpolator.js';
+import { Presence } from './Presence.js';
+import { SlotAllocator, computeEntrySpawnPose } from './SlotAllocator.js';
+import { StreamClient } from './StreamClient.js';
+import { MAX_SLOTS, defaultCallsign, getBuildHash, sanitizeCallsign } from './config.js';
+import { encodeInput } from './protocol.js';
+
+const INPUT_SEND_INTERVAL_MS = 250; // 4 Hz nominal (safely above 180 ms server pacing rule)
+
+export class WorldSession {
+  constructor({
+    adapter,
+    terrain,
+    fireSim,
+    opConfig = null,
+    worldId = DEFAULT_WORLD_ID,
+    buildHash = getBuildHash(),
+    callsign = 'EF-07',
+    colorIdx = 0,
+    mode = 'mp',
+    onStatusChange = null,
+    onScoreEvents = null,
+    onMetaUpdate = null,
+    onImpactEvents = null,
+    onFireSync = null,
+    onIdleVacate = null,
+    onIdleOffline = null,
+    onEvicted = null,
+    disableRealTimers = false,
+    electionBackoffRangeMs = null,
+  }) {
+    this.adapter = adapter;
+    this.terrain = terrain;
+    this.fireSim = fireSim;
+    this.opConfig = opConfig;
+    this.worldId = worldId;
+    this.buildHash = buildHash;
+    this.callsign = sanitizeCallsign(callsign, 'EF-07');
+    this.colorIdx = Math.max(0, Math.min(15, Math.floor(colorIdx) || 0));
+    this.mode = mode;
+
+    this.onStatusChange = onStatusChange;
+    this.onScoreEvents = onScoreEvents;
+    this.onMetaUpdate = onMetaUpdate;
+    this.onImpactEvents = onImpactEvents;
+    this.onFireSync = onFireSync;
+    this.onIdleVacate = onIdleVacate;
+    this.onIdleOffline = onIdleOffline;
+    this.onEvicted = onEvicted;
+
+    this._disableRealTimers = disableRealTimers;
+    this._electionBackoffRangeMs = electionBackoffRangeMs;
+
+    this.started = false;
+    this.stopped = false;
+    this.queued = false;
+    this.offlineFallback = false;
+    this._status = 'live';
+    this._lastInputSentAt = 0;
+    this._inputInFlightSince = 0;
+    this._inputSeq = 0;
+    this._inputSeqConnId = null;
+    this._latestAircraft = null;
+    this._latestDropSeq = 0;
+    this._idleCountdown = null;
+
+    this.link = null;
+    this.presence = null;
+    this.allocator = null;
+    this.election = null;
+    this.host = null;
+    this.stream = null;
+    this.interpolator = new PlaneInterpolator();
+    this._offLink = null;
+    this._offRenewBeat = null;
+  }
+
+  get isHost() {
+    return !!(this.election?.isHost && this.host?.running);
+  }
+
+  get localSlotId() {
+    return this.allocator?.slotId ?? null;
+  }
+
+  async start() {
+    if (this.started) return;
+    this.started = true;
+    this.stopped = false;
+
+    const nowFn = this._disableRealTimers ? () => this.adapter.now() : () => performance.now();
+
+    this.link = new Link(this.adapter, {
+      nowFn,
+      disableTicker: this._disableRealTimers,
+    });
+
+    this._offLink = this.link.on((up) => {
+      this._updateStatus();
+      if (!up && this.link.downFor() > 25) {
+        this.offlineFallback = true;
+      }
+    });
+
+    this.allocator = new SlotAllocator(this.adapter, this.worldId, {
+      nowFn: () => this.adapter.now(),
+      onIdleVacate: () => {
+        this.returnToDemoFlight().catch(() => {});
+        this.onIdleVacate?.();
+      },
+      onIdleOffline: () => {
+        this.offlineFallback = true;
+        this.link?.pause();
+        this.adapter.goOffline();
+        this._updateStatus();
+        this.onIdleOffline?.();
+      },
+      onEvicted: () => {
+        this._stopHost();
+        this._updateStatus();
+        this.onEvicted?.();
+      },
+    });
+
+    this.stream = new StreamClient(this.adapter, this.worldId, {
+      fireSim: null,
+      nowFn,
+      onFireKey: (keyState) => {
+        if (!this.isHost) {
+          this.fireSim?.applyExternalKey(keyState);
+          this.onFireSync?.({ full: true, dirtyIndices: null });
+        }
+      },
+      onFireDelta: (delta) => {
+        if (!this.isHost) {
+          const dirty = this.fireSim ? this.fireSim.applyExternalDelta(delta) : [];
+          this.onFireSync?.({ full: false, dirtyIndices: dirty });
+        }
+      },
+      onPlanes: (planes, info) => {
+        this.interpolator.pushSnapshot(planes, info.arrivedAtMs, this.localSlotId);
+      },
+      onMeta: (meta) => {
+        this.onMetaUpdate?.(meta);
+      },
+      onSlots: (slots) => {
+        // Reconcile eviction: if Host evicted our slot, unseat locally instead of spamming in/$uid!
+        if (this.allocator.isSeated) {
+          const mine = slots?.[String(this.allocator.slotId)];
+          if (!mine || mine.uid !== this.adapter.uid) {
+            this.allocator.markEvicted();
+            return;
+          }
+        }
+        if (this.queued && slots) {
+          const now = this.adapter.now();
+          let active = 0;
+          for (const s of Object.values(slots)) {
+            if (s && s.leaseUntil > now) active++;
+          }
+          if (active < MAX_SLOTS) {
+            this.requestManualControl().catch(() => {});
+          }
+        }
+      },
+      onScoreEvents: (events) => {
+        if (!this.isHost) this.onScoreEvents?.(events);
+      },
+    });
+
+    this.election = new AuthorityElection(this.adapter, this.worldId, {
+      link: this.link,
+      canBeHost: () => this.allocator.isSeated && !!this.presence?.connId && !this.presence.record?.away,
+      backoffRangeMs: this._electionBackoffRangeMs,
+      disablePageHooks: this._disableRealTimers,
+      onBecameHost: ({ epoch, isFailover }) => {
+        this._startHost(epoch, isFailover);
+      },
+      onLostHost: () => {
+        this._stopHost();
+      },
+      onAuthorityChange: () => {
+        this._updateStatus();
+      },
+    });
+
+    this.election.start();
+    await this.stream.start();
+
+    this._offRenewBeat = this.link.every(2000, () => {
+      if (this.allocator.isSeated) {
+        this.allocator.renewIfDue(false, this.presence?.connId).catch(() => {});
+      }
+      this.election.tick().catch(() => {});
+    });
+
+    this._updateStatus();
+  }
+
+  _startHost(epoch, isFailover) {
+    if (this.stopped) return;
+    if (this.host?.running) {
+      this.host.setEpoch(epoch);
+      this.host.setLocalSlotId(this.localSlotId);
+      return;
+    }
+
+    this.host = new HostBroadcaster(this.adapter, this.worldId, {
+      terrain: this.terrain,
+      fireSim: this.fireSim,
+      epoch,
+      buildHash: this.buildHash,
+      localSlotId: this.localSlotId,
+      enableBackgroundTicker: !this._disableRealTimers,
+      onScoreEvents: (events) => this.onScoreEvents?.(events),
+      onImpactEvents: (impacts) => this.onImpactEvents?.(impacts),
+      onSimStep: (stepDelta) => {
+        if (stepDelta.fullReset) {
+          this.onFireSync?.({ full: true, dirtyIndices: null });
+        } else if (stepDelta.changedCells?.length) {
+          this.onFireSync?.({
+            full: false,
+            dirtyIndices: stepDelta.changedCells.map((c) => c.idx),
+          });
+        }
+      },
+    });
+
+    if (this._latestAircraft) {
+      this.host.setLocalAircraft(this._latestAircraft, this._latestDropSeq);
+    }
+
+    this.host.start({ isFailover }).then(() => {
+      this._updateStatus();
+    }).catch(() => {});
+  }
+
+  _stopHost() {
+    if (this.host) {
+      this.host.stop();
+      this.host = null;
+    }
+    this._updateStatus();
+  }
+
+  async requestManualControl() {
+    if (this.stopped) return { seated: false, slotId: null, spawnPose: null, queued: false };
+    if (this.offlineFallback) {
+      this.offlineFallback = false;
+      this.link?.resume();
+      this.adapter.goOnline();
+    }
+
+    this.allocator.markActive();
+
+    if (this.allocator.isSeated) {
+      return {
+        seated: true,
+        slotId: this.allocator.slotId,
+        spawnPose: null,
+        queued: false,
+      };
+    }
+
+    // Step 1: Establish connId-fenced presence and await ack FIRST.
+    if (!this.presence || this.presence.stopped) {
+      this.presence = new Presence(this.adapter, this.worldId, this.link, {
+        autoStart: true,
+        nowFn: () => this.adapter.now(),
+        onConnChange: (connId) => {
+          this.allocator?.setConnId(connId);
+        },
+      });
+    }
+    const ackedConnId = await this.presence.ready;
+    if (!ackedConnId || this.stopped) {
+      return { seated: false, slotId: null, spawnPose: null, queued: false };
+    }
+
+    // Step 2: Claim O(1) slot atomically with acked connId (and config+authority if fresh world).
+    const res = await this.allocator.claim({
+      callsign: this.callsign,
+      colorIdx: this.colorIdx,
+      connId: ackedConnId,
+      buildHash: this.buildHash,
+    });
+
+    if (!res.seated) {
+      this.queued = !!res.queued;
+      this._updateStatus();
+      return { seated: false, slotId: null, spawnPose: null, queued: this.queued };
+    }
+
+    this.queued = false;
+    this.callsign = this.allocator.callsign;
+    const spawnPose = computeEntrySpawnPose(res.slotId, this.terrain);
+
+    if (res.createdWorld) {
+      this.election.notifyInitialHost({
+        uid: this.adapter.uid,
+        epoch: 1,
+        rev: 0,
+        leaseUntil: this.adapter.now() + 8000,
+      });
+    } else if (this.host?.running) {
+      this.host.setLocalSlotId(res.slotId);
+    } else {
+      await this.election.tick();
+    }
+
+    this._updateStatus();
+    return { seated: true, slotId: res.slotId, spawnPose, queued: false };
+  }
+
+  async returnToDemoFlight() {
+    this.queued = false;
+
+    if (this.election?.isHost) {
+      if (this.host?.running && this.host.hydrated) {
+        await this.host.publishFireRing().catch(() => {});
+      }
+      await this.election.abdicate();
+    }
+    this._stopHost();
+
+    if (this.allocator) {
+      await this.allocator.vacate();
+    }
+    if (this.presence) {
+      await this.presence.stop();
+      this.presence = null;
+    }
+
+    this._lastInputSentAt = 0;
+    this._inputSeq = 0;
+    this._inputSeqConnId = null;
+    this._idleCountdown = null;
+    this._updateStatus();
+  }
+
+  resumeLive() {
+    this.offlineFallback = false;
+    this.allocator?.markActive();
+    this.link?.resume();
+    this.adapter.goOnline();
+    this._updateStatus();
+  }
+
+  /** Send rate-limited 4 Hz local aircraft state to `in/$uid` while seated. */
+  sendLocalState(aircraft, dropSeq = 0) {
+    if (this.stopped || !aircraft) return;
+    this._latestAircraft = aircraft;
+    this._latestDropSeq = dropSeq;
+
+    if (!aircraft.autopilot) {
+      this.allocator?.markActive();
+    }
+
+    if (this.host?.running) {
+      this.host.setLocalAircraft(aircraft, dropSeq);
+    }
+
+    if (!this.allocator?.isSeated) return;
+    const connId = this.presence?.connId;
+    if (!connId || this.presence.record?.away) return;
+
+    // Host consumes its own aircraft directly; skip redundant in/$uid self-write while hosting.
+    if (this.isHost) return;
+
+    const now = this.adapter.now();
+    if (now - this._lastInputSentAt < INPUT_SEND_INTERVAL_MS) return;
+
+    if (this._inputSeqConnId !== connId) {
+      this._inputSeq = 0;
+      this._inputSeqConnId = connId;
+    }
+    const seq = ++this._inputSeq;
+    const d = encodeInput(aircraft, dropSeq);
+    this._lastInputSentAt = now;
+    const path = `worlds/${this.worldId}/in/${this.adapter.uid}`;
+    if (!this._inputInFlightSince) this._inputInFlightSince = this._nowPerf();
+
+    this.adapter.set(path, {
+      s: seq,
+      t: this.adapter.serverTimestamp(),
+      c: connId,
+      d,
+    }).then(() => {
+      this._inputInFlightSince = 0;
+      this.allocator?.markInputWritten();
+    }).catch(() => {
+      this._inputInFlightSince = 0;
+    });
+  }
+
+  async updateProfile(callsign, colorIdx) {
+    const clean = sanitizeCallsign(callsign, this.callsign || 'EF-07');
+    const safeColor = Math.max(0, Math.min(15, Math.floor(colorIdx) || 0));
+    this.callsign = clean;
+    this.colorIdx = safeColor;
+    if (this.allocator?.isSeated) {
+      await this.allocator.updateProfile(clean, safeColor);
+    }
+  }
+
+  _nowPerf() {
+    return this._disableRealTimers ? this.adapter.now() : performance.now();
+  }
+
+  _updateStatus() {
+    let next = 'live';
+    if (this.offlineFallback || !this.link?.up) {
+      next = 'offline';
+    } else if (this.isHost) {
+      next = 'host';
+    } else if (this.election?.syncing) {
+      next = 'syncing';
+    }
+    if (next !== this._status) {
+      this._status = next;
+      this.onStatusChange?.(next, this.getNetState());
+    }
+  }
+
+  getNetState() {
+    const slotId = this.localSlotId;
+    const slotScores = this.fireSim?.getSlotScores?.() || new Map();
+    const personalScore = slotId !== null ? (slotScores.get(slotId) || 0) : 0;
+
+    let top10 = this.stream?.meta?.top10 || [];
+    if (this.isHost || top10.length === 0) {
+      top10 = Array.from(slotScores.entries())
+        .filter(([, sc]) => sc > 0)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10)
+        .map(([sid, score]) => {
+          const info = this.stream?.getRosterInfo(sid) || {
+            callsign: defaultCallsign(sid),
+            colorIdx: sid % 16,
+          };
+          return { slotId: sid, name: info.callsign, score, colorIdx: info.colorIdx };
+        });
+    }
+
+    const pilotsCount = this.stream ? this.stream.getSeatedCount(this.adapter.now()) : (slotId !== null ? 1 : 0);
+
+    return {
+      mode: this.mode,
+      status: this._status,
+      pilotsCount,
+      pilotsCap: MAX_SLOTS,
+      localSlotId: slotId,
+      personalScore,
+      top10,
+      queueBanner: this.queued ? 'SQUADRON FULL · AUTO-QUEUED' : null,
+      idleCountdown: this._idleCountdown,
+      offlineFallback: this.offlineFallback,
+    };
+  }
+
+  step(dt, renderTimeMs = this._nowPerf()) {
+    if (this.stopped) {
+      return { remotePlanes: [], localAuthTank: null, isHost: false, netState: this.getNetState() };
+    }
+
+    const keyWait = this.stream?.waitingMs(renderTimeMs) || 0;
+    const inWait = this._inputInFlightSince ? Math.max(0, renderTimeMs - this._inputInFlightSince) : 0;
+    this.link?.step(Math.max(keyWait, inWait));
+
+    if (this.allocator) {
+      const idle = this.allocator.tickIdle();
+      this._idleCountdown = idle.idleCountdown;
+    }
+
+    if (this.host?.running) {
+      this.host.step(dt);
+    }
+
+    this.stream?.tick();
+
+    if (this._disableRealTimers) {
+      this.election?.tick().catch(() => {});
+      if (this.allocator?.isSeated) {
+        this.allocator.renewIfDue(false, this.presence?.connId).catch(() => {});
+      }
+    }
+
+    const remotePlanes = this.interpolator.sample(renderTimeMs, {
+      excludeSlotId: this.localSlotId,
+      getRosterInfo: (sid) => this.stream.getRosterInfo(sid),
+    });
+
+    const localAuthTank = this.isHost && this.localSlotId !== null
+      ? this.host.getPilotTank(this.localSlotId)
+      : this.interpolator.localAuthTank;
+
+    this._updateStatus();
+
+    return {
+      remotePlanes,
+      localAuthTank,
+      isHost: this.isHost,
+      netState: this.getNetState(),
+    };
+  }
+
+  async stop() {
+    if (this.stopped) return;
+    this.stopped = true;
+
+    this._offLink?.();
+    this._offRenewBeat?.();
+
+    if (this.election) {
+      if (this.election.isHost && this.host?.running && this.host.hydrated) {
+        await this.host.publishFireRing().catch(() => {});
+      }
+      await this.election.stop({ abdicateIfHost: true });
+    }
+    this._stopHost();
+    if (this.allocator) {
+      await this.allocator.vacate();
+    }
+    if (this.presence) {
+      await this.presence.stop();
+      this.presence = null;
+    }
+    this.stream?.stop();
+    this.link?.stop();
+    this.interpolator.clear();
+  }
+}
