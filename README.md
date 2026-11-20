@@ -1,14 +1,19 @@
-# EMBER FRONT — Aerial Fire Response Unit
+# EMBER FRONT — Aerial Fire Response Unit (`v0.4.0`)
 
-Stylized retro-3D arcade aerial firefighting game built with Three.js, Vite, procedural Web Audio synthesis, and zero-login 100-player Firebase Realtime Database (RTDB) multiplayer. Every 3D mesh, terrain heightmap, GLSL shader, HUD element, and sound effect is generated procedurally in code with zero external media assets.
+Stylized retro-3D arcade aerial firefighting game built with Three.js, Vite, Web Audio + VHF radio comms, and zero-login 100-player Firebase Realtime Database (RTDB) multiplayer.
 
 ## Play Online
 
-- **Solo Campaign (Operations 01–05):** https://ember-front-rtdb.web.app
-- **100-Player Shared Mega-Basin:** https://ember-front-rtdb.web.app/?mode=mp
-- **Offline 100-Plane Loopback Mode:** https://ember-front-rtdb.web.app/?loopback=100
+- **Launch & Live Lobbies (Solo / Host / Join):** https://ember-front-rtdb.web.app
+- **Direct Solo Mode (`0` Firebase sockets):** https://ember-front-rtdb.web.app/?mode=solo
+- **Direct Lobby Invite Link:** `https://ember-front-rtdb.web.app/?lobby=megabasin-01`
+- **Offline 100-Plane Loopback Stress Test:** https://ember-front-rtdb.web.app/?loopback=100
 
-Solo mode downloads zero Firebase bytes and opens zero network connections; multiplayer modules and Firebase SDK chunks are lazy-loaded only when entering Shared Mega-Basin or `?loopback=100`.
+Clicking **FLY SOLO** (or launching with `?mode=solo`) tears down Firebase connections so Solo gameplay holds zero network sockets. Clicking **HOST LOBBY** claims a fresh Operation 01 room with a 1-click invite link and up to 100 concurrent pilots.
+
+## Release Versioning
+
+Every production release bumps semantic `"version"` in `package.json` (injected at build time via `__APP_VERSION__` into the Launch Overlay badge, Settings Drawer footer, and `window.__EMBER_FRONT__.version`), deploys to Firebase Hosting (`ember-front-rtdb.web.app`), and pushes a matching annotated/lightweight `vX.Y.Z` tag on `main`.
 
 ## Controls
 

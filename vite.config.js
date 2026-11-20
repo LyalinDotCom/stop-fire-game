@@ -1,5 +1,8 @@
+import fs from 'node:fs';
 import { defineConfig } from 'vite';
 import { buildHash } from './tools/lib/buildHash.mjs';
+
+const pkg = JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 
 export default defineConfig({
   base: './',
@@ -10,6 +13,7 @@ export default defineConfig({
     port: 4180,
   },
   define: {
+    __APP_VERSION__: JSON.stringify(pkg.version),
     __BUILD_HASH__: JSON.stringify(buildHash(import.meta.dirname)),
   },
   build: {

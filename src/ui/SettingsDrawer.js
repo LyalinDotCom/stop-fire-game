@@ -62,6 +62,31 @@ function el(tag, className, text) {
   return node;
 }
 
+function resolveAppVersion(explicit) {
+  if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
+  // eslint-disable-next-line no-undef
+  if (typeof __APP_VERSION__ !== 'undefined' && __APP_VERSION__) {
+    // eslint-disable-next-line no-undef
+    return String(__APP_VERSION__).trim();
+  }
+  return 'dev';
+}
+
+function resolveBuildHash(explicit) {
+  if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
+  // eslint-disable-next-line no-undef
+  if (typeof __BUILD_HASH__ !== 'undefined' && __BUILD_HASH__) {
+    // eslint-disable-next-line no-undef
+    return String(__BUILD_HASH__).trim();
+  }
+  return 'local';
+}
+
+function formatVersionLabel(ver) {
+  if (!ver || ver === 'dev') return 'dev';
+  return /^v/i.test(ver) ? ver : `v${ver}`;
+}
+
 function resolveConnStatus(netState) {
   if (!netState) return 'connecting';
   if (
@@ -87,9 +112,11 @@ function resolveConnStatus(netState) {
 }
 
 export class SettingsDrawer {
-  constructor({ onSettingChange, onClose } = {}) {
+  constructor({ onSettingChange, onClose, appVersion, buildHash } = {}) {
     this._onSettingChange = onSettingChange;
     this._onClose = onClose;
+    this._appVersion = resolveAppVersion(appVersion);
+    this._buildHash = resolveBuildHash(buildHash);
 
     this._open = false;
     this._activeTab = 'audio';
@@ -150,6 +177,17 @@ export class SettingsDrawer {
     this._buildControlsTab(body);
     this._buildSquadronTab(body);
     this.drawerEl.appendChild(body);
+
+    // Compact release version footer (always visible below scrollable tabs)
+    const verLabel = formatVersionLabel(this._appVersion);
+    const shortHash = String(this._buildHash || 'local').slice(0, 12);
+    this._versionFooterEl = el(
+      'div',
+      'ef-drawer-footer',
+      `EMBER FRONT ${verLabel} · build ${shortHash}`
+    );
+    this._versionFooterEl.setAttribute('data-app-version', this._appVersion);
+    this.drawerEl.appendChild(this._versionFooterEl);
   }
 
   _selectTab(id) {

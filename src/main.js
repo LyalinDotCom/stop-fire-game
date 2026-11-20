@@ -168,6 +168,19 @@ function computeInitialSpawn(terrain, fireSnapshot, slotId = null, colorIdx = 0,
   });
 }
 
+function getAppVersion() {
+  try {
+    // eslint-disable-next-line no-undef
+    if (typeof __APP_VERSION__ === 'string' && __APP_VERSION__.length > 0) {
+      // eslint-disable-next-line no-undef
+      return __APP_VERSION__;
+    }
+  } catch {
+    // ignore
+  }
+  return 'dev';
+}
+
 function getBuildHash() {
   try {
     // eslint-disable-next-line no-undef
@@ -260,8 +273,10 @@ class EmberFrontApp {
     this._rafId = 0;
     this._disposed = false;
 
-    // HUD Orchestrator (with Solo / Host Lobby / Join Lobby callbacks)
+    // HUD Orchestrator (with Solo / Host Lobby / Join Lobby callbacks + release version)
     this.hud = new HudController({
+      appVersion: getAppVersion(),
+      buildHash: getBuildHash(),
       onToggleAudio: () => this._handleToggleAudio(),
       onOpenDrawer: (force) => this._handleToggleDrawer(force),
       onSettingChange: (key, value) => this._handleSettingChange(key, value),
@@ -1986,11 +2001,15 @@ class EmberFrontApp {
   _exposeDebugHook() {
     const app = this;
     const api = {
+      version: getAppVersion(),
+      buildHash: getBuildHash(),
       getState() {
         const stats = app.renderer ? app.renderer.getStats() : null;
         const snap = app.fireSim ? app.fireSim.getSnapshot() : null;
         const ac = app.aircraft;
         return {
+          version: getAppVersion(),
+          buildHash: getBuildHash(),
           fps: app._fps,
           drawCalls: stats ? stats.drawCalls : 0,
           triangles: stats ? stats.triangles : 0,

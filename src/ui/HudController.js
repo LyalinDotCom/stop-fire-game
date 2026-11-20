@@ -115,6 +115,31 @@ function clamp01(v) {
   return v <= 0 ? 0 : v >= 1 ? 1 : v;
 }
 
+function resolveAppVersion(explicit) {
+  if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
+  // eslint-disable-next-line no-undef
+  if (typeof __APP_VERSION__ !== 'undefined' && __APP_VERSION__) {
+    // eslint-disable-next-line no-undef
+    return String(__APP_VERSION__).trim();
+  }
+  return 'dev';
+}
+
+function resolveBuildHash(explicit) {
+  if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
+  // eslint-disable-next-line no-undef
+  if (typeof __BUILD_HASH__ !== 'undefined' && __BUILD_HASH__) {
+    // eslint-disable-next-line no-undef
+    return String(__BUILD_HASH__).trim();
+  }
+  return 'local';
+}
+
+function formatVersionLabel(ver) {
+  if (!ver || ver === 'dev') return 'dev';
+  return /^v/i.test(ver) ? ver : `v${ver}`;
+}
+
 function resolveRadioAccent(urgency, category) {
   const u = String(urgency || '').toLowerCase();
   const c = String(category || '').toLowerCase();
@@ -202,6 +227,8 @@ export class HudController {
     onJoinLobby,
     onRefreshLobbies,
     onCopyInviteLink,
+    appVersion,
+    buildHash,
   } = {}) {
     this._callbacks = {
       onToggleAudio,
@@ -216,6 +243,8 @@ export class HudController {
       onRefreshLobbies,
       onCopyInviteLink,
     };
+    this._appVersion = resolveAppVersion(appVersion);
+    this._buildHash = resolveBuildHash(buildHash);
 
     this._root =
       (typeof document !== 'undefined' && document.getElementById('hud-root')) ||
@@ -302,6 +331,8 @@ export class HudController {
 
     // 11. Slide-Over Settings, Audio Mixer, Controls & Live Squadron Drawer
     this._drawer = new SettingsDrawer({
+      appVersion: this._appVersion,
+      buildHash: this._buildHash,
       onSettingChange: (key, val) => {
         if (key === 'audioMuted') {
           this.setAudioMuted(Boolean(val));
@@ -611,7 +642,14 @@ export class HudController {
     const head = el('div', 'ef-launch-head');
     const brand = el('div', 'ef-launch-brand');
     brand.appendChild(el('div', 'ef-launch-kicker', 'AERIAL FIRE RESPONSE UNIT'));
-    brand.appendChild(el('h1', 'ef-launch-title', 'EMBER FRONT'));
+    const titleRow = el('div', 'ef-launch-title-row');
+    titleRow.appendChild(el('h1', 'ef-launch-title', 'EMBER FRONT'));
+    const verBadge = el('span', 'ef-launch-version', formatVersionLabel(this._appVersion));
+    verBadge.setAttribute('data-app-version', this._appVersion);
+    verBadge.title = `Release ${formatVersionLabel(this._appVersion)} (build ${String(this._buildHash).slice(0, 12)})`;
+    this._launchVersionEl = verBadge;
+    titleRow.appendChild(verBadge);
+    brand.appendChild(titleRow);
     brand.appendChild(
       el('div', 'ef-launch-sub', 'Skim lakes to scoop · Drop at 25–50 m AGL · Protect cabins')
     );
