@@ -79,8 +79,13 @@ function getSharedTreeTextures(onLoaded = null) {
           tex.magFilter = THREE.LinearFilter;
           tex.anisotropy = 4;
           tex.needsUpdate = true;
+          const oldFallback = _sharedTreeTextures.fallbackFoliage;
           _sharedTreeTextures.foliage = tex;
           for (const cb of _sharedTreeTextures.listeners) cb('foliage', tex);
+          if (oldFallback) {
+            _sharedTreeTextures.fallbackFoliage = null;
+            oldFallback.dispose();
+          }
         },
         undefined,
         () => {}
@@ -96,8 +101,13 @@ function getSharedTreeTextures(onLoaded = null) {
           tex.magFilter = THREE.LinearFilter;
           tex.anisotropy = 4;
           tex.needsUpdate = true;
+          const oldFallback = _sharedTreeTextures.fallbackBark;
           _sharedTreeTextures.bark = tex;
           for (const cb of _sharedTreeTextures.listeners) cb('bark', tex);
+          if (oldFallback) {
+            _sharedTreeTextures.fallbackBark = null;
+            oldFallback.dispose();
+          }
         },
         undefined,
         () => {}
@@ -107,10 +117,10 @@ function getSharedTreeTextures(onLoaded = null) {
 
   if (onLoaded) {
     _sharedTreeTextures.listeners.push(onLoaded);
-    if (_sharedTreeTextures.foliage !== _sharedTreeTextures.fallbackFoliage) {
+    if (_sharedTreeTextures.foliage && _sharedTreeTextures.foliage !== _sharedTreeTextures.fallbackFoliage) {
       onLoaded('foliage', _sharedTreeTextures.foliage);
     }
-    if (_sharedTreeTextures.bark !== _sharedTreeTextures.fallbackBark) {
+    if (_sharedTreeTextures.bark && _sharedTreeTextures.bark !== _sharedTreeTextures.fallbackBark) {
       onLoaded('bark', _sharedTreeTextures.bark);
     }
   }

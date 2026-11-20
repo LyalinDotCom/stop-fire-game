@@ -23,7 +23,10 @@ import {
 } from './RtdbAdapter.js';
 
 const MAP_ID_RE = /^[a-z0-9_-]{2,24}$/;
+const PUBLIC_WORLD_ID_RE = /^megabasin-(0[1-9]|1[0-8])$/;
+const MIN_EXPIRES_MS = 3_600_000;
 const MAX_EXPIRES_MS = 86_400_000;
+const MAX_Q_STEP = 64;
 
 const ALLOWED_KEYS = {
   worldsIndexEntry: new Set(['name', 'mode', 'players', 'cap', 'buildHash', 'protocolVersion', 'updatedAt', 'expiresAt']),
@@ -503,24 +506,41 @@ export class MockRtdbHub {
 
       case 'config': {
         if (isDelete) throw deny('config cannot be deleted');
-        if (oldVal !== null) throw deny('config is immutable once created');
-        if (newWorld?.authority?.uid !== uid || newWorld?.authority?.epoch !== 1) {
-          throw deny('config creation requires authority.uid === auth.uid and authority.epoch === 1');
+        if (oldVal === null) {
+          if (newWorld?.authority?.uid !== uid || newWorld?.authority?.epoch !== 1) {
+            throw deny('config creation requires authority.uid === auth.uid and authority.epoch === 1');
+          }
+        } else {
+          const canRefresh =
+            (oldVal.expiresAt ?? 0) <= now + MIN_EXPIRES_MS ||
+            (oldWorld?.authority?.leaseUntil ?? 0) <= now ||
+            (PUBLIC_WORLD_ID_RE.test(worldId) && oldVal.cap !== 100);
+          const hasAuth =
+            isLiveHost(oldWorld, uid, now) ||
+            (newWorld?.authority?.uid === uid && (newWorld?.authority?.leaseUntil ?? 0) > now);
+          if (!canRefresh || !hasAuth) {
+            throw deny('config is immutable while live and unexpired');
+          }
         }
         if (!hasOnlyAllowedKeys(newVal, ALLOWED_KEYS.config)) throw deny('config has disallowed $other keys');
         if (newVal.mode !== 'megabasin') throw deny('config.mode must be "megabasin"');
         if (typeof newVal.mapId !== 'string' || !MAP_ID_RE.test(newVal.mapId)) {
           throw deny('config.mapId invalid');
         }
-        if (!Number.isInteger(newVal.cap) || newVal.cap < 1 || newVal.cap > 100) {
+        if (PUBLIC_WORLD_ID_RE.test(worldId)) {
+          if (newVal.cap !== 100) throw deny('public shard config.cap must be 100');
+        } else if (!Number.isInteger(newVal.cap) || newVal.cap < 1 || newVal.cap > 100) {
           throw deny('config.cap must be int 1..100');
         }
         if (newVal.protocolVersion !== PROTOCOL_VERSION) throw deny('config.protocolVersion invalid');
         if (typeof newVal.buildHash !== 'string' || !BUILD_HASH_RE.test(newVal.buildHash)) {
           throw deny('config.buildHash invalid');
         }
-        if (typeof newVal.expiresAt !== 'number' || !(newVal.expiresAt > now && newVal.expiresAt <= now + MAX_EXPIRES_MS)) {
-          throw deny('config.expiresAt outside (now, now+86400000]');
+        if (
+          typeof newVal.expiresAt !== 'number' ||
+          !(newVal.expiresAt >= now + MIN_EXPIRES_MS && newVal.expiresAt <= now + MAX_EXPIRES_MS)
+        ) {
+          throw deny('config.expiresAt outside [now+3600000, now+86400000]');
         }
         this._requireParentServerTimestamp(entity, 'createdAt', sentinelPaths, newVal, now);
         return;
@@ -588,6 +608,9 @@ export class MockRtdbHub {
         const slotNum = Number(key);
         if (isDelete) {
           if (!oldVal) throw deny(`conditional delete failed: ${entityPath} does not exist`);
+          if (newWorld?.roster?.[key] != null) {
+            throw deny(`slot delete requires removing roster/${key} atomically`);
+          }
           const isSelf = oldVal.uid === uid && newWorld?.uidToSlot?.[uid] == null;
           const pres = oldWorld?.presence?.[oldVal.uid];
           const isHostEvict = isLiveHost(oldWorld, uid, now) && (
@@ -596,7 +619,7 @@ export class MockRtdbHub {
             (pres.away === true && now - pres.at >= 15000)
           );
           if (!isSelf && !isHostEvict) {
-            throw deny('only slot owner (clearing uidToSlot) or live host (for expired/away>=15s slot) can delete slot');
+            throw deny('only slot owner (clearing uidToSlot) or live host (for expired/missing/away>=15s slot) can delete slot');
           }
           return;
         }
@@ -605,6 +628,10 @@ export class MockRtdbHub {
         if (newVal.uid !== uid) throw deny('slots/$s.uid must match auth.uid');
         if (typeof newVal.conn !== 'string' || !CONN_ID_RE.test(newVal.conn)) {
           throw deny('slots/$s.conn must match /^[A-Za-z0-9]{12}$/');
+        }
+        const callerPres = oldWorld?.presence?.[uid];
+        if (!callerPres || callerPres.away === true || callerPres.conn !== newVal.conn) {
+          throw deny('slot write requires live non-away presence/$uid matching conn');
         }
         this._requireParentServerTimestamp(entity, 'at', sentinelPaths, newVal, now);
         if (!(newVal.leaseUntil > now + 15000 && newVal.leaseUntil <= now + 45000)) {
@@ -789,7 +816,17 @@ export class MockRtdbHub {
         if (newVal.e !== auth.epoch) throw deny(`planes epoch mismatch (${newVal.e} !== ${auth.epoch})`);
         if (!Number.isInteger(newVal.q) || newVal.q < 0 || newVal.q > 1e9) throw deny('planes.q invalid');
         this._requireParentServerTimestamp(entity, 't', sentinelPaths, newVal, now);
-        if (oldVal && !(newVal.e > oldVal.e || (newVal.e === oldVal.e && newVal.q > oldVal.q))) {
+        if (!oldVal) {
+          if (newVal.q > MAX_Q_STEP) throw deny(`initial planes.q exceeds max step ${MAX_Q_STEP}`);
+        } else if (newVal.e > oldVal.e) {
+          const validReset = newVal.q <= MAX_Q_STEP;
+          const validCont = newVal.q > oldVal.q && newVal.q <= oldVal.q + MAX_Q_STEP;
+          if (!validReset && !validCont) throw deny('planes.q jump exceeds max step on epoch bump');
+        } else if (newVal.e === oldVal.e) {
+          if (!(newVal.q > oldVal.q && newVal.q <= oldVal.q + MAX_Q_STEP)) {
+            throw deny('planes.q must advance within +64');
+          }
+        } else {
           throw deny('planes (e, q) must strictly advance');
         }
         if (typeof newVal.p !== 'string' || newVal.p.length > PAYLOAD_CAPS.planes) {
@@ -810,7 +847,22 @@ export class MockRtdbHub {
         if (String(newVal.q % 16) !== key) {
           throw deny(`fireRing slot mismatch: q (${newVal.q}) % 16 !== ${key}`);
         }
-        if (oldVal && !(newVal.e > oldVal.e || newVal.q > oldVal.q)) {
+        const keyQ = oldWorld?.fireKey?.q;
+        if (!oldVal) {
+          const validInit = newVal.q <= MAX_Q_STEP || (typeof keyQ === 'number' && newVal.q <= keyQ + MAX_Q_STEP);
+          if (!validInit) throw deny(`initial fireRing.q exceeds max step ${MAX_Q_STEP}`);
+        } else if (newVal.e > oldVal.e) {
+          const validReset = newVal.q <= MAX_Q_STEP;
+          const validCont = newVal.q > oldVal.q && newVal.q <= oldVal.q + MAX_Q_STEP;
+          const validFromKey = typeof keyQ === 'number' && newVal.q <= keyQ + MAX_Q_STEP;
+          if (!validReset && !validCont && !validFromKey) {
+            throw deny('fireRing.q jump exceeds max step on epoch bump');
+          }
+        } else if (newVal.e === oldVal.e) {
+          if (!(newVal.q > oldVal.q && newVal.q <= oldVal.q + MAX_Q_STEP)) {
+            throw deny('fireRing.q must advance within +64');
+          }
+        } else {
           throw deny('fireRing (e, q) must strictly advance');
         }
         if (typeof newVal.d !== 'string' || newVal.d.length < 1 || newVal.d.length > PAYLOAD_CAPS.fireRing) {

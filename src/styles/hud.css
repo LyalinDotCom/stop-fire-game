@@ -2010,7 +2010,7 @@ body {
     rgba(4, 9, 15, 0.66) 100%
   );
   pointer-events: auto;
-  z-index: 29;
+  z-index: 35;
 }
 
 .ef-launch-card {

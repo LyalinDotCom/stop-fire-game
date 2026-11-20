@@ -116,6 +116,7 @@ export class RadioManager {
     this._queue = [];
     this._active = null; // { clip, priority, token, timerId }
     this._playToken = 0;
+    this._drainTimer = null;
 
     this._lastCategoryMs = new Map();
     this._recentIdsByCategory = new Map();
@@ -210,6 +211,34 @@ export class RadioManager {
     return chosen;
   }
 
+  _cancelDrainTimer() {
+    if (this._drainTimer !== null) {
+      clearTimeout(this._drainTimer);
+      this._drainTimer = null;
+    }
+  }
+
+  _pruneStaleQueue(now = Date.now()) {
+    if (this._queue.length === 0) return;
+    this._queue = this._queue.filter((q) => now - q.queuedAt <= 12000);
+  }
+
+  _enqueue(entry) {
+    this._pruneStaleQueue(entry.queuedAt);
+    const category = entry.clip.category;
+    const existingIdx = this._queue.findIndex((q) => q.clip.category === category);
+    if (existingIdx >= 0) {
+      this._queue[existingIdx] = entry;
+    } else {
+      this._queue.push(entry);
+    }
+    // Keep queue sorted highest priority first, bounded to MAX_QUEUE_LENGTH
+    this._queue.sort((a, b) => b.priority - a.priority || a.queuedAt - b.queuedAt);
+    if (this._queue.length > MAX_QUEUE_LENGTH) {
+      this._queue.length = MAX_QUEUE_LENGTH;
+    }
+  }
+
   /**
    * Trigger a VHF radio transmission from a category.
    * @param {string} rawCategory
@@ -247,6 +276,7 @@ export class RadioManager {
         (priority >= 4 && this._active.priority < 4);
 
       if (shouldPreempt) {
+        this._cancelDrainTimer();
         this._abortActive();
         this._startTransmission(entry);
         return clip;
@@ -255,21 +285,23 @@ export class RadioManager {
       // Avoid queuing ambient chatter behind active comms
       if (priority === 0) return null;
 
-      // Replace duplicate category already sitting in queue with fresher callout
-      const existingIdx = this._queue.findIndex((q) => q.clip.category === category);
-      if (existingIdx >= 0) {
-        this._queue[existingIdx] = entry;
-      } else {
-        this._queue.push(entry);
-      }
-      // Keep queue sorted highest priority first, bounded to MAX_QUEUE_LENGTH
-      this._queue.sort((a, b) => b.priority - a.priority || a.queuedAt - b.queuedAt);
-      if (this._queue.length > MAX_QUEUE_LENGTH) {
-        this._queue.length = MAX_QUEUE_LENGTH;
-      }
+      this._enqueue(entry);
       return clip;
     }
 
+    // Handle arrival during the 280 ms inter-transmission drain gap
+    this._pruneStaleQueue(nowMs);
+    if (this._queue.length > 0) {
+      // Priority-0 chatter must never preempt or cancel queued alerts waiting in the gap
+      if (priority === 0) return null;
+      this._cancelDrainTimer();
+      this._enqueue(entry);
+      const next = this._queue.shift();
+      this._startTransmission(next);
+      return clip;
+    }
+
+    this._cancelDrainTimer();
     this._startTransmission(entry);
     return clip;
   }
@@ -299,6 +331,7 @@ export class RadioManager {
 
   _startTransmission(entry) {
     if (this._disposed) return;
+    this._cancelDrainTimer();
     const { clip, priority } = entry;
     const token = ++this._playToken;
 
@@ -372,18 +405,23 @@ export class RadioManager {
   }
 
   _drainQueue() {
-    if (this._disposed || this._active || this._queue.length === 0) return;
-    // Drop stale queued alerts older than 12s
-    const now = Date.now();
-    while (this._queue.length > 0 && now - this._queue[0].queuedAt > 12000) {
-      this._queue.shift();
+    if (this._disposed || this._active) return;
+    this._pruneStaleQueue();
+    if (this._queue.length === 0) {
+      this._cancelDrainTimer();
+      return;
     }
-    if (this._queue.length === 0) return;
-    const next = this._queue.shift();
-    // Brief natural radio gap between consecutive transmissions (280 ms)
+    if (this._drainTimer !== null) return;
+    // Brief natural radio gap between consecutive transmissions (280 ms).
+    // Keep entries in _queue until the callback fires so urgent arrivals during the
+    // gap stay ordered and never drop a queued alert.
     const token = this._playToken;
-    setTimeout(() => {
+    this._drainTimer = setTimeout(() => {
+      this._drainTimer = null;
       if (this._disposed || this._active || this._playToken !== token) return;
+      this._pruneStaleQueue();
+      if (this._queue.length === 0) return;
+      const next = this._queue.shift();
       this._startTransmission(next);
     }, 280);
   }
@@ -416,6 +454,7 @@ export class RadioManager {
       const now = Date.now();
       const quietEnough =
         !this._active &&
+        this._drainTimer === null &&
         this._queue.length === 0 &&
         now - this._lastTransmissionEndMs >= AMBIENT_QUIET_GAP_MS;
 
@@ -427,12 +466,14 @@ export class RadioManager {
   }
 
   clearQueue() {
+    this._cancelDrainTimer();
     this._queue.length = 0;
   }
 
   dispose() {
     this._disposed = true;
     this.stopAmbientChatter();
+    this._cancelDrainTimer();
     this._queue.length = 0;
     this._abortActive();
     this._listeners.clear();

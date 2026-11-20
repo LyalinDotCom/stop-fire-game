@@ -275,7 +275,7 @@ export class TacticalMap {
           : agl < 16
             ? 'too_low'
             : 'optimal';
-    const isTooHigh = altZone === 'too_high';
+    const isTooHigh = altZone === 'too_high' && (onTarget || nearDist < 135);
     const isLowDanger = altZone === 'too_low' && (onTarget || nearDist < 90);
 
     const radiusM = Math.max(14, Math.min(88, dropPreview.radiusM ?? dropPreview.radius ?? 28));

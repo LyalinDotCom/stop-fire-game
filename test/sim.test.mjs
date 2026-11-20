@@ -521,12 +521,19 @@ describe('FlightModel', () => {
         tankPct: 100,
       });
 
+      // Inject artificial +11.8 m/s upward thermal+buoyancy kick into airframe vy to verify
+      // predictDropImpact() uses pure kinematic velocity & y0 = y - 1.4 (matching main.js & HostBroadcaster.js)
+      const kinVx = p.vx;
+      const kinVy = p.vy;
+      const kinVz = p.vz;
+      p.vy += 11.8;
+
       // Step sim wind once, use exact sim wind vector
       testSim.windVx = sc.windVx;
       testSim.windVz = sc.windVz;
       const pred = predictDropImpact(p, { windVx: sc.windVx, windVz: sc.windVz }, terrain, testSim);
 
-      testSim.spawnWaterParcel(7, p.x, p.y, p.z, p.vx, p.vy, p.vz, sc.agl);
+      testSim.spawnWaterParcel(7, p.x, p.y - 1.4, p.z, kinVx, kinVy, kinVz, sc.agl);
       let impact = null;
       for (let step = 0; step < 60 && !impact; step++) {
         // Hold wind constant while parcel falls to isolate ballistic math comparison
@@ -544,6 +551,76 @@ describe('FlightModel', () => {
         `predictDropImpact error ${errM.toFixed(2)}m must be < 1 cell (${terrain.cellSize}m)`
       );
     }
+  });
+
+  it('#89 #2: OOB perimeter fence safely turns and climbs plane back inward on all 36 headings across all 6 maps with 0 crashes and 0 wall scrapes', () => {
+    for (const op of [...OPERATIONS, MEGA_BASIN_OP]) {
+      const t = generateTerrain(op);
+      const hardLimit = t.halfWorld * 0.96;
+      for (let h = 0; h < 36; h++) {
+        const yaw = h * 10;
+        const rad = (yaw * Math.PI) / 180;
+        const ux = Math.sin(rad);
+        const uz = -Math.cos(rad);
+        const rmUnit = Math.max(Math.hypot(Math.abs(ux), Math.abs(uz)) * 0.88, Math.max(Math.abs(ux), Math.abs(uz)));
+        const rCross = (0.761 / rmUnit) * t.halfWorld;
+        const sx = ux * rCross;
+        const sz = uz * rCross;
+        const gy = Math.max(t.waterLevel, t.getHeight(sx, sz));
+        const p = createAircraftState({
+          x: sx,
+          y: gy + 65,
+          z: sz,
+          yawDeg: yaw,
+          speedKmh: 185,
+          tankPct: 100,
+          slotId: 1,
+        });
+        let hitOob = false;
+        let returnedInward = false;
+        for (let f = 0; f < 60 * 18; f++) {
+          const { events } = stepFlight(p, { pitch: 0, roll: 0, throttleDelta: 0, drop: false }, t, 1 / 60);
+          if (p.outOfBounds) hitOob = true;
+          assert.equal(p.crashed, false, `${op.id} yaw=${yaw} must not crash during OOB auto-return`);
+          assert.equal(events.treeHit, null, `${op.id} yaw=${yaw} must not strike trees during OOB auto-return`);
+          assert.ok(
+            Math.abs(p.x) < hardLimit - 0.5 && Math.abs(p.z) < hardLimit - 0.5,
+            `${op.id} yaw=${yaw} must not scrape hardLimit (${hardLimit})`
+          );
+          if (hitOob && !p.outOfBounds) {
+            returnedInward = true;
+            break;
+          }
+        }
+        assert.equal(returnedInward, true, `${op.id} yaw=${yaw} must return cleanly inside basin`);
+      }
+    }
+  });
+
+  it('#89 #3: guards NaN/undefined dt and NaN/null inputs without poisoning AircraftState or FireSim', () => {
+    const p = createAircraftState({
+      x: 50,
+      y: terrain.getHeight(50, -40) + 45,
+      z: -40,
+      yawDeg: 90,
+      speedKmh: 158,
+      tankPct: 80,
+    });
+    stepFlight(p, {}, terrain, undefined);
+    stepFlight(p, {}, terrain, NaN);
+    stepFlight(p, null, terrain, 1 / 60);
+    stepFlight(p, { pitch: NaN, roll: NaN, throttleDelta: NaN, drop: false }, terrain, 1 / 60);
+    assert.ok(Number.isFinite(p.x) && Number.isFinite(p.y) && Number.isFinite(p.z), 'position remains finite');
+    assert.ok(Number.isFinite(p.yawDeg) && Number.isFinite(p.pitchDeg) && Number.isFinite(p.rollDeg), 'attitude remains finite');
+    assert.ok(Number.isFinite(p.speedKmh) && Number.isFinite(p.throttle), 'speed/throttle remain finite');
+
+    const sim = new FireSim(terrain);
+    sim.spawnWaterParcel(1, NaN, 40, 0, 10, 0, 0, 35);
+    assert.equal(sim.parcelCount, 0, 'NaN parcel is ignored');
+    sim.step(NaN, NaN);
+    sim.step(undefined, undefined);
+    assert.ok(Number.isFinite(sim.simTime) && sim.simTime > 0, 'FireSim simTime remains finite');
+    assert.ok(Number.isFinite(sim.windVx) && Number.isFinite(sim.windVz), 'FireSim wind remains finite');
   });
 });
 
@@ -1312,6 +1389,167 @@ describe('FireSim', () => {
     const p99 = timesMs[Math.floor(timesMs.length * 0.99)];
     console.log(`[FireSim 100P Mega-Basin benchmark] p50=${p50.toFixed(3)}ms, p99=${p99.toFixed(3)}ms`);
     assert.ok(p99 < 2.0, `Expected Mega-Basin 100-pilot p99 < 2.0 ms, got ${p99.toFixed(3)} ms`);
+  });
+
+  it('#89 #1: rollingIntermission on op01..op05 ignites 100% of fire seeds and emits sector_redeploy (resetting wave=1 & score) on overrun', () => {
+    for (const op of OPERATIONS) {
+      const t = generateTerrain(op);
+      const simRolling = new FireSim(t, { isMegaBasin: op.mode === 'megabasin', rollingIntermission: true });
+      const simPlain = new FireSim(t);
+      assert.equal(simRolling.isMegaBasin, false, `${op.id} is not Mega-Basin`);
+      assert.equal(simRolling.rollingIntermission, true, `${op.id} has rollingIntermission`);
+      assert.equal(
+        simRolling.burningCount,
+        simPlain.burningCount,
+        `${op.id} rollingIntermission must ignite 100% of seeds (${simRolling.burningCount} vs ${simPlain.burningCount})`
+      );
+    }
+
+    // Trigger overrun on op01 rollingIntermission -> intermissionReason='overrun' -> wave=1, score=0, wind unrotated, sector_redeploy
+    const t0 = generateTerrain(OPERATIONS[0]);
+    const sim = new FireSim(t0, { isMegaBasin: false, rollingIntermission: true });
+    const origWindDir = sim.baseWindDirDeg;
+    sim.missionScore = 4200;
+    sim.slotScores.set(1, 4200);
+    for (let c = 0; c < sim.cabinsTotal; c++) {
+      sim.cabinHp[c] = 0;
+      sim.cabinHpF[c] = 0;
+    }
+    sim.cabinsAlive = 0;
+    sim.step(0.1, 1);
+    assert.equal(sim.status, 'intermission');
+    assert.equal(sim.intermissionReason, 'overrun');
+    assert.equal(sim.getSnapshot().intermissionReason, 'overrun');
+
+    let finalStep = null;
+    const events = [];
+    for (let i = 0; i < 155; i++) {
+      const r = sim.step(0.1, 1);
+      events.push(...sim.drainWorldEvents());
+      if (r.fullReset) {
+        finalStep = r;
+        break;
+      }
+    }
+    assert.ok(finalStep && finalStep.fullReset, 'overrun intermission reset cleanly');
+    assert.equal(finalStep.advanceOperation, false, 'overrun must NOT advance operation');
+    assert.equal(sim.wave, 1, 'non-MegaBasin overrun resets wave to 1');
+    assert.equal(sim.missionScore, 0, 'non-MegaBasin overrun clears failed score');
+    assert.equal(sim.baseWindDirDeg, origWindDir, 'non-MegaBasin overrun does not rotate base wind');
+    assert.ok(events.some((e) => e.type === 'sector_redeploy'), 'emits sector_redeploy event');
+    assert.ok(!events.some((e) => e.type === 'operation_advance'), 'does NOT emit bogus operation_advance on overrun');
+  });
+
+  it('#89 #4 & #10: op04 scoopZones align with S-curve river (>=480m wing-safe) and charred trees have 9.5*scale standing snag hitbox', () => {
+    const t4 = generateTerrain(OPERATIONS[3]);
+    assert.equal(t4.scoopZones[0].headingDeg, 168);
+    assert.equal(t4.scoopZones[1].headingDeg, 170);
+    for (const z of t4.scoopZones) {
+      const rad = (z.headingDeg * Math.PI) / 180;
+      const fx = Math.sin(rad);
+      const fz = -Math.cos(rad);
+      const rx = -fz;
+      const rz = fx;
+      let fwd = 0;
+      let back = 0;
+      for (let d = 10; d <= 600; d += 10) {
+        const cx = z.x + fx * d;
+        const cz = z.z + fz * d;
+        if (t4.isWater(cx, cz) && t4.isWater(cx - rx * 14, cz - rz * 14) && t4.isWater(cx + rx * 14, cz + rz * 14)) {
+          fwd = d;
+        } else break;
+      }
+      for (let d = 10; d <= 600; d += 10) {
+        const cx = z.x - fx * d;
+        const cz = z.z - fz * d;
+        if (t4.isWater(cx, cz) && t4.isWater(cx - rx * 14, cz - rz * 14) && t4.isWater(cx + rx * 14, cz + rz * 14)) {
+          back = d;
+        } else break;
+      }
+      assert.ok(fwd + back >= 480, `op04 ${z.name} contiguous wing-safe runway=${fwd + back}m (expected >= 480m)`);
+    }
+
+    // #89 #10: Charred snag collision height (~9.5 * tr.scale) & narrow trunk canopyR (0.7 * tr.scale)
+    const t0 = generateTerrain(OPERATIONS[0]);
+    const tr = t0.trees[0];
+    const { gx, gz } = t0.worldToGrid(tr.x, tr.z);
+    const fakeCells = new Uint8Array(t0.gridSize * t0.gridSize);
+    fakeCells[gz * t0.gridSize + gx] = CELL_STATE.CHARRED;
+    assert.ok(
+      t0.findCollidingTree(tr.x, tr.y + 8.0 * tr.scale, tr.z, 2.6, fakeCells) !== null,
+      'charred standing snag hits at 8.0 * scale (matching visible blackened trunk)'
+    );
+    assert.equal(
+      t0.findCollidingTree(tr.x, tr.y + 11.2 * tr.scale, tr.z, 2.6, fakeCells),
+      null,
+      'charred snag clears above 9.5 * scale + 1.0 margin'
+    );
+  });
+
+  it('#89 #6: Autopilot lands optimal direct hits on op03 and op05 without misted_high climbs', () => {
+    for (const opIdx of [2, 4]) {
+      const op = OPERATIONS[opIdx];
+      const t = generateTerrain(op);
+      const sim = new FireSim(t, { isMegaBasin: false, rollingIntermission: true });
+      const ap = new Autopilot(t);
+      const lake = t.scoopZones[0];
+      const plane = createAircraftState({
+        x: lake.x,
+        z: lake.z + 180,
+        y: t.waterLevel + 52,
+        yawDeg: 45,
+        speedKmh: 158,
+        tankPct: 100,
+        autopilot: true,
+        slotId: 0,
+      });
+
+      const outcomes = [];
+      let pAcc = 0;
+      let sAcc = 0;
+      for (let f = 0; f < 60 * 150; f++) {
+        const snap = sim.getSnapshot();
+        const inp = ap.update(plane, snap, 1 / 60, sim);
+        const { events } = stepFlight(plane, inp, t, 1 / 60, { fireSim: sim });
+        assert.equal(events.planeCrash, null, `${op.id} Autopilot crashed`);
+        assert.equal(events.treeHit, null, `${op.id} Autopilot hit tree`);
+        if (plane.releasing) {
+          pAcc += 1 / 60;
+          if (pAcc >= 0.1) {
+            pAcc -= 0.1;
+            const yr = (plane.yawDeg * Math.PI) / 180;
+            const pr = (plane.pitchDeg * Math.PI) / 180;
+            const vm = plane.speedKmh / 3.6;
+            sim.spawnWaterParcel(
+              0,
+              plane.x,
+              plane.y - 1.4,
+              plane.z,
+              Math.sin(yr) * Math.cos(pr) * vm,
+              Math.sin(pr) * vm,
+              -Math.cos(yr) * Math.cos(pr) * vm,
+              plane.agl
+            );
+          }
+        }
+        sAcc += 1 / 60;
+        if (sAcc >= 0.1) {
+          sAcc -= 0.1;
+          sim.step(0.1, 1);
+          outcomes.push(...sim.drainDropOutcomes());
+        }
+      }
+      const optDirect = outcomes.filter((o) => o.dropQuality === 'optimal' && o.outcome === 'direct');
+      assert.ok(
+        optDirect.length >= 2,
+        `${op.id} Autopilot must land >= 2 optimal direct hits in 150 s (got ${optDirect.length}/${outcomes.length})`
+      );
+      assert.equal(
+        outcomes.filter((o) => o.dropQuality === 'misted_high').length,
+        0,
+        `${op.id} Autopilot must avoid misted_high drops`
+      );
+    }
   });
 });
 

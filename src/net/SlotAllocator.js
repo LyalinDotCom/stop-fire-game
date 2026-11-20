@@ -81,6 +81,7 @@ export class SlotAllocator {
     this._idleVacated = false;
     this._idleOfflined = false;
     this._claiming = false;
+    this._claimPromise = null;
     this.callsign = 'EF-07';
     this.colorIdx = 0;
   }
@@ -160,13 +161,25 @@ export class SlotAllocator {
    * - On reload with an expired prior slot still pointing to us, re-claims that exact slot index!
    * - If world is fresh (!config), atomically writes config + authority (epoch 1, rev 0) together.
    */
-  async claim({
+  async claim(opts = {}) {
+    if (this._claimPromise) {
+      return this._claimPromise;
+    }
+    const p = this._claimInner(opts).finally(() => {
+      if (this._claimPromise === p) this._claimPromise = null;
+    });
+    this._claimPromise = p;
+    return p;
+  }
+
+  async _claimInner({
     callsign,
     colorIdx = 0,
     connId = this.connId,
     buildHash = getBuildHash(),
     mapId = 'op01',
     cap = MAX_SLOTS,
+    skipConfigRefresh = false,
   } = {}) {
     if (this._claiming) return { seated: false, slotId: this.slotId, createdWorld: false, queued: false };
     if (!connId) {
@@ -181,14 +194,17 @@ export class SlotAllocator {
       this.colorIdx = safeColor;
 
       // Read only our own uidToSlot/$uid (parent uidToSlot is not readable under live rules!).
-      const [existingSlotVal, config, slotsMap] = await Promise.all([
+      const [existingSlotVal, config, slotsMap, existingAuth] = await Promise.all([
         this.adapter.get(`${this.basePath}/uidToSlot/${uid}`),
         this.adapter.get(`${this.basePath}/config`),
         this.adapter.get(`${this.basePath}/slots`),
+        this.adapter.get(`${this.basePath}/authority`).catch(() => null),
       ]);
 
       const now = this.adapter.now();
       const slots = slotsMap || {};
+      const isPublicShard = /^megabasin-(0[1-9]|1[0-8])$/.test(this.worldId);
+      const targetCap = isPublicShard ? MAX_SLOTS : Math.max(1, Math.min(MAX_SLOTS, Math.floor(cap) || MAX_SLOTS));
 
       let preferredExpiredSlot = null;
       if (Number.isInteger(existingSlotVal) && existingSlotVal >= 0 && existingSlotVal < MAX_SLOTS) {
@@ -212,7 +228,16 @@ export class SlotAllocator {
         }
       }
 
-      const effectiveCap = Math.max(1, Math.min(MAX_SLOTS, Math.floor(config?.cap ?? cap) || MAX_SLOTS));
+      const authExpired = !existingAuth || typeof existingAuth.leaseUntil !== 'number' || existingAuth.leaseUntil <= now;
+      const configNeedsRefresh = Boolean(
+        !skipConfigRefresh &&
+        config &&
+        authExpired &&
+        ((config.expiresAt ?? 0) <= now + 3_600_000 || (isPublicShard && config.cap !== MAX_SLOTS))
+      );
+      const effectiveCap = configNeedsRefresh
+        ? targetCap
+        : Math.max(1, Math.min(MAX_SLOTS, Math.floor(config?.cap ?? targetCap) || MAX_SLOTS));
       const activeByOthers = countActiveSlots(slots, now, uid);
 
       // Build shuffled list of vacant (missing or expired) slots.
@@ -270,22 +295,29 @@ export class SlotAllocator {
           },
         };
 
-        if (creatingWorld) {
+        if (creatingWorld || configNeedsRefresh) {
           updates.config = {
             mode: 'megabasin',
             mapId,
-            cap: Math.max(1, Math.min(MAX_SLOTS, Math.floor(cap) || MAX_SLOTS)),
+            cap: targetCap,
             protocolVersion: PROTOCOL_VERSION,
             buildHash,
             createdAt: this.adapter.serverTimestamp(),
             expiresAt: tNow + WORLD_TTL_MS,
           };
-          updates.authority = {
-            uid,
-            epoch: 1,
-            rev: 0,
-            leaseUntil: tNow + 8000,
-          };
+          updates.authority = existingAuth
+            ? {
+                uid,
+                epoch: (existingAuth.epoch | 0) + 1,
+                rev: (existingAuth.rev | 0) + 1,
+                leaseUntil: tNow + 8000,
+              }
+            : {
+                uid,
+                epoch: 1,
+                rev: 0,
+                leaseUntil: tNow + 8000,
+              };
         }
 
         try {
@@ -299,14 +331,28 @@ export class SlotAllocator {
           this._claimedAt = this._nowFn();
           this.callsign = cleanName;
           this.markActive();
-          return { seated: true, slotId: s, createdWorld: creatingWorld, queued: false };
+          return {
+            seated: true,
+            slotId: s,
+            createdWorld: creatingWorld || configNeedsRefresh,
+            initialAuthority: updates.authority || null,
+            queued: false,
+          };
         } catch (err) {
           if (!isPermissionDenied(err)) throw err;
-          if (creatingWorld) {
+          if (creatingWorld || configNeedsRefresh) {
             const recheckCfg = await this.adapter.get(`${this.basePath}/config`).catch(() => null);
             if (recheckCfg) {
               this._claiming = false;
-              return this.claim({ callsign, colorIdx: safeColor, connId, buildHash, mapId, cap });
+              return this._claimInner({
+                callsign,
+                colorIdx: safeColor,
+                connId,
+                buildHash,
+                mapId,
+                cap,
+                skipConfigRefresh: true,
+              });
             }
           }
         }
@@ -415,6 +461,10 @@ export class SlotAllocator {
    * Strictly enforces conditional leaf deletion so missing leaves never cause PERMISSION_DENIED.
    */
   async vacate() {
+    // Await any in-flight claim() so vacate() never no-ops and orphans a just-committed slot!
+    if (this._claimPromise) {
+      await this._claimPromise.catch(() => {});
+    }
     const uid = this.adapter.uid;
     const s = this.slotId;
     const updates = {};

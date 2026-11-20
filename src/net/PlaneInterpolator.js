@@ -248,8 +248,9 @@ function evalHermite(p0, p1, m0, m1, u) {
  *   so remote planes NEVER freeze in mid-air and NEVER pop across the sky!
  */
 export class PlaneTrack {
-  constructor(slotId) {
+  constructor(slotId, uid = null) {
     this.slotId = slotId;
+    this.uid = uid;
     this.samples = [];
     this.lastSeenMs = 0;
     this.lastMovedMs = 0;
@@ -349,9 +350,17 @@ export class PlaneTrack {
     this._errRoll *= decay;
 
     // Never-stop forward-speed floor & anti-pop frame-step clamp for flying aircraft:
-    // ensures convergence never stalls/reverses a flying plane and never jumps > ~2 m in a 60 Hz frame.
+    // ensures convergence never stalls/reverses a flying plane and never jumps > ~2 m in a 60 Hz frame,
+    // while gating on staleMoveMs <= 600 so parked/hidden-tab static poses do not drift off-position!
     const staleMs = Math.max(0, nowMs - (this.lastSeenMs || 0));
-    if (isFlying && !isLargeTeleport && dtSec > 0.002 && staleMs <= MAX_EXTRAPOLATE_MS + 350) {
+    const staleMoveMs = Math.max(0, nowMs - (this.lastMovedMs || this.lastSeenMs));
+    if (
+      isFlying &&
+      !isLargeTeleport &&
+      dtSec > 0.002 &&
+      staleMs <= MAX_EXTRAPOLATE_MS + 350 &&
+      staleMoveMs <= 600
+    ) {
       const vMs = Math.max(25, raw.speedKmh * KMH_TO_MS);
       const yawR = wrap360(this._lastOut.yawDeg) * DEG_TO_RAD;
       const pitchR = clamp(this._lastOut.pitchDeg || 0, -35, 35) * DEG_TO_RAD;
@@ -407,7 +416,6 @@ export class PlaneTrack {
 
     // Per-plane stale protection: if this ONE remote plane hasn't moved for > 1.5 s (bad Wi-Fi),
     // smoothly level its wings so it doesn't freeze awkwardly in a steep bank.
-    const staleMoveMs = Math.max(0, nowMs - (this.lastMovedMs || this.lastSeenMs));
     let pitchDeg = raw.pitchDeg + this._errPitch;
     let rollDeg = raw.rollDeg + this._errRoll;
     if (staleMoveMs > STALE_COAST_MS) {
@@ -544,10 +552,35 @@ export class PlaneInterpolator {
   }
 
   /**
+   * Reconcile tracks against authoritative `slots` map:
+   * immediately evict vacated/expired slots (zero mid-air linger) and reset PlaneTrack if
+   * a recycled slotId now belongs to a different uid (zero cross-pilot rubber-band!).
+   */
+  reconcileSlots(activeSlots, serverNow = null) {
+    if (!activeSlots || typeof activeSlots !== 'object') return;
+    for (const [slotId, track] of [...this.tracks.entries()]) {
+      const slotObj = activeSlots[String(slotId)];
+      const expired =
+        !slotObj ||
+        typeof slotObj.uid !== 'string' ||
+        (typeof serverNow === 'number' && typeof slotObj.leaseUntil === 'number' && slotObj.leaseUntil <= serverNow);
+      if (expired) {
+        this.tracks.delete(slotId);
+      } else if (track.uid && slotObj.uid !== track.uid) {
+        // Recycled slot claimed by a new pilot -> drop old pilot's history cleanly!
+        this.tracks.delete(slotId);
+      } else if (!track.uid) {
+        track.uid = slotObj.uid;
+      }
+    }
+  }
+
+  /**
    * Ingest a decoded planes snapshot from StreamClient.
    * Optional `serverTimeMs` enables Host-clock timeline spacing even when client packets arrive clumped.
+   * Optional `activeSlots` binds each track to its occupant UID so recycled slots reset cleanly.
    */
-  pushSnapshot(planes, arrivalMs, localSlotId = null, serverTimeMs = null) {
+  pushSnapshot(planes, arrivalMs, localSlotId = null, serverTimeMs = null, activeSlots = null, serverNow = null) {
     let timelineMs = typeof serverTimeMs === 'number' && Number.isFinite(serverTimeMs) && serverTimeMs > 0
       ? serverTimeMs
       : arrivalMs;
@@ -558,18 +591,29 @@ export class PlaneInterpolator {
     this._lastTimelineMs = timelineMs;
 
     this.playback.heard(arrivalMs, timelineMs);
+    if (activeSlots) this.reconcileSlots(activeSlots, serverNow);
     const seen = new Set();
 
     for (let i = 0; i < planes.length; i++) {
       const p = planes[i];
+      const slotObj = activeSlots ? activeSlots[String(p.slotId)] : null;
+      const slotUid = slotObj && typeof slotObj.uid === 'string' ? slotObj.uid : null;
+      if (
+        activeSlots &&
+        (!slotUid || (typeof serverNow === 'number' && typeof slotObj.leaseUntil === 'number' && slotObj.leaseUntil <= serverNow))
+      ) {
+        continue;
+      }
       seen.add(p.slotId);
       if (localSlotId !== null && p.slotId === localSlotId) {
         this.localAuthTank = p.tankPct;
       }
       let track = this.tracks.get(p.slotId);
-      if (!track) {
-        track = new PlaneTrack(p.slotId);
+      if (!track || (slotUid && track.uid && track.uid !== slotUid)) {
+        track = new PlaneTrack(p.slotId, slotUid);
         this.tracks.set(p.slotId, track);
+      } else if (slotUid && !track.uid) {
+        track.uid = slotUid;
       }
       track.push(timelineMs, p, arrivalMs);
     }
@@ -585,7 +629,8 @@ export class PlaneInterpolator {
   /**
    * Evaluate all remote planes at nowMs (excluding excludeSlotId) enriched with roster metadata.
    */
-  sample(nowMs, { excludeSlotId = null, getRosterInfo = null } = {}) {
+  sample(nowMs, { excludeSlotId = null, getRosterInfo = null, activeSlots = null, serverNow = null } = {}) {
+    if (activeSlots) this.reconcileSlots(activeSlots, serverNow);
     const renderMs = this.playback.at(nowMs);
     if (renderMs === null) return [];
 

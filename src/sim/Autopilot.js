@@ -272,14 +272,35 @@ export class Autopilot {
         const desiredRoll = this.extendTimer > 0 ? 0 : clamp(headingErr * 1.15, -42, 42);
         roll = this._commandRoll(aircraft, desiredRoll);
 
+        // Within 320 m of fire, clamp long lookahead distances so distant perimeter peaks behind the fire
+        // do not push the plane into >58 m misted_high altitude, while preserving immediate terrain safety!
+        const approachLookaheadY = distAim < 320
+          ? sampleLookaheadSurface(this.terrain, aircraft.x, aircraft.z, aircraft.yawDeg, [
+              35,
+              85,
+              130,
+              Math.min(240, distAim + 45),
+              Math.min(340, distAim + 45),
+            ])
+          : lookaheadY;
+
         const targetGroundY = Math.max(this.terrain.waterLevel, this.terrain.getHeight(target.x, target.z));
         const curGroundY = Math.max(this.terrain.waterLevel, this.terrain.getHeight(aircraft.x, aircraft.z));
-        // Cruise right in peak optimal drop envelope (36-40 m AGL), well above all treetops (<= 16 m)
-        const desiredY = Math.max(curGroundY + 38, lookaheadY + 32, targetGroundY + 38);
-        pitch = this._altitudePitch(aircraft, desiredY, 18, -12);
+        // Only climb toward elevated target ridge when close (< 250 m), avoiding premature high-AGL flight over lowlands/lakes
+        const nearTgtBlend = clamp(1 - (distAim - 110) / 140, 0, 1);
+        const tgtAltRef = curGroundY + (targetGroundY - curGroundY) * nearTgtBlend + 36;
+        // Cruise right in peak optimal drop envelope (35-38 m AGL), well above all treetops (<= 16 m)
+        const desiredY = Math.max(curGroundY + 36, approachLookaheadY + 28, tgtAltRef);
+        const maxDive = aircraft.agl > 50 ? -18 : -13;
+        pitch = this._altitudePitch(aircraft, desiredY, 18, maxDive);
         throttleDelta = this._commandSpeed(aircraft, 156);
 
-        if (primaryTarget && aircraft.tankPct > 15 && aircraft.agl >= 24) {
+        // Gate release on optimal 22..52 m AGL envelope (leaving headroom for drop buoyancy) unless immediate terrain forces up to 56 m
+        const immLookaheadY = sampleLookaheadSurface(this.terrain, aircraft.x, aircraft.z, aircraft.yawDeg, [35, 85]);
+        const terrainForcedHigh = immLookaheadY + 24 > curGroundY + 52;
+        const altOkForRelease = aircraft.agl >= 22 && (aircraft.agl <= 52 || (terrainForcedHigh && aircraft.agl <= 56));
+
+        if (primaryTarget && aircraft.tankPct > 15 && altOkForRelease) {
           const impactDist = Math.hypot(impact.impactX - target.x, impact.impactZ - target.z);
           const hasCells = Boolean(fireSource && fireSource.cells);
           // Wait until impact footprint solidly overlaps the fire core (not grazing edge 45m early)
@@ -308,8 +329,15 @@ export class Autopilot {
         drop = aircraft.tankPct > 0.5;
         roll = this._commandRoll(aircraft, 0);
         const curGroundY = Math.max(this.terrain.waterLevel, this.terrain.getHeight(aircraft.x, aircraft.z));
-        const desiredY = Math.max(curGroundY + 38, lookaheadY + 32);
-        pitch = this._altitudePitch(aircraft, desiredY, 16, -10);
+        const releaseLookaheadY = sampleLookaheadSurface(
+          this.terrain,
+          aircraft.x,
+          aircraft.z,
+          aircraft.yawDeg,
+          [35, 85, 130]
+        );
+        const desiredY = Math.max(curGroundY + 36, releaseLookaheadY + 28);
+        pitch = this._altitudePitch(aircraft, desiredY, 16, -11);
         throttleDelta = this._commandSpeed(aircraft, 154);
 
         if (aircraft.tankPct <= 0.5 || this.phaseTime >= 2.2) {

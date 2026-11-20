@@ -75,9 +75,14 @@ function getSharedPlaneTextures(onLoaded = null) {
           tex.magFilter = THREE.LinearFilter;
           tex.anisotropy = 4;
           tex.needsUpdate = true;
+          const oldFallback = _sharedPlaneTextures.fallbackAlbedo;
           _sharedPlaneTextures.albedo = tex;
           for (const cb of _sharedPlaneTextures.listeners) {
             cb('albedo', tex);
+          }
+          if (oldFallback) {
+            _sharedPlaneTextures.fallbackAlbedo = null;
+            oldFallback.dispose();
           }
         },
         undefined,
@@ -94,9 +99,14 @@ function getSharedPlaneTextures(onLoaded = null) {
           tex.magFilter = THREE.LinearFilter;
           tex.anisotropy = 4;
           tex.needsUpdate = true;
+          const oldFallback = _sharedPlaneTextures.fallbackBump;
           _sharedPlaneTextures.bump = tex;
           for (const cb of _sharedPlaneTextures.listeners) {
             cb('bump', tex);
+          }
+          if (oldFallback) {
+            _sharedPlaneTextures.fallbackBump = null;
+            oldFallback.dispose();
           }
         },
         undefined,
@@ -107,10 +117,10 @@ function getSharedPlaneTextures(onLoaded = null) {
 
   if (onLoaded) {
     _sharedPlaneTextures.listeners.push(onLoaded);
-    if (_sharedPlaneTextures.albedo !== _sharedPlaneTextures.fallbackAlbedo) {
+    if (_sharedPlaneTextures.albedo && _sharedPlaneTextures.albedo !== _sharedPlaneTextures.fallbackAlbedo) {
       onLoaded('albedo', _sharedPlaneTextures.albedo);
     }
-    if (_sharedPlaneTextures.bump !== _sharedPlaneTextures.fallbackBump) {
+    if (_sharedPlaneTextures.bump && _sharedPlaneTextures.bump !== _sharedPlaneTextures.fallbackBump) {
       onLoaded('bump', _sharedPlaneTextures.bump);
     }
   }
@@ -1190,8 +1200,17 @@ export function createHeroPlaneMesh(liveryIndex = 0, stencilText = '07') {
   cockpitInterior.position.set(0, 0.54, -1.08);
   group.add(cockpitInterior);
 
-  // Tinted semi-gloss aviation windshield overlay for realistic canopy readability
-  const windshieldGeo = new THREE.PlaneGeometry(0.92, 0.56);
+  // Tinted semi-gloss curved aviation windshield flush along the A-pillars
+  // (+Z FrontSide normal faces forward-and-up along the firewall -> cockpit slope)
+  const windshieldGeo = new THREE.PlaneGeometry(0.86, 0.54, 4, 1);
+  {
+    const wsPos = windshieldGeo.getAttribute('position');
+    for (let i = 0; i < wsPos.count; i++) {
+      const t = wsPos.getX(i) / 0.43; // -1..+1 across windshield width
+      wsPos.setZ(i, -0.075 * t * t);  // Hug rounded superellipse fuselage arch
+    }
+    windshieldGeo.computeVertexNormals();
+  }
   const windshieldMat = new THREE.MeshStandardMaterial({
     color: '#1c3647',
     roughness: 0.24,
@@ -1203,8 +1222,8 @@ export function createHeroPlaneMesh(liveryIndex = 0, stencilText = '07') {
     polygonOffsetUnits: -1,
   });
   const windshieldMesh = new THREE.Mesh(windshieldGeo, windshieldMat);
-  windshieldMesh.position.set(0, 0.72, -1.53);
-  windshieldMesh.rotation.x = -0.86;
+  windshieldMesh.position.set(0, 0.705, -1.50);
+  windshieldMesh.rotation.x = -(Math.PI - 0.89); // ~ -2.25 rad: +Z normal faces (-Z, +Y)
   group.add(windshieldMesh);
 
   // Wing registration stencils: "EF" on port wing, slot digits ("07") on starboard wing
@@ -1212,8 +1231,17 @@ export function createHeroPlaneMesh(liveryIndex = 0, stencilText = '07') {
   const efTex = createWingStencilTexture('EF');
   let numTex = createWingStencilTexture(currentStencil);
 
-  const stencilGeo = new THREE.PlaneGeometry(1.55, 0.78);
+  // Gently cambered decal plane conforming cleanly above the NACA upper wing skin
+  const stencilGeo = new THREE.PlaneGeometry(1.55, 0.78, 1, 4);
   stencilGeo.rotateX(-Math.PI / 2);
+  {
+    const stPos = stencilGeo.getAttribute('position');
+    for (let i = 0; i < stPos.count; i++) {
+      const tz = stPos.getZ(i) / 0.39; // -1..+1 fore-to-aft
+      stPos.setY(i, stPos.getY(i) - 0.015 * tz * tz);
+    }
+    stencilGeo.computeVertexNormals();
+  }
 
   const efMat = new THREE.MeshBasicMaterial({
     map: efTex,
@@ -1224,8 +1252,8 @@ export function createHeroPlaneMesh(liveryIndex = 0, stencilText = '07') {
     polygonOffsetUnits: -2,
   });
   const efMesh = new THREE.Mesh(stencilGeo, efMat);
-  efMesh.position.set(-3.92, 1.135, -0.58);
-  efMesh.rotation.z = -0.032; // Match wing dihedral
+  efMesh.position.set(-3.92, 1.202, -0.58);
+  efMesh.rotation.set(0.042, 0, -0.015, 'ZYX'); // Match upper airfoil camber slope & dihedral
   group.add(efMesh);
 
   const numMat = new THREE.MeshBasicMaterial({
@@ -1237,25 +1265,29 @@ export function createHeroPlaneMesh(liveryIndex = 0, stencilText = '07') {
     polygonOffsetUnits: -2,
   });
   const numMesh = new THREE.Mesh(stencilGeo, numMat);
-  numMesh.position.set(+3.92, 1.135, -0.58);
-  numMesh.rotation.z = +0.032;
+  numMesh.position.set(+3.92, 1.202, -0.58);
+  numMesh.rotation.set(0.042, 0, +0.015, 'ZYX');
   group.add(numMesh);
 
   // =========================================================================
   // Animated Control Surfaces & Belly Water-Drop Bay Doors
   // =========================================================================
 
-  // Port & Starboard Ailerons (hinged at outer trailing edge)
+  // Port & Starboard Ailerons (hinged flush into tapered swept outer wing trailing edge)
   const aileronGeo = new THREE.BoxGeometry(1.88, 0.055, 0.34);
   aileronGeo.translate(0, 0, 0.17); // Pivot around leading edge
   const leftAileron = new THREE.Mesh(aileronGeo, ctrlMatPrimary);
-  leftAileron.position.set(-4.05, 1.03, 0.24);
-  leftAileron.rotation.z = -0.032;
+  leftAileron.rotation.order = 'YZX'; // Apply trailing-edge sweep & dihedral before X deflection
+  leftAileron.position.set(-4.05, 1.018, 0.19);
+  leftAileron.rotation.y = -0.123;
+  leftAileron.rotation.z = -0.031;
   group.add(leftAileron);
 
   const rightAileron = new THREE.Mesh(aileronGeo, ctrlMatPrimary);
-  rightAileron.position.set(+4.05, 1.03, 0.24);
-  rightAileron.rotation.z = +0.032;
+  rightAileron.rotation.order = 'YZX';
+  rightAileron.position.set(+4.05, 1.018, 0.19);
+  rightAileron.rotation.y = +0.123;
+  rightAileron.rotation.z = +0.031;
   group.add(rightAileron);
 
   // Elevator (hinged along horizontal stabilizer trailing edge)

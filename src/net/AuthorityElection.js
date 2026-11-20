@@ -5,6 +5,7 @@
 export const AUTHORITY_LEASE_MS = 8000;
 export const AUTHORITY_RENEW_INTERVAL_MS = 2500;
 export const HIDDEN_ABDICATE_MS = 3000;
+export const ABDICATE_COOLDOWN_MS = 6000;
 
 function isMobileClient() {
   if (typeof navigator === 'undefined') return false;
@@ -46,6 +47,7 @@ export class AuthorityElection {
 
     this._lastRenewAt = 0;
     this._hiddenSince = 0;
+    this._abdicateCooldownUntil = 0;
     this._takeoverTimer = null;
     this._takeoverScheduledAt = 0;
     this._txInFlight = false;
@@ -133,9 +135,11 @@ export class AuthorityElection {
       this.onLostHost?.({ epoch: this.epoch });
     }
 
-    // If lease is missing, expired, or abdicated, schedule tiered contention takeover.
+    // If lease is missing, expired, or abdicated, schedule tiered contention takeover
+    // unless we voluntarily abdicated within ABDICATE_COOLDOWN_MS while peers exist.
+    const inAbdicateCooldown = now < this._abdicateCooldownUntil && this.hasOtherPeers();
     const needsElection = !val || val.leaseUntil <= now;
-    if (needsElection && !amLiveHost && this.canBeHost()) {
+    if (needsElection && !amLiveHost && !inAbdicateCooldown && this.canBeHost()) {
       this._scheduleTakeover();
     } else if (val && val.leaseUntil > now) {
       this._cancelTakeover();
@@ -156,6 +160,7 @@ export class AuthorityElection {
 
   _scheduleTakeover() {
     if (this.stopped || this._takeoverTimer || this._takeoverScheduledAt || this._txInFlight) return;
+    if (this.adapter.now() < this._abdicateCooldownUntil && this.hasOtherPeers()) return;
     const delay = this._computeBackoffMs();
     this._takeoverScheduledAt = this.adapter.now() + delay;
     this._takeoverTimer = setTimeout(() => {
@@ -210,7 +215,8 @@ export class AuthorityElection {
     // Non-host: watch for missing or expired authority lease.
     if (!this.authority || this.authority.leaseUntil <= now) {
       this.syncing = true;
-      if (this.canBeHost()) {
+      const inAbdicateCooldown = now < this._abdicateCooldownUntil && this.hasOtherPeers();
+      if (!inAbdicateCooldown && this.canBeHost()) {
         if (this._takeoverScheduledAt && now >= this._takeoverScheduledAt) {
           this._cancelTakeover();
           await this.attemptTakeover();
@@ -255,6 +261,9 @@ export class AuthorityElection {
     if (this.stopped || this.isHost || this._txInFlight || !this._listenerAttached || !this.canBeHost()) {
       return false;
     }
+    if (this.adapter.now() < this._abdicateCooldownUntil && this.hasOtherPeers()) {
+      return false;
+    }
     this._txInFlight = true;
     const uid = this.adapter.uid;
     try {
@@ -292,7 +301,10 @@ export class AuthorityElection {
   async abdicate() {
     if (!this.isHost || !this._listenerAttached) return false;
     const uid = this.adapter.uid;
+    const now = this.adapter.now();
     this.isHost = false;
+    this._abdicateCooldownUntil = now + ABDICATE_COOLDOWN_MS;
+    this._hiddenSince = now;
     this._cancelTakeover();
     this.onLostHost?.({ epoch: this.epoch, voluntary: true });
 

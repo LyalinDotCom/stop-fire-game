@@ -227,6 +227,7 @@ export class HudController {
     onJoinLobby,
     onRefreshLobbies,
     onCopyInviteLink,
+    onCloseLaunch,
     appVersion,
     buildHash,
   } = {}) {
@@ -242,6 +243,7 @@ export class HudController {
       onJoinLobby,
       onRefreshLobbies,
       onCopyInviteLink,
+      onCloseLaunch,
     };
     this._appVersion = resolveAppVersion(appVersion);
     this._buildHash = resolveBuildHash(buildHash);
@@ -256,6 +258,8 @@ export class HudController {
     this._windAngleInit = false;
     this._overlayType = null;
     this._overlayCountdownEl = null;
+    this._overlayContained = true;
+    this._overlayNextOpName = '';
     this._toastTimers = new Set();
 
     // JIT hint & atmosphere vignette state
@@ -336,7 +340,13 @@ export class HudController {
       onSettingChange: (key, val) => {
         if (key === 'audioMuted') {
           this.setAudioMuted(Boolean(val));
-        } else if (key === 'copyInviteLink' && this._callbacks.onCopyInviteLink) {
+        }
+        if (this._callbacks.onSettingChange) {
+          this._callbacks.onSettingChange(key, val);
+          return;
+        }
+        // Fallback when SettingsDrawer actions are wired via direct callbacks without onSettingChange
+        if (key === 'copyInviteLink' && this._callbacks.onCopyInviteLink) {
           this._callbacks.onCopyInviteLink(val);
         } else if (key === 'hostLobby' && this._callbacks.onHostLobby) {
           this._callbacks.onHostLobby();
@@ -344,7 +354,6 @@ export class HudController {
           this.showLaunchOverlay(true, { canDismiss: true });
           if (this._callbacks.onRefreshLobbies) this._callbacks.onRefreshLobbies();
         }
-        if (this._callbacks.onSettingChange) this._callbacks.onSettingChange(key, val);
       },
       onClose: () => {
         this._settingsBtn.classList.remove('is-active');
@@ -662,6 +671,7 @@ export class HudController {
     closeBtn.addEventListener('click', () => {
       if (this._launchCanDismiss && !this._launchBusy) {
         this.showLaunchOverlay(false);
+        if (this._callbacks.onCloseLaunch) this._callbacks.onCloseLaunch();
       }
     });
     this._launchCloseBtn = closeBtn;
@@ -1418,7 +1428,13 @@ export class HudController {
 
       if (this._overlayType === 'intermission' && this._overlayCountdownEl) {
         const secs = Math.max(0, Math.ceil(fireSnapshot.intermissionTimer || 0));
-        this._overlayCountdownEl.textContent = `NEXT OPERATION IN ${secs}S`;
+        if (!this._overlayContained) {
+          this._overlayCountdownEl.textContent = `REDEPLOYING SECTOR IN ${secs}S`;
+        } else if (this._overlayNextOpName) {
+          this._overlayCountdownEl.textContent = `NEXT: ${this._overlayNextOpName.toUpperCase()} IN ${secs}S`;
+        } else {
+          this._overlayCountdownEl.textContent = `NEXT OPERATION IN ${secs}S`;
+        }
       }
     }
 
@@ -1469,14 +1485,26 @@ export class HudController {
         this._telemBadgeEl.textContent = 'DROPPING';
         this._telemBadgeEl.classList.add('is-releasing');
       } else {
+        const isSoloMode = Boolean(
+          netState && (netState.mode === 'solo' || netState.connStatus === 'solo' || netState.status === 'solo')
+        );
+        const rawCallsign =
+          (aircraft && typeof aircraft.callsign === 'string' && aircraft.callsign.trim()) ||
+          (settings && typeof settings.callsign === 'string' && settings.callsign.trim()) ||
+          '';
         const slotId =
           typeof aircraft.slotId === 'number'
             ? aircraft.slotId
             : netState && typeof netState.localSlotId === 'number'
               ? netState.localSlotId
               : null;
-        this._telemBadgeEl.textContent =
-          slotId !== null ? `EF-${String(slotId).padStart(2, '0')}` : 'EF-07';
+        if (rawCallsign) {
+          this._telemBadgeEl.textContent = sanitizeCallsign(rawCallsign, 'EF-07');
+        } else if (!isSoloMode && slotId !== null) {
+          this._telemBadgeEl.textContent = `EF-${String(slotId).padStart(2, '0')}`;
+        } else {
+          this._telemBadgeEl.textContent = 'EF-07';
+        }
       }
 
       // Airspeed & AGL
@@ -1591,13 +1619,20 @@ export class HudController {
       }
     }
 
-    // 5. Score Micro-Toasts
+    // 5. Score Micro-Toasts (strictly local manual pilot; never spam unseated spectators)
     if (Array.isArray(scoreEvents) && scoreEvents.length > 0) {
-      const localSlot = netState && typeof netState.localSlotId === 'number' ? netState.localSlotId : null;
-      for (let i = 0; i < scoreEvents.length; i++) {
-        const ev = scoreEvents[i];
-        if (localSlot === null || ev.slotId === localSlot) {
-          this._spawnScoreToast(ev);
+      const localSlot =
+        netState && (netState.mode === 'solo' || netState.connStatus === 'solo' || netState.status === 'solo')
+          ? 0
+          : netState && typeof netState.localSlotId === 'number'
+            ? netState.localSlotId
+            : null;
+      if (localSlot !== null && !aircraft?.autopilot) {
+        for (let i = 0; i < scoreEvents.length; i++) {
+          const ev = scoreEvents[i];
+          if (ev && ev.slotId === localSlot) {
+            this._spawnScoreToast(ev);
+          }
         }
       }
     }
@@ -1703,14 +1738,24 @@ export class HudController {
     } else if (type === 'intermission') {
       const contained = data.contained !== false;
       const opName = data.opName || 'Active Sector';
+      const nextOpName =
+        typeof data.nextOpName === 'string' && data.nextOpName.trim() ? data.nextOpName.trim() : '';
       const countdown = Math.max(0, Math.ceil(data.intermissionTimer ?? 12));
       const score = String(Math.max(0, Math.floor(data.missionScore || 0))).padStart(6, '0');
+
+      this._overlayContained = contained;
+      this._overlayNextOpName = nextOpName;
 
       card.appendChild(
         el('div', 'ef-overlay-kicker', contained ? 'FIRE CONTAINED · ADVANCING SECTOR' : 'SECTOR OVERRUN · REDEPLOYING')
       );
       card.appendChild(el('h2', 'ef-overlay-heading', opName));
-      this._overlayCountdownEl = el('p', 'ef-overlay-sub', `NEXT OPERATION IN ${countdown}S`);
+      const countdownText = !contained
+        ? `REDEPLOYING SECTOR IN ${countdown}S`
+        : nextOpName
+          ? `NEXT: ${nextOpName.toUpperCase()} IN ${countdown}S`
+          : `NEXT OPERATION IN ${countdown}S`;
+      this._overlayCountdownEl = el('p', 'ef-overlay-sub', countdownText);
       card.appendChild(this._overlayCountdownEl);
 
       const stats = el('div', 'ef-overlay-stats');
@@ -1741,6 +1786,29 @@ export class HudController {
         }
         contribWrap.appendChild(list);
         card.appendChild(contribWrap);
+      }
+
+      const canAdvance =
+        typeof data.canAdvance === 'boolean'
+          ? data.canAdvance
+          : this._lastConnStatus === 'solo' ||
+            this._lastConnStatus === 'host' ||
+            this._lastConnStatus === 'offline_full' ||
+            this._lastConnStatus === 'offline_error';
+      if (contained && canAdvance && this._callbacks.onNextOperation) {
+        const actions = el('div', 'ef-overlay-actions');
+        const nextBtn = el(
+          'button',
+          'ef-btn-primary',
+          nextOpName ? `NEXT: ${nextOpName.toUpperCase()}` : 'NEXT OPERATION'
+        );
+        nextBtn.type = 'button';
+        nextBtn.setAttribute('data-action', 'next-operation');
+        nextBtn.addEventListener('click', () => {
+          if (this._callbacks.onNextOperation) this._callbacks.onNextOperation();
+        });
+        actions.appendChild(nextBtn);
+        card.appendChild(actions);
       }
     } else if (type === 'offline') {
       card.appendChild(el('div', 'ef-overlay-kicker', 'AIRSPACE LINK PAUSED'));

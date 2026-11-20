@@ -73,11 +73,11 @@ export class SceneRenderer {
     this._skybox = createSkybox();
     this.scene.add(this._skybox.mesh);
 
-    // Hero plane + 99-plane instanced remote fleet
+    // Hero plane + 100-plane instanced remote fleet (handles 100/100 shards even for unseated spectators)
     this._heroPlane = createHeroPlaneMesh(0, '07');
     this.scene.add(this._heroPlane.group);
 
-    this._remoteFleet = new RemotePlaneFleet(99);
+    this._remoteFleet = new RemotePlaneFleet(100);
     this.scene.add(this._remoteFleet.group);
 
     // World & VFX (built from terrain)
@@ -275,7 +275,15 @@ export class SceneRenderer {
         if (localAircraft.colorIdx !== undefined) {
           this._heroPlane.setLivery(localAircraft.colorIdx);
         }
-        if (localAircraft.slotId !== undefined && localAircraft.slotId !== null && localAircraft.slotId >= 0) {
+        const csStr = typeof localAircraft.callsign === 'string' ? localAircraft.callsign.trim() : '';
+        const csDigits = csStr.match(/(\d{1,2})$/);
+        if (csDigits) {
+          this._heroPlane.setStencil(csDigits[1].padStart(2, '0'));
+        } else if (
+          localAircraft.slotId !== undefined &&
+          localAircraft.slotId !== null &&
+          localAircraft.slotId > 0
+        ) {
           const digits = String(localAircraft.slotId % 100).padStart(2, '0');
           this._heroPlane.setStencil(digits);
         } else {
@@ -301,7 +309,7 @@ export class SceneRenderer {
     if (this._water) {
       const windVx = fireSnapshot ? (fireSnapshot.windVx || 0) : 0;
       const windVz = fireSnapshot ? (fireSnapshot.windVz || 0) : 0;
-      this._water.update(elapsed, windVx, windVz);
+      this._water.update(elapsed, windVx, windVz, safeDt);
     }
     if (this._world && typeof this._world.update === 'function') {
       this._world.update(elapsed);
@@ -310,7 +318,7 @@ export class SceneRenderer {
     // 4. Dynamic flickering orange fire PointLights tracking fireSnapshot.hotClusters
     this._updateFireLights(fireSnapshot, elapsed);
 
-    // 5. Remote plane fleet (up to 99 instanced planes with <15m camera proximity fade)
+    // 5. Remote plane fleet (up to 100 instanced planes with <15m camera proximity fade)
     this._remoteFleet.update(remotePlanes, this.camera.position, elapsed);
 
     // 6. VFX pools & drop reticle
@@ -324,6 +332,7 @@ export class SceneRenderer {
         showDropReticle,
         dropPreview,
         atmosphere: { smokeDensity, thermalLift, turbulence, heatDanger },
+        cameraPos: this.camera.position,
       });
     }
 

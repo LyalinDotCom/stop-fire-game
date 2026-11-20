@@ -218,8 +218,8 @@ function getLayoutSpec(layoutKey, halfWorld, seed) {
           return 16 + terrace;
         },
         scoopZones: [
-          { x: -165, z: -360, headingDeg: 25, length: 480, width: 170, name: 'Upper Gorge Bend' },
-          { x: 165, z: 360, headingDeg: 25, length: 480, width: 170, name: 'Lower Gorge Reach' },
+          { x: -165, z: -360, headingDeg: 168, length: 480, width: 170, name: 'Upper Gorge Bend' },
+          { x: 165, z: 360, headingDeg: 170, length: 480, width: 170, name: 'Lower Gorge Reach' },
         ],
         settlementDefs: [
           { name: 'West Terrace', x: -450, z: 120, cabinCount: 7, towerCount: 1, padRadius: 125, padHeight: 46 },
@@ -831,12 +831,12 @@ export function generateTerrain(opConfig) {
         const isCharred = fireCells != null && fireCells[ci] === 14;
         for (let k = start; k < end; k++) {
           const tr = trees[treeCellIndices[k]];
-          const treeH = (isCharred ? 4.5 : 11.8) * tr.scale;
+          const treeH = (isCharred ? 9.5 : 11.8) * tr.scale;
           const relY = y - tr.y;
           if (relY < -1.0 || relY > treeH + 1.0) continue;
 
           const u = relY <= 0 ? 0 : relY >= treeH ? 1 : relY / treeH;
-          const canopyR = (isCharred ? 0.9 : 3.1 - 1.85 * u) * tr.scale;
+          const canopyR = (isCharred ? 0.7 : 3.1 - 1.85 * u) * tr.scale;
           const hitR = canopyR + aircraftRadius;
           const dx = x - tr.x;
           const dz = z - tr.z;

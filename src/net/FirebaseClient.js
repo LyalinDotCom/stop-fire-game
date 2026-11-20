@@ -86,18 +86,50 @@ export async function connectFirebase(opts = {}) {
     }
   }
 
-  // Silent anonymous authentication (zero login UI).
+  const startMs = Date.now();
+  const remainingMs = () => Math.max(250, timeoutMs - (Date.now() - startMs));
+
+  // Silent anonymous authentication (zero login UI), bounded by connectTimeoutMs.
   let user;
   try {
-    if (typeof auth.authStateReady === 'function') {
-      await auth.authStateReady();
-    }
-    user = auth.currentUser ?? (await authSdk.signInAnonymously(auth)).user;
+    user = await new Promise((resolve, reject) => {
+      let settled = false;
+      const authTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        dbSdk.goOffline(database);
+        reject(new RtdbError('offline', 'Timed out authenticating with Firebase'));
+      }, remainingMs());
+      (async () => {
+        if (typeof auth.authStateReady === 'function') {
+          await auth.authStateReady();
+        }
+        return auth.currentUser ?? (await authSdk.signInAnonymously(auth)).user;
+      })().then(
+        (u) => {
+          if (settled) {
+            dbSdk.goOffline(database);
+            return;
+          }
+          settled = true;
+          clearTimeout(authTimer);
+          resolve(u);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(authTimer);
+          reject(err);
+        }
+      );
+    });
   } catch (err) {
+    dbSdk.goOffline(database);
+    if (err instanceof RtdbError) throw err;
     throw new RtdbError(err?.code || 'auth/failed', err?.message || 'Anonymous sign-in failed');
   }
 
-  // Wait for RTDB connection (.info/connected === true).
+  // Wait for RTDB connection (.info/connected === true) within remaining connectTimeoutMs budget.
   const connected = await new Promise((resolve) => {
     let done = false;
     let off = () => {};
@@ -106,7 +138,7 @@ export async function connectFirebase(opts = {}) {
       done = true;
       off();
       resolve(false);
-    }, timeoutMs);
+    }, remainingMs());
     off = dbSdk.onValue(dbSdk.ref(database, '.info/connected'), (snap) => {
       if (!done && snap.val()) {
         done = true;

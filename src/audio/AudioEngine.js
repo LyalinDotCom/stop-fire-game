@@ -140,6 +140,7 @@ export class AudioEngine {
     this._radioBuffers = new Map();
     this._radioInflight = new Map();
     this._activeRadioStop = null;
+    this._radioHtmlAudio = null;
 
     // Edge-detection & debounce state
     this._wasReleasing = false;
@@ -171,7 +172,7 @@ export class AudioEngine {
       }
     }
 
-    if (this._ctx && this._ctx.state === 'suspended') {
+    if (this._ctx && (this._ctx.state === 'suspended' || this._ctx.state === 'interrupted')) {
       this._ctx
         .resume()
         .then(() => {
@@ -543,6 +544,9 @@ export class AudioEngine {
     if (this._musicHtmlAudio) {
       this._updateHtmlMusicVolume();
     }
+    if (this._radioHtmlAudio) {
+      this._updateHtmlRadioVolume();
+    }
     if (!this._ctx || !this._masterGain) return;
     const now = this._ctx.currentTime;
     const target = this._muted ? 0.0 : DEFAULT_MASTER_GAIN;
@@ -586,6 +590,9 @@ export class AudioEngine {
   }
 
   _applyRadioGain() {
+    if (this._radioHtmlAudio) {
+      this._updateHtmlRadioVolume();
+    }
     if (!this._ctx || !this._radioGain) return;
     const now = this._ctx.currentTime;
     this._radioGain.gain.cancelScheduledValues(now);
@@ -598,6 +605,12 @@ export class AudioEngine {
     const duck = this._musicDucked ? MUSIC_DUCK_GAIN : 1.0;
     const vol = this._muted || !this._musicEnabled ? 0 : this._musicVolume * DEFAULT_MASTER_GAIN * duck;
     this._musicHtmlAudio.volume = clamp(vol, 0, 1);
+  }
+
+  _updateHtmlRadioVolume() {
+    if (!this._radioHtmlAudio) return;
+    const vol = this._muted ? 0 : this._radioVolume * DEFAULT_MASTER_GAIN;
+    this._radioHtmlAudio.volume = clamp(vol, 0, 1);
   }
 
   // ---- Master / Bus Volume Controls ----
@@ -928,12 +941,14 @@ export class AudioEngine {
     }
     try {
       const el = new Audio(url);
-      el.volume = clamp(this._radioVolume * DEFAULT_MASTER_GAIN, 0, 1);
+      this._radioHtmlAudio = el;
+      this._updateHtmlRadioVolume();
       let settled = false;
       const done = (ok) => {
         if (settled) return;
         settled = true;
         if (this._activeRadioStop === cancel) this._activeRadioStop = null;
+        if (this._radioHtmlAudio === el) this._radioHtmlAudio = null;
         el.onended = null;
         el.onerror = null;
         resolve(ok);
@@ -969,6 +984,7 @@ export class AudioEngine {
     releasing = false,
     nearestFireDist = 9999,
     bounced = false,
+    crashed = false,
     turbulence = 0,
     smokeDensity = 0,
     heatDanger = 0,
@@ -979,11 +995,12 @@ export class AudioEngine {
 
     const now = this._ctx.currentTime;
     const smooth = 0.04;
-    const turb = clamp(Number(turbulence) || 0, 0, 1);
+    const isCrashed = Boolean(crashed);
+    const turb = isCrashed ? 0 : clamp(Number(turbulence) || 0, 0, 1);
     const smoke = clamp(Number(smokeDensity) || 0, 0, 1);
-    const heat = clamp(Number(heatDanger) || 0, 0, 1);
+    const heat = isCrashed ? 0 : clamp(Number(heatDanger) || 0, 0, 1);
     const roughAmt = typeof scoopRough === 'number' ? clamp(scoopRough, 0, 1) : scoopRough ? 1 : 0;
-    const isScoopRough = Boolean(scooping && roughAmt > 0.05);
+    const isScoopRough = Boolean(!isCrashed && scooping && roughAmt > 0.05);
 
     // Layer 1: Ambient wind bed (420 - 780 Hz; thickens subtly in dense smoke)
     const speedNorm = clamp((airspeedKmh - 115) / 95, 0, 1);
@@ -993,7 +1010,7 @@ export class AudioEngine {
     this._windFilter.frequency.setTargetAtTime(clamp(windFreq, 280, 920), now, 0.08);
     this._windGain.gain.setTargetAtTime(windVol, now, 0.08);
 
-    // Layer 2: Engine / Propeller drone (±12% RPM modulation, -4% scoop dip)
+    // Layer 2: Engine / Propeller drone (±12% RPM modulation, -4% scoop dip; cuts out cleanly while crashed)
     const rpmNorm = clamp(0.55 * throttle + 0.45 * speedNorm, 0, 1);
     const rpmMod = 0.88 + 0.24 * rpmNorm;
     const scoopFactor = scooping ? 0.96 : 1.0;
@@ -1002,9 +1019,9 @@ export class AudioEngine {
     this._engineSaw.frequency.setTargetAtTime(sawHz, now, smooth);
     this._engineSquare.frequency.setTargetAtTime(sqHz, now, smooth);
     this._engineFilter.frequency.setTargetAtTime(220 + 65 * rpmNorm, now, smooth);
-    this._engineGain.gain.setTargetAtTime(0.095 + 0.035 * rpmNorm, now, smooth);
+    this._engineGain.gain.setTargetAtTime(isCrashed ? 0.0 : 0.095 + 0.035 * rpmNorm, now, isCrashed ? 0.06 : smooth);
     this._propWashFilter.frequency.setTargetAtTime(175 + 75 * rpmNorm, now, smooth);
-    this._propWashGain.gain.setTargetAtTime(0.042 + 0.028 * rpmNorm, now, smooth);
+    this._propWashGain.gain.setTargetAtTime(isCrashed ? 0.0 : 0.042 + 0.028 * rpmNorm, now, isCrashed ? 0.06 : smooth);
 
     // Layer 3: Proximity wildfire roar (< 280 m, boosted by convective heat danger)
     const fireProx = nearestFireDist < 280 ? clamp(1 - nearestFireDist / 280, 0, 1) : 0;
@@ -1014,7 +1031,8 @@ export class AudioEngine {
     this._fireCrackleLfo.frequency.setTargetAtTime(12 + 18 * Math.max(fireProx, heat), now, 0.15);
 
     // Layer 4: Water drop whoosh (1400 -> 320 Hz over 1.25 s)
-    if (releasing) {
+    const isReleasing = Boolean(!isCrashed && releasing);
+    if (isReleasing) {
       if (!this._wasReleasing) {
         this._dropElapsed = 0;
         this._dropFilter.frequency.setValueAtTime(1400, now);
@@ -1028,10 +1046,11 @@ export class AudioEngine {
     } else {
       this._dropGain.gain.setTargetAtTime(0.0, now, 0.06);
     }
-    this._wasReleasing = Boolean(releasing);
+    this._wasReleasing = isReleasing;
 
     // Layer 6: Lake scoop skim burst + Layer 6c choppy rough pontoon slap
-    this._scoopGain.gain.setTargetAtTime(scooping ? (isScoopRough ? 0.24 : 0.2) : 0.0, now, 0.035);
+    const isScooping = Boolean(!isCrashed && scooping);
+    this._scoopGain.gain.setTargetAtTime(isScooping ? (isScoopRough ? 0.24 : 0.2) : 0.0, now, 0.035);
     if (this._scoopRoughGain && this._scoopRoughLfo) {
       this._scoopRoughGain.gain.setTargetAtTime(isScoopRough ? 0.22 * roughAmt : 0.0, now, 0.04);
       this._scoopRoughLfo.frequency.setTargetAtTime(7.5 + 4.0 * speedNorm, now, 0.08);
@@ -1685,6 +1704,7 @@ export class AudioEngine {
   dispose() {
     this._disposed = true;
     this.stopRadioClip();
+    this._radioHtmlAudio = null;
     this.stopMusic();
     this._radioBuffers.clear();
     this._radioInflight.clear();

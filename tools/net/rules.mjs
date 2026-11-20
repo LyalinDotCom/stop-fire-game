@@ -33,6 +33,7 @@ const closed = { $other: val(false) };
 
 // ── Protocol constants (kept in sync with src/net/config.js) ──
 const WORLD_ID_RE = /^megabasin-(0[1-9]|1[0-9]|20)$/;
+const PUBLIC_WORLD_ID_RE = /^megabasin-(0[1-9]|1[0-8])$/;
 const MAP_ID_RE = /^[a-z0-9_-]{2,24}$/;
 const SLOT_KEY_RE = /^([0-9]|[1-9][0-9])$/;
 const RING_KEY_RE = /^([0-9]|1[0-5])$/;
@@ -42,7 +43,9 @@ const CALLSIGN_RE = /^[A-Za-z0-9][A-Za-z0-9 _.'-]{0,15}$/;
 
 const PROTOCOL_VERSION = 1;
 const RING_SIZE = 16;
+const MIN_WORLD_TTL_MS = 3_600_000;
 const MAX_WORLD_TTL_MS = 86_400_000;
+const MAX_Q_STEP = 64;
 
 // ── Common path helpers ──
 const W = "root.child('worlds').child($w)";
@@ -90,15 +93,34 @@ const worldsIndex = {
   },
 };
 
-// ── worlds/$w/config (immutable world genesis metadata) ──
+// ── worlds/$w/config (world genesis & expired/stale shard refresh metadata) ──
 const config = {
   '.read': 'auth !== null',
   '.write': all([
     'auth !== null',
-    '!data.exists()',
     'newData.exists()',
-    "newData.parent().child('authority/uid').val() === auth.uid",
-    "newData.parent().child('authority/epoch').val() === 1",
+    any([
+      all([
+        '!data.exists()',
+        "newData.parent().child('authority/uid').val() === auth.uid",
+        "newData.parent().child('authority/epoch').val() === 1",
+      ]),
+      all([
+        'data.exists()',
+        any([
+          `data.child('expiresAt').val() <= now + ${MIN_WORLD_TTL_MS}`,
+          `${AUTH}.child('leaseUntil').val() <= now`,
+          all([`$w.matches(${re(PUBLIC_WORLD_ID_RE)})`, "data.child('cap').val() !== 100"]),
+        ]),
+        any([
+          isLiveHost,
+          all([
+            "newData.parent().child('authority/uid').val() === auth.uid",
+            "newData.parent().child('authority/leaseUntil').val() > now",
+          ]),
+        ]),
+      ]),
+    ]),
   ]),
   '.validate': all([
     "newData.hasChildren(['mode', 'mapId', 'cap', 'protocolVersion', 'buildHash', 'createdAt', 'expiresAt'])",
@@ -106,11 +128,18 @@ const config = {
   ]),
   mode: val("newData.val() === 'megabasin'"),
   mapId: val(all(['newData.isString()', `newData.val().matches(${re(MAP_ID_RE)})`])),
-  cap: val(int('newData', 1, 100)),
+  cap: val(any([
+    all([`$w.matches(${re(PUBLIC_WORLD_ID_RE)})`, 'newData.val() === 100']),
+    all([`!$w.matches(${re(PUBLIC_WORLD_ID_RE)})`, int('newData', 1, 100)]),
+  ])),
   protocolVersion: val(`newData.val() === ${PROTOCOL_VERSION}`),
   buildHash: val(all(['newData.isString()', `newData.val().matches(${re(BUILD_HASH_RE)})`])),
   createdAt: val('newData.val() === now'),
-  expiresAt: val(all(['newData.isNumber()', 'newData.val() > now', `newData.val() <= now + ${MAX_WORLD_TTL_MS}`])),
+  expiresAt: val(all([
+    'newData.isNumber()',
+    `newData.val() >= now + ${MIN_WORLD_TTL_MS}`,
+    `newData.val() <= now + ${MAX_WORLD_TTL_MS}`,
+  ])),
   ...closed,
 };
 
@@ -174,15 +203,20 @@ const authority = {
   ...closed,
 };
 
-// ── worlds/$w/slots/{0..99} (O(1) bijective slot lease) ──
+// ── worlds/$w/slots/{0..99} (O(1) bijective slot lease, presence-fenced & roster-bound) ──
 const slotLeaseWindow = all([
   "newData.child('leaseUntil').val() > now + 15000",
   "newData.child('leaseUntil').val() <= now + 45000",
 ]);
 const slotOccupantPresence = `${W}.child('presence').child(data.child('uid').val())`;
+const callerPresenceLive = all([
+  `${W}.child('presence').child(auth.uid).child('conn').val() === newData.child('conn').val()`,
+  `!${W}.child('presence').child(auth.uid).child('away').exists()`,
+]);
 const slotDelete = all([
   '!newData.exists()',
   'data.exists()',
+  "!newData.parent().parent().child('roster').child($slot).exists()",
   any([
     all([
       "data.child('uid').val() === auth.uid",
@@ -192,6 +226,7 @@ const slotDelete = all([
       isLiveHost,
       any([
         "data.child('leaseUntil').val() <= now",
+        `!${slotOccupantPresence}.exists()`,
         all([
           `${slotOccupantPresence}.child('away').val() === true`,
           `now - ${slotOccupantPresence}.child('at').val() >= 15000`,
@@ -203,7 +238,7 @@ const slotDelete = all([
 const slotClaim = all([
   any(['!data.exists()', "data.child('leaseUntil').val() <= now"]),
   "newData.parent().parent().child('config').exists()",
-  "newData.parent().parent().child('roster').child($slot).exists()",
+  "newData.parent().parent().child('roster').child($slot).child('uid').val() === auth.uid",
 ]);
 const slotSelfRenew = all([
   'data.exists()',
@@ -223,6 +258,7 @@ const slots = {
           "newData.child('uid').val() === auth.uid",
           "newData.child('at').val() === now",
           slotLeaseWindow,
+          callerPresenceLive,
           "newData.parent().parent().child('uidToSlot').child(auth.uid).val() + '' === $slot",
           any([slotClaim, slotSelfRenew]),
         ]),
@@ -258,7 +294,7 @@ const uidToSlot = {
             "newData.parent().parent().child('slots').child(data.val() + '').child('uid').val() !== auth.uid",
           ]),
           "newData.parent().parent().child('slots').child(newData.val() + '').child('uid').val() === auth.uid",
-          "newData.parent().parent().child('roster').child(newData.val() + '').exists()",
+          "newData.parent().parent().child('roster').child(newData.val() + '').child('uid').val() === auth.uid",
         ]),
         all([
           '!newData.exists()',
@@ -310,7 +346,7 @@ const roster = {
           "newData.child('uid').val() === auth.uid",
           "newData.child('at').val() === now",
           "newData.parent().parent().child('slots').child($slot).child('uid').val() === auth.uid",
-          any(['!data.exists()', "now - data.child('at').val() >= 1000"]),
+          any(['!data.exists()', "data.child('uid').val() !== auth.uid", "now - data.child('at').val() >= 1000"]),
         ]),
       ]),
     ]),
@@ -432,7 +468,7 @@ const inputs = {
   },
 };
 
-// ── worlds/$w/planes (Host-packed 12 B/plane Base64 fleet stream) ──
+// ── worlds/$w/planes (Host-packed 12 B/plane Base64 fleet stream, bounded q step) ──
 const planes = {
   '.read': 'auth !== null',
   '.write': all(['auth !== null', 'newData.exists()', isLiveHost, hostEpochMatches]),
@@ -440,11 +476,23 @@ const planes = {
     "newData.hasChildren(['e', 'q', 't', 'p'])",
     "newData.child('t').val() === now",
     any([
-      '!data.exists()',
-      "newData.child('e').val() > data.child('e').val()",
+      all(['!data.exists()', `newData.child('q').val() <= ${MAX_Q_STEP}`]),
       all([
+        'data.exists()',
+        "newData.child('e').val() > data.child('e').val()",
+        any([
+          `newData.child('q').val() <= ${MAX_Q_STEP}`,
+          all([
+            "newData.child('q').val() > data.child('q').val()",
+            `newData.child('q').val() <= data.child('q').val() + ${MAX_Q_STEP}`,
+          ]),
+        ]),
+      ]),
+      all([
+        'data.exists()',
         "newData.child('e').val() === data.child('e').val()",
         "newData.child('q').val() > data.child('q').val()",
+        `newData.child('q').val() <= data.child('q').val() + ${MAX_Q_STEP}`,
       ]),
     ]),
   ]),
@@ -455,7 +503,8 @@ const planes = {
   ...closed,
 };
 
-// ── worlds/$w/fireRing/{0..15} (2 Hz Host cellular fire delta ring buffer) ──
+// ── worlds/$w/fireRing/{0..15} (2 Hz Host cellular fire delta ring buffer, bounded q step) ──
+const fireKeyQ = `${W}.child('fireKey').child('q')`;
 const fireRing = {
   '.read': 'auth !== null',
   $slot: {
@@ -466,9 +515,31 @@ const fireRing = {
       "newData.child('t').val() === now",
       `newData.child('q').val() % ${RING_SIZE} + '' === $slot`,
       any([
-        '!data.exists()',
-        "newData.child('e').val() > data.child('e').val()",
-        "newData.child('q').val() > data.child('q').val()",
+        all([
+          '!data.exists()',
+          any([
+            `newData.child('q').val() <= ${MAX_Q_STEP}`,
+            all([`${fireKeyQ}.exists()`, `newData.child('q').val() <= ${fireKeyQ}.val() + ${MAX_Q_STEP}`]),
+          ]),
+        ]),
+        all([
+          'data.exists()',
+          "newData.child('e').val() > data.child('e').val()",
+          any([
+            `newData.child('q').val() <= ${MAX_Q_STEP}`,
+            all([
+              "newData.child('q').val() > data.child('q').val()",
+              `newData.child('q').val() <= data.child('q').val() + ${MAX_Q_STEP}`,
+            ]),
+            all([`${fireKeyQ}.exists()`, `newData.child('q').val() <= ${fireKeyQ}.val() + ${MAX_Q_STEP}`]),
+          ]),
+        ]),
+        all([
+          'data.exists()',
+          "newData.child('e').val() === data.child('e').val()",
+          "newData.child('q').val() > data.child('q').val()",
+          `newData.child('q').val() <= data.child('q').val() + ${MAX_Q_STEP}`,
+        ]),
       ]),
     ]),
     e: val(int('newData', 1, 1e9)),

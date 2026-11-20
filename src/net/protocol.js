@@ -180,7 +180,11 @@ export function encodePlanes(planes) {
     const roll7 = Math.round(((clamp(p.rollDeg ?? 0, -64, 64) + 64) / 128) * 127) & 0x7f;
     const rot24 = yaw10 | (pitch7 << 10) | (roll7 << 17);
 
-    const spd6 = Math.round((clamp(p.speedKmh ?? 158, 90, 216) - 90) / 2) & 0x3f;
+    const rawSpd = p.speedKmh ?? 158;
+    const isCrashed = Boolean(p.crashed) || rawSpd < 40;
+    const spd6 = isCrashed
+      ? 0
+      : (Math.round((clamp(rawSpd, 92, 216) - 92) / 2) + 1) & 0x3f;
     const tank5 = Math.round((clamp(p.tankPct ?? 100, 0, 100) / 100) * 31) & 0x1f;
     const flags5 = (typeof p.flags === 'number' ? p.flags : packPlaneFlags(p)) & 0x1f;
     const aux16 = spd6 | (tank5 << 6) | (flags5 << 11);
@@ -234,7 +238,8 @@ export function decodePlanes(b64) {
       yawDeg: (yaw10 / 1024) * 360,
       pitchDeg: (pitch7 / 127) * 120 - 60,
       rollDeg: (roll7 / 127) * 128 - 64,
-      speedKmh: 90 + spd6 * 2,
+      speedKmh: spd6 === 0 ? 0 : 92 + (spd6 - 1) * 2,
+      crashed: spd6 === 0,
       tankPct: (tank5 / 31) * 100,
       flags: flags5,
       releasing: (flags5 & PLANE_FLAG_RELEASING) !== 0,
@@ -487,7 +492,7 @@ export function decodeCellsRle(bytes, expectedLen) {
   return out;
 }
 
-/** Quantize active fire intensity (1..12) to 4 buckets as a last-resort compression fallback if RLE > budget. */
+/** Quantize active fire intensity (1..12) to 4 buckets as a compression fallback if RLE > budget. */
 function quantizeCellsForBudget(cells) {
   const q = new Uint8Array(cells.length);
   for (let i = 0; i < cells.length; i++) {
@@ -499,6 +504,35 @@ function quantizeCellsForBudget(cells) {
     }
   }
   return q;
+}
+
+/** Smooth short fragmented runs (length <= maxRun) into previous neighbor state to guarantee RLE fits budget. */
+function smoothFragmentedRuns(cells, maxRun = 1, coarseFire = false) {
+  const out = new Uint8Array(cells.length);
+  for (let i = 0; i < cells.length; i++) {
+    const s = cells[i] & 0x0f;
+    if (coarseFire && s >= 1 && s <= 12) {
+      out[i] = s <= 6 ? 4 : 10;
+    } else {
+      out[i] = s;
+    }
+  }
+  let i = 0;
+  while (i < out.length) {
+    const state = out[i];
+    let j = i + 1;
+    while (j < out.length && out[j] === state) j++;
+    const runLen = j - i;
+    if (runLen <= maxRun && i > 0) {
+      // Smooth isolated WET(13)/CHARRED(14)/INTACT(0)/EMBER(15) speckles (or all short runs when coarseFire)
+      if (coarseFire || state === 0 || state === 13 || state === 14 || state === 15) {
+        const fill = out[i - 1];
+        for (let k = i; k < j; k++) out[k] = fill;
+      }
+    }
+    i = j;
+  }
+  return out;
 }
 
 /**
@@ -540,14 +574,30 @@ export function encodeFireKey(state, maxChars = PAYLOAD_CAPS.fireKey) {
   };
 
   let str = JSON.stringify(payload);
+  let qCells = null;
   if (str.length > maxChars) {
     // Fallback 1: quantize active fire intensities into 4 buckets to extend RLE runs.
-    payload.r = bytesToBase64(encodeCellsRle(quantizeCellsForBudget(cells)));
+    qCells = quantizeCellsForBudget(cells);
+    payload.r = bytesToBase64(encodeCellsRle(qCells));
     str = JSON.stringify(payload);
   }
   if (str.length > maxChars && payload.s.length > 20) {
     // Fallback 2: keep top 20 slot scores.
     payload.s = payload.s.slice(0, 20);
+    str = JSON.stringify(payload);
+  }
+  if (str.length > maxChars) {
+    // Fallback 3: smooth isolated 1-cell WET/CHARRED/INTACT speckles + trim scores to top 10.
+    payload.s = payload.s.slice(0, 10);
+    qCells = smoothFragmentedRuns(qCells || quantizeCellsForBudget(cells), 1, false);
+    payload.r = bytesToBase64(encodeCellsRle(qCells));
+    str = JSON.stringify(payload);
+  }
+  for (let maxRun = 2; str.length > maxChars && maxRun <= 8; maxRun *= 2) {
+    // Fallback 4: progressive run smoothing for adversarial checkerboard grids so encodeFireKey never throws.
+    payload.s = payload.s.slice(0, 10);
+    qCells = smoothFragmentedRuns(qCells, maxRun, true);
+    payload.r = bytesToBase64(encodeCellsRle(qCells));
     str = JSON.stringify(payload);
   }
   if (str.length > maxChars) {

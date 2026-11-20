@@ -1,6 +1,6 @@
 // Thin production RtdbAdapter wrapping firebase/database SDK functions passed from FirebaseClient.
 // Zero static imports of firebase/* so Solo mode downloads 0 bytes of Firebase.
-import { RtdbAdapter, RtdbError, isServerTimestamp, normalizePath } from './RtdbAdapter.js';
+import { RtdbAdapter, RtdbError, isPermissionDenied, isServerTimestamp, normalizePath } from './RtdbAdapter.js';
 
 const RELISTEN_MIN_MS = 1000;
 const RELISTEN_MAX_MS = 15000;
@@ -158,8 +158,13 @@ export class LiveRtdbAdapter extends RtdbAdapter {
           cb(snap.val());
         },
         (err) => {
-          onError(wrapError(err));
-          if (stopped || this._closed) return;
+          const wrapped = wrapError(err);
+          onError(wrapped);
+          // Do NOT infinitely relisten on permanent PERMISSION_DENIED errors.
+          if (stopped || this._closed || isPermissionDenied(wrapped)) {
+            stopped = true;
+            return;
+          }
           timer = setTimeout(attach, wait);
           wait = Math.min(RELISTEN_MAX_MS, wait * 2);
         }

@@ -74,24 +74,43 @@ export async function pickHostableShard(adapter, {
     if (!candidates.includes(wid)) candidates.push(wid);
   }
 
-  // Pass 1: completely unused shard (neither worldsIndex nor live authority).
+  // Pass 1: completely unused shard (neither worldsIndex nor live authority; unexpired or absent config).
+  let fallbackExpired = null;
   for (const wid of candidates) {
     if (rawIndex[wid]) continue;
-    const auth = await adapter.get(`worlds/${wid}/authority`).catch(() => null);
-    if (!auth || typeof auth.leaseUntil !== 'number' || auth.leaseUntil <= now) {
+    const [auth, cfg] = await Promise.all([
+      adapter.get(`worlds/${wid}/authority`).catch(() => null),
+      adapter.get(`worlds/${wid}/config`).catch(() => null),
+    ]);
+    const authDead = !auth || typeof auth.leaseUntil !== 'number' || auth.leaseUntil <= now;
+    if (!authDead) continue;
+    const cfgHealthy = !cfg || (typeof cfg.expiresAt === 'number' && cfg.expiresAt > now + 600_000);
+    if (cfgHealthy) {
       return { worldId: wid, isFresh: !auth };
     }
+    if (!fallbackExpired) fallbackExpired = { worldId: wid, isFresh: false, expiredConfig: true };
   }
 
-  // Pass 2: stale or empty shard whose authority lease has expired.
+  // Pass 2: stale or empty shard whose authority lease has expired (preferring non-expired config first).
   for (const wid of candidates) {
     const entry = rawIndex[wid];
     const stale = !entry || !entry.updatedAt || (now - entry.updatedAt > freshMs) || (entry.players || 0) <= 0;
     if (!stale) continue;
-    const auth = await adapter.get(`worlds/${wid}/authority`).catch(() => null);
-    if (!auth || typeof auth.leaseUntil !== 'number' || auth.leaseUntil <= now) {
+    const [auth, cfg] = await Promise.all([
+      adapter.get(`worlds/${wid}/authority`).catch(() => null),
+      adapter.get(`worlds/${wid}/config`).catch(() => null),
+    ]);
+    const authDead = !auth || typeof auth.leaseUntil !== 'number' || auth.leaseUntil <= now;
+    if (!authDead) continue;
+    const cfgHealthy = !cfg || (typeof cfg.expiresAt === 'number' && cfg.expiresAt > now + 600_000);
+    if (cfgHealthy) {
       return { worldId: wid, isFresh: false };
     }
+    if (!fallbackExpired) fallbackExpired = { worldId: wid, isFresh: false, expiredConfig: true };
+  }
+
+  if (fallbackExpired) {
+    return fallbackExpired;
   }
 
   // Fallback: all 18 public shards active — return the least-populated non-full shard or megabasin-01.

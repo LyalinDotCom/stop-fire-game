@@ -24,7 +24,7 @@ uniform vec3 uDeepColor;
 uniform vec3 uShimmerColor;
 uniform vec3 uHorizonTint;
 uniform float uTime;
-uniform vec2 uWindDir;
+uniform vec2 uDriftOffset;
 
 varying vec3 vWorldPos;
 
@@ -46,9 +46,8 @@ void main() {
   float fresnel = pow(1.0 - max(viewVec.y, 0.0), 3.0);
   color = mix(color, uHorizonTint, fresnel * 0.24);
 
-  // Scrolling horizontal pale-cyan specular shimmer dashes (#9ecad0)
-  vec2 drift = vec2(uTime * 3.8, uTime * 0.9) + uWindDir * uTime * 1.6;
-  vec2 sp = p + drift;
+  // Smooth incrementally integrated downwind pale-cyan specular shimmer dashes (#9ecad0)
+  vec2 sp = p + uDriftOffset;
 
   // Layer 1: primary crisp horizontal dashes
   vec2 cell1 = vec2(floor(sp.x / 18.0), floor(sp.y / 6.5));
@@ -61,8 +60,8 @@ void main() {
     step(0.36, frac1.y) * step(frac1.y, 0.60) *
     step(0.42, pulse1);
 
-  // Layer 2: finer offset sparkle dashes
-  vec2 sp2 = p * vec2(1.0, 1.35) - drift * 0.72 + vec2(37.1, 19.4);
+  // Layer 2: finer offset sparkle dashes drifting smoothly downwind at 0.72x parallax
+  vec2 sp2 = p * vec2(1.0, 1.35) + uDriftOffset * 0.72 + vec2(37.1, 19.4);
   vec2 cell2 = vec2(floor(sp2.x / 13.0), floor(sp2.y / 5.0));
   vec2 frac2 = vec2(fract(sp2.x / 13.0), fract(sp2.y / 5.0));
   float h2 = hash21(cell2 + 17.3);
@@ -104,7 +103,7 @@ export function createWaterPlane(worldSize, waterLevel = 12.0) {
       uShimmerColor: { value: new THREE.Color('#9ecad0') },
       uHorizonTint: { value: new THREE.Color('#6e5053') },
       uTime: { value: 0 },
-      uWindDir: { value: new THREE.Vector2(1, 0) },
+      uDriftOffset: { value: new THREE.Vector2(0, 0) },
     },
   ]);
 
@@ -123,13 +122,22 @@ export function createWaterPlane(worldSize, waterLevel = 12.0) {
   mesh.position.y = waterLevel;
   mesh.name = 'AlpineWaterPlane';
 
+  let lastElapsed = 0;
+
   return {
     mesh,
     material,
-    update(elapsed, windVx = 1, windVz = 0) {
-      material.uniforms.uTime.value = elapsed;
-      const len = Math.hypot(windVx, windVz) || 1;
-      material.uniforms.uWindDir.value.set(windVx / len, windVz / len);
+    update(elapsed, windVx = 1, windVz = 0, dt = null) {
+      const safeElapsed = Number.isFinite(elapsed) ? elapsed : lastElapsed;
+      const stepDt = Number.isFinite(dt)
+        ? Math.max(0, Math.min(dt, 0.1))
+        : Math.max(0, Math.min(safeElapsed - lastElapsed, 0.1));
+      lastElapsed = safeElapsed;
+
+      material.uniforms.uTime.value = safeElapsed;
+      const drift = material.uniforms.uDriftOffset.value;
+      drift.x -= (Number.isFinite(windVx) ? windVx : 0) * 0.45 * stepDt;
+      drift.y -= (Number.isFinite(windVz) ? windVz : 0) * 0.45 * stepDt;
     },
     dispose() {
       geometry.dispose();

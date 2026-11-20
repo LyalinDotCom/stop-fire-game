@@ -29,11 +29,9 @@ function clamp(v, lo, hi) {
 
 function detectTouchDevice() {
   if (typeof window === 'undefined') return false;
-  const coarse = Boolean(
+  return Boolean(
     typeof window.matchMedia === 'function' && window.matchMedia('(pointer: coarse)').matches
   );
-  const touchPts = typeof navigator !== 'undefined' && (navigator.maxTouchPoints || 0) > 0;
-  return coarse || touchPts;
 }
 
 function hasTouchQueryParam() {
@@ -317,7 +315,7 @@ function isIgnoredTakeoverTarget(target) {
   if (!target || typeof target.closest !== 'function') return false;
   return Boolean(
     target.closest(
-      '.ef-touch-controls, .ef-topright-cluster, .ef-drawer, .ef-drawer-backdrop, .ef-overlay, button, input, select, textarea, label, a'
+      '.ef-touch-controls, .ef-topright-cluster, .ef-drawer, .ef-drawer-backdrop, .ef-overlay, .ef-overlay-card, .ef-launch-overlay, button, input, select, textarea, label, a'
     )
   );
 }
@@ -539,6 +537,7 @@ export class TouchControls {
     this._onWindowPointerUp = this._handleWindowPointerUp.bind(this);
     this._onWindowPointerDown = this._handleWindowPointerDown.bind(this);
     this._onWindowBlur = this._handleWindowBlur.bind(this);
+    this._onWindowResize = this._handleWindowResize.bind(this);
     this._onVisibilityChange = this._handleVisibilityChange.bind(this);
     this._onContextMenu = (e) => e.preventDefault();
     this._onTouchPrevent = (e) => {
@@ -566,6 +565,8 @@ export class TouchControls {
     window.addEventListener('pointercancel', this._onWindowPointerUp, { passive: true });
     window.addEventListener('pointerdown', this._onWindowPointerDown, { passive: true });
     window.addEventListener('blur', this._onWindowBlur);
+    window.addEventListener('resize', this._onWindowResize, { passive: true });
+    window.addEventListener('orientationchange', this._onWindowResize, { passive: true });
     document.addEventListener('visibilitychange', this._onVisibilityChange);
 
     // Dynamic pointer media query listener (handles responsive devtools / convertible tablets)
@@ -822,6 +823,10 @@ export class TouchControls {
     this._releaseAllPointers();
   }
 
+  _handleWindowResize() {
+    this._releaseAllPointers();
+  }
+
   _handleVisibilityChange() {
     if (document.hidden) {
       this._releaseAllPointers();
@@ -863,6 +868,8 @@ export class TouchControls {
     window.removeEventListener('pointercancel', this._onWindowPointerUp);
     window.removeEventListener('pointerdown', this._onWindowPointerDown);
     window.removeEventListener('blur', this._onWindowBlur);
+    window.removeEventListener('resize', this._onWindowResize);
+    window.removeEventListener('orientationchange', this._onWindowResize);
     document.removeEventListener('visibilitychange', this._onVisibilityChange);
 
     if (this._coarseMql && typeof this._coarseMql.removeEventListener === 'function') {

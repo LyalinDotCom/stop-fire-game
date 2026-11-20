@@ -47,6 +47,7 @@ export class InputManager {
    * @param {boolean} [opts.mouseYoke=false]
    * @param {() => void} [opts.onFlightKey]
    * @param {() => void} [opts.onFirstGesture]
+   * @param {() => void} [opts.onUserGesture]
    * @param {() => void} [opts.onToggleMute]
    * @param {() => void} [opts.onToggleDrawer]
    * @param {() => void} [opts.onEscape]
@@ -59,6 +60,7 @@ export class InputManager {
 
     this._onFlightKey = opts.onFlightKey || null;
     this._onFirstGesture = opts.onFirstGesture || null;
+    this._onUserGesture = opts.onUserGesture || null;
     this._onToggleMute = opts.onToggleMute || null;
     this._onToggleDrawer = opts.onToggleDrawer || null;
     this._onEscape = opts.onEscape || null;
@@ -70,6 +72,7 @@ export class InputManager {
     this._mouseNormX = 0;
     this._mouseNormY = 0;
     this._mouseInside = false;
+    this._mouseNeedsRecenter = false;
 
     this._gestureFired = false;
     this._lastActivityMs = performance.now();
@@ -118,14 +121,26 @@ export class InputManager {
     }
     if (typeof mouseYoke === 'boolean') {
       this._mouseYoke = mouseYoke;
-      if (!mouseYoke) this._mouseDown = false;
+      if (!mouseYoke) {
+        this._mouseDown = false;
+        this._mouseInside = false;
+        this._mouseNeedsRecenter = false;
+      }
     }
     if (typeof drawerOpen === 'boolean') {
+      const wasOpen = this._drawerOpen;
       this._drawerOpen = drawerOpen;
-      if (drawerOpen) {
+      if (drawerOpen && !wasOpen) {
+        // Only clear active flight inputs on the false -> true transition edge
         this._keys.clear();
         this._mouseDown = false;
+        this._mouseInside = false;
+        this._mouseNeedsRecenter = true;
         this._clearTouchState();
+      } else if (!drawerOpen && wasOpen) {
+        // Keep Mouse-Yoke disarmed after closing drawer via corner × until cursor re-enters center zone
+        this._mouseInside = false;
+        this._mouseNeedsRecenter = true;
       }
     }
   }
@@ -175,7 +190,7 @@ export class InputManager {
     const next = Boolean(active);
     if (next && !this._touchDrop) {
       this._dropJustPressedPending = true;
-      this._fireFirstGesture();
+      this._fireFirstGesture(true);
       this._lastActivityMs = performance.now();
       if (!this._drawerOpen && this._onFlightKey) {
         this._onFlightKey('TouchDrop');
@@ -188,10 +203,10 @@ export class InputManager {
 
   /**
    * Trigger manual-control takeover from DEMO FLIGHT (same callback as pressing a flight key)
-   * and unlock audio on first user gesture.
+   * and unlock audio on user gesture.
    */
   triggerTakeover() {
-    this._fireFirstGesture();
+    this._fireFirstGesture(true);
     this._lastActivityMs = performance.now();
     if (!this._drawerOpen && this._onFlightKey) {
       this._onFlightKey('TouchTakeover');
@@ -208,16 +223,17 @@ export class InputManager {
     this._lastActivityMs = performance.now();
   }
 
-  _fireFirstGesture() {
-    if (!this._gestureFired) {
+  _fireFirstGesture(discrete = false) {
+    if (!this._gestureFired || discrete) {
       this._gestureFired = true;
       if (this._onFirstGesture) this._onFirstGesture();
+      if (this._onUserGesture) this._onUserGesture();
     }
   }
 
   _handleKeyDown(e) {
-    // Always unlock audio on first user keydown
-    this._fireFirstGesture();
+    // Unlock / resume audio on discrete user keydown (handles iOS 'interrupted' recovery too)
+    this._fireFirstGesture(!e.repeat);
 
     const editable = isEditableTarget(e.target) || isEditableTarget(document.activeElement);
 
@@ -273,6 +289,8 @@ export class InputManager {
   _handleBlur() {
     this._keys.clear();
     this._mouseDown = false;
+    this._mouseInside = false;
+    this._gestureFired = false;
     this._clearTouchState();
   }
 
@@ -280,17 +298,23 @@ export class InputManager {
     if (document.hidden) {
       this._keys.clear();
       this._mouseDown = false;
+      this._mouseInside = false;
+      this._gestureFired = false;
       this._clearTouchState();
+    } else {
+      // Returning from lock-screen / app-switch (iOS Safari 'interrupted' audio context): re-arm gesture unlock
+      this._gestureFired = false;
     }
   }
 
   _handlePointerDown(e) {
-    this._fireFirstGesture();
+    this._fireFirstGesture(true);
     if (e.pointerType === 'touch') return;
     if (!this._mouseYoke || this._drawerOpen) return;
     if (e.button !== 0) return;
     // Only capture drop clicks directly on the game canvas (not HUD buttons)
     if (this._canvas && e.target !== this._canvas) return;
+    this._mouseNeedsRecenter = false;
     if (!this._mouseDown) {
       this._dropJustPressedPending = true;
     }
@@ -309,10 +333,22 @@ export class InputManager {
   _handlePointerMove(e) {
     if (e.pointerType === 'touch') return;
     if (!this._mouseYoke || this._drawerOpen) return;
+    // Ignore pointer moves over HUD buttons, drawers, or overlays
+    if (this._canvas && e.target && e.target !== this._canvas) return;
     const w = window.innerWidth || 1;
     const h = window.innerHeight || 1;
-    this._mouseNormX = ((e.clientX / w) - 0.5) * 2;
-    this._mouseNormY = ((e.clientY / h) - 0.5) * 2;
+    const nx = ((e.clientX / w) - 0.5) * 2;
+    const ny = ((e.clientY / h) - 0.5) * 2;
+    this._mouseNormX = nx;
+    this._mouseNormY = ny;
+    if (this._mouseNeedsRecenter) {
+      // Re-arm Mouse-Yoke only once cursor moves back near screen center/deadzone
+      if (Math.hypot(nx, ny) <= 0.35) {
+        this._mouseNeedsRecenter = false;
+        this._mouseInside = true;
+      }
+      return;
+    }
     this._mouseInside = true;
   }
 
@@ -364,6 +400,11 @@ export class InputManager {
         const mx = applyDeadzone(this._mouseNormX, 0.06);
         let my = applyDeadzone(this._mouseNormY, 0.06);
         if (this._invertPitch) my = -my;
+        const mouseActive = Math.abs(mx) > 0 || Math.abs(my) > 0 || this._mouseDown;
+        if (mouseActive) {
+          this._lastActivityMs = performance.now();
+          if (this._onFlightKey) this._onFlightKey('MouseYoke');
+        }
         if (Math.abs(mx) > Math.abs(roll)) roll = mx;
         if (Math.abs(my) > Math.abs(pitch)) pitch = my;
         if (this._mouseDown) drop = true;

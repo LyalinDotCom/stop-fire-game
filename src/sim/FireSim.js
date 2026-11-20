@@ -53,6 +53,7 @@ const ATTR_SLOTS_PER_CELL = 8; // Zero-GC fixed per-cell 3s attribution ring
 const BASE_SPREAD_RATE = 0.0065; // Solo-winnable in 2-4 min at 1 pilot; scales smoothly 1..100 via pilotScale
 
 function clamp(v, lo, hi) {
+  if (!Number.isFinite(v)) return lo;
   return v < lo ? lo : v > hi ? hi : v;
 }
 
@@ -114,11 +115,16 @@ function normalizeExternalOutcome(raw) {
 export class FireSim {
   /**
    * @param {import('./TerrainGen.js').TerrainData} terrain
-   * @param {{ isMegaBasin?: boolean, onDropOutcome?: (ev: object) => void, onWorldEvent?: (ev: object) => void }} [opts]
+   * @param {{ isMegaBasin?: boolean, rollingIntermission?: boolean, onDropOutcome?: (ev: object) => void, onWorldEvent?: (ev: object) => void }} [opts]
    */
-  constructor(terrain, { isMegaBasin = false, onDropOutcome = null, onWorldEvent = null } = {}) {
+  constructor(
+    terrain,
+    { isMegaBasin = false, rollingIntermission = undefined, onDropOutcome = null, onWorldEvent = null } = {}
+  ) {
     this.terrain = terrain;
     this.isMegaBasin = Boolean(isMegaBasin || terrain.opConfig?.mode === 'megabasin');
+    this.rollingIntermission =
+      rollingIntermission !== undefined ? Boolean(rollingIntermission) : this.isMegaBasin;
     this.gridSize = terrain.gridSize;
     this.cellSize = terrain.cellSize;
     this.cellCount = this.gridSize * this.gridSize;
@@ -350,8 +356,8 @@ export class FireSim {
    * Reset fire simulation for a given wave (wave 1 resets score; wave > 1 in rolling/Mega-Basin preserves score).
    */
   reset(wave = 1) {
-    this.wave = wave;
-    const preserveScores = this.isMegaBasin && wave > 1;
+    this.wave = Number.isFinite(wave) ? Math.max(1, Math.round(wave)) : 1;
+    const preserveScores = (this.isMegaBasin || this.rollingIntermission) && this.wave > 1;
     if (!preserveScores) {
       this.missionScore = 0;
       this.slotScores.clear();
@@ -475,6 +481,16 @@ export class FireSim {
    */
   spawnWaterParcel(slotId, x, y, z, vx, vy, vz, releaseAgl, dropId = null) {
     if (this.parcelCount >= MAX_PARCELS) return;
+    if (
+      !Number.isFinite(x) ||
+      !Number.isFinite(y) ||
+      !Number.isFinite(z) ||
+      !Number.isFinite(vx) ||
+      !Number.isFinite(vy) ||
+      !Number.isFinite(vz)
+    ) {
+      return;
+    }
     const sid = slotId ?? 0;
 
     let burst = this._activeBurstBySlot.get(sid);
@@ -757,7 +773,8 @@ export class FireSim {
    * Advance the wildfire simulation by `dt` seconds (designed for 10 Hz, dt = 0.1 s).
    */
   step(dt = 0.1, activeManualPilots = 1) {
-    const dtSafe = Math.max(0.001, Math.min(dt, 0.25));
+    const dtSafe = Number.isFinite(dt) ? Math.max(0.001, Math.min(dt, 0.25)) : 0.1;
+    const pilotsSafe = Number.isFinite(activeManualPilots) ? Math.max(1, activeManualPilots) : 1;
     this.simTime += dtSafe;
 
     const changedCells = [];
@@ -782,8 +799,11 @@ export class FireSim {
       if (this.intermissionTimer <= 0) {
         const prevReason = this.intermissionReason || 'contained';
         const fromOp = this.terrain.opConfig;
+        const fromOpId = fromOp?.id || 'op01';
+        const fromOpIndex = typeof fromOp?.opIndex === 'number' ? fromOp.opIndex : 0;
         const nextOp = getNextOperation(fromOp);
-        const nextWave = this.wave + 1;
+        const isOverrunRedeploy = prevReason === 'overrun' && !this.isMegaBasin;
+        const nextWave = isOverrunRedeploy ? 1 : this.wave + 1;
         advanceOperation = prevReason === 'contained';
 
         this.reset(nextWave);
@@ -791,15 +811,27 @@ export class FireSim {
         for (let c = 0; c < this.cabinsTotal; c++) {
           cabinChanges.push({ id: c, hp: this.cabinHp[c] });
         }
-        this._emitWorldEvent({
-          type: 'operation_advance',
-          fromOpId: fromOp?.id || 'op01',
-          fromOpIndex: typeof fromOp?.opIndex === 'number' ? fromOp.opIndex : 0,
-          nextOpId: nextOp.id,
-          nextOpIndex: nextOp.opIndex,
-          wave: nextWave,
-          reason: prevReason,
-        });
+        if (isOverrunRedeploy) {
+          this._emitWorldEvent({
+            type: 'sector_redeploy',
+            fromOpId,
+            fromOpIndex,
+            nextOpId: fromOpId,
+            nextOpIndex: fromOpIndex,
+            wave: 1,
+            reason: prevReason,
+          });
+        } else {
+          this._emitWorldEvent({
+            type: 'operation_advance',
+            fromOpId,
+            fromOpIndex,
+            nextOpId: nextOp.id,
+            nextOpIndex: nextOp.opIndex,
+            wave: nextWave,
+            reason: prevReason,
+          });
+        }
       }
       return {
         changedCells,
@@ -818,6 +850,7 @@ export class FireSim {
         windVz: this.windVz,
         status: this.status,
         intermissionTimer: this.intermissionTimer,
+        intermissionReason: this.intermissionReason,
         wave: this.wave,
         fullReset,
         advanceOperation,
@@ -832,7 +865,7 @@ export class FireSim {
 
     // 4. Cellular wildfire dynamics, ember spotting, and cabins
     if (this.status === 'active') {
-      this._stepCellular(dtSafe, activeManualPilots);
+      this._stepCellular(dtSafe, pilotsSafe);
       this._stepCabins(dtSafe, cabinChanges, scoreEvents);
     }
 
@@ -858,7 +891,7 @@ export class FireSim {
     if (this.status === 'active') {
       if (this.burningCount === 0 && this.emberCount === 0) {
         const opCfg = this.terrain.opConfig;
-        if (this.isMegaBasin) {
+        if (this.rollingIntermission) {
           this.status = 'intermission';
           this.intermissionReason = 'contained';
           this.intermissionTimer = 15.0;
@@ -876,7 +909,7 @@ export class FireSim {
           cabinsTotal: this.cabinsTotal,
         });
       } else if (this.cabinsTotal > 0 && this.cabinsAlive === 0) {
-        if (this.isMegaBasin) {
+        if (this.rollingIntermission) {
           this.status = 'intermission';
           this.intermissionReason = 'overrun';
           this.intermissionTimer = 15.0;
@@ -903,6 +936,7 @@ export class FireSim {
       windVz: this.windVz,
       status: this.status,
       intermissionTimer: this.intermissionTimer,
+      intermissionReason: this.intermissionReason,
       wave: this.wave,
       fullReset: false,
       advanceOperation: false,
@@ -1868,6 +1902,7 @@ export class FireSim {
       wave: this.wave,
       status: this.status,
       intermissionTimer: this.intermissionTimer,
+      intermissionReason: this.intermissionReason,
       fireHead: this.fireHead,
       atRiskTarget: this.atRiskTarget,
       atRiskCabin: this.atRiskTarget,
@@ -1965,6 +2000,13 @@ export class FireSim {
     if (typeof keyState.wave === 'number') this.wave = keyState.wave;
     if (typeof keyState.status === 'string') this.status = keyState.status;
     if (typeof keyState.intermissionTimer === 'number') this.intermissionTimer = keyState.intermissionTimer;
+    if (typeof keyState.intermissionReason === 'string' || keyState.intermissionReason === null) {
+      this.intermissionReason = keyState.intermissionReason;
+    } else if (this.status === 'intermission') {
+      this.intermissionReason = this.cabinsTotal > 0 && this.cabinsAlive === 0 ? 'overrun' : 'contained';
+    } else {
+      this.intermissionReason = null;
+    }
     if (typeof keyState.missionScore === 'number') this.missionScore = keyState.missionScore;
 
     if (keyState.slotScores) {
@@ -2048,6 +2090,13 @@ export class FireSim {
     if (typeof delta.wave === 'number') this.wave = delta.wave;
     if (typeof delta.status === 'string') this.status = delta.status;
     if (typeof delta.intermissionTimer === 'number') this.intermissionTimer = delta.intermissionTimer;
+    if (typeof delta.intermissionReason === 'string' || delta.intermissionReason === null) {
+      this.intermissionReason = delta.intermissionReason;
+    } else if (this.status === 'intermission') {
+      this.intermissionReason = this.cabinsTotal > 0 && this.cabinsAlive === 0 ? 'overrun' : 'contained';
+    } else if (typeof delta.status === 'string') {
+      this.intermissionReason = null;
+    }
 
     const hits = delta.scoreEvents || delta.h || [];
     for (let i = 0; i < hits.length; i++) {

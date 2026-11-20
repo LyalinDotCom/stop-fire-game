@@ -58,6 +58,7 @@ export const FLIGHT_CONSTANTS = {
 };
 
 function clamp(v, lo, hi) {
+  if (!Number.isFinite(v)) return lo;
   return v < lo ? lo : v > hi ? hi : v;
 }
 
@@ -316,8 +317,8 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   if (typeof state.scoopQuality !== 'string') state.scoopQuality = 'none';
   if (typeof state.turbTime !== 'number') state.turbTime = 0;
 
-  const dtSafe = Math.max(0, Math.min(dt, 0.05));
-  if (dtSafe <= 0) return { events };
+  if (!Number.isFinite(dt) || dt <= 0) return { events };
+  const dtSafe = Math.min(dt, 0.05);
 
   // 0. Handle active crash & 3.5 s auto-respawn timer
   if (state.crashed) {
@@ -388,9 +389,10 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
     state.bounceTimer = Math.max(0, state.bounceTimer - dtSafe);
   }
 
-  const pitchIn = clamp(input.pitch ?? 0, -1, 1);
-  const rollIn = clamp(input.roll ?? 0, -1, 1);
-  const throttleDelta = clamp(input.throttleDelta ?? 0, -1, 1);
+  const safeInput = input && typeof input === 'object' ? input : {};
+  const pitchIn = Number.isFinite(safeInput.pitch) ? clamp(safeInput.pitch, -1, 1) : 0;
+  const rollIn = Number.isFinite(safeInput.roll) ? clamp(safeInput.roll, -1, 1) : 0;
+  const throttleDelta = Number.isFinite(safeInput.throttleDelta) ? clamp(safeInput.throttleDelta, -1, 1) : 0;
 
   // Sample fire atmosphere (smoke plumes, convective thermal columns, low-altitude flame heat)
   const atm = options.atmosphere
@@ -414,15 +416,19 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   const weightAgility = 1.0 - FLIGHT_CONSTANTS.TANK_WEIGHT_PENALTY * tankNorm;
 
   // 1. Throttle & target cruise speed
+  if (!Number.isFinite(state.throttle)) state.throttle = 0.5;
   state.throttle = clamp(state.throttle + throttleDelta * 0.6 * dtSafe, 0, 1);
-  const vTargetKmh =
+  let vTargetKmh =
     FLIGHT_CONSTANTS.THROTTLE_MIN_KMH +
     (FLIGHT_CONSTANTS.THROTTLE_MAX_KMH - FLIGHT_CONSTANTS.THROTTLE_MIN_KMH) * state.throttle;
 
-  // 2. Basin perimeter fence check (guides smoothly back inward)
-  const fenceLimit = terrain.halfWorld * 0.88;
+  // 2. Basin perimeter fence check (matches TerrainGen superellipse mountain ring with >200 m turn margin on cardinals & corners)
+  const fenceRatio = 0.76;
   const hardLimit = terrain.halfWorld * 0.96;
-  const isOob = Math.abs(state.x) > fenceLimit || Math.abs(state.z) > fenceLimit;
+  const nxFence = Math.abs(state.x) / terrain.halfWorld;
+  const nzFence = Math.abs(state.z) / terrain.halfWorld;
+  const ringMetric = Math.max(Math.hypot(nxFence, nzFence) * 0.88, Math.max(nxFence, nzFence));
+  const isOob = ringMetric > fenceRatio;
   state.outOfBounds = isOob;
 
   // 3. Roll dynamics: tank-weighted bank-in, crisp auto-level when released (softened in heavy turbulence so wings genuinely rock)
@@ -431,8 +437,9 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   if (isOob) {
     const inwardYawDeg = normHeading(Math.atan2(-state.x, state.z) * RAD2DEG);
     const err = wrapDeg(inwardYawDeg - state.yawDeg);
-    const targetRoll = clamp(err * 0.9, -42, 42);
-    state.rollDeg = moveToward(state.rollDeg, targetRoll, FLIGHT_CONSTANTS.ROLL_RATE_DEG_S * dtSafe);
+    const turnDir = Math.abs(err) < 1 ? 0 : err >= 0 ? 1 : -1;
+    const targetRoll = Math.abs(err) > 36 ? turnDir * FLIGHT_CONSTANTS.MAX_ROLL_DEG : clamp(err * 1.25, -FLIGHT_CONSTANTS.MAX_ROLL_DEG, FLIGHT_CONSTANTS.MAX_ROLL_DEG);
+    state.rollDeg = moveToward(state.rollDeg, targetRoll, FLIGHT_CONSTANTS.ROLL_RATE_DEG_S * 1.35 * dtSafe);
   } else if (Math.abs(rollIn) > 0.01) {
     const bankMag = Math.abs(state.rollDeg) / FLIGHT_CONSTANTS.MAX_ROLL_DEG;
     const fineFactor = Math.sign(rollIn) === Math.sign(state.rollDeg) || Math.abs(state.rollDeg) < 10
@@ -445,24 +452,61 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   }
   state.rollDeg = clamp(state.rollDeg, -FLIGHT_CONSTANTS.MAX_ROLL_DEG, FLIGHT_CONSTANTS.MAX_ROLL_DEG);
 
-  // 4. Pitch dynamics: tank-weighted climb authority + snappy auto-trim + buoyancy relief + gentle bank-lift assist
-  if (Math.abs(pitchIn) > 0.01) {
-    const pitchWeight = pitchIn > 0 ? weightAgility : 1.0 + 0.05 * tankNorm;
-    state.pitchDeg += pitchIn * FLIGHT_CONSTANTS.PITCH_RATE_DEG_S * pitchWeight * dtSafe;
-  } else {
-    const bankTrimTarget = Math.min(2.2, (Math.abs(state.rollDeg) / FLIGHT_CONSTANTS.MAX_ROLL_DEG) * 1.8);
-    const buoyancyTrimBoost = state.releasing ? 4.2 * (state.autopilot ? 0.45 : 1.0) : 0;
-    const pitchTrimRate = FLIGHT_CONSTANTS.PITCH_TRIM_DEG_S * (1.0 - 0.65 * effectiveTurb);
-    state.pitchDeg = moveToward(state.pitchDeg, bankTrimTarget + buoyancyTrimBoost, pitchTrimRate * dtSafe);
+  // 4. Pitch dynamics: terrain-clearing climb during OOB auto-return, tank-weighted climb authority + auto-trim + buoyancy relief
+  let oobClimbing = false;
+  if (isOob) {
+    const curSurfY = Math.max(terrain.waterLevel, terrain.getHeight(state.x, state.z));
+    let oobPeakY = curSurfY;
+    const hRad = state.yawDeg * DEG2RAD;
+    const fx = Math.sin(hRad);
+    const fz = -Math.cos(hRad);
+    const rx = -fz;
+    const rz = fx;
+    const oobDists = [30, 75, 130, 195];
+    for (let i = 0; i < oobDists.length; i++) {
+      const d = oobDists[i];
+      const sx = state.x + fx * d;
+      const sz = state.z + fz * d;
+      const hc = Math.max(terrain.waterLevel, terrain.getHeight(sx, sz));
+      if (hc > oobPeakY) oobPeakY = hc;
+      const hl = Math.max(terrain.waterLevel, terrain.getHeight(sx - rx * 28, sz - rz * 28));
+      if (hl > oobPeakY) oobPeakY = hl;
+      const hr = Math.max(terrain.waterLevel, terrain.getHeight(sx + rx * 28, sz + rz * 28));
+      if (hr > oobPeakY) oobPeakY = hr;
+    }
+    // Keep turn speed tight (~142 km/h) so turn radius (~92 m) arcs cleanly inside the mountain walls
+    vTargetKmh = Math.min(vTargetKmh, 142);
+    const oobTargetY = oobPeakY + 48;
+    if (state.y < oobTargetY) {
+      oobClimbing = true;
+      const climbNeed = clamp((oobTargetY - state.y) * 0.9, 18, FLIGHT_CONSTANTS.MAX_PITCH_DEG);
+      state.pitchDeg = moveToward(
+        state.pitchDeg,
+        climbNeed,
+        FLIGHT_CONSTANTS.PITCH_RATE_DEG_S * 1.6 * dtSafe
+      );
+      vTargetKmh = 148;
+    }
+  }
+  if (!oobClimbing) {
+    if (Math.abs(pitchIn) > 0.01) {
+      const pitchWeight = pitchIn > 0 ? weightAgility : 1.0 + 0.05 * tankNorm;
+      state.pitchDeg += pitchIn * FLIGHT_CONSTANTS.PITCH_RATE_DEG_S * pitchWeight * dtSafe;
+    } else {
+      const bankTrimTarget = Math.min(2.2, (Math.abs(state.rollDeg) / FLIGHT_CONSTANTS.MAX_ROLL_DEG) * 1.8);
+      const buoyancyTrimBoost = state.releasing ? 4.2 * (state.autopilot ? 0.45 : 1.0) : 0;
+      const pitchTrimRate = FLIGHT_CONSTANTS.PITCH_TRIM_DEG_S * (1.0 - 0.65 * effectiveTurb);
+      state.pitchDeg = moveToward(state.pitchDeg, bankTrimTarget + buoyancyTrimBoost, pitchTrimRate * dtSafe);
+    }
   }
 
-  // Stall guard (< 120 km/h -> soft nose-down assist -10 deg/s until > 128 km/h)
+  // Stall guard (< 120 km/h -> soft nose-down assist -10 deg/s until > 128 km/h; suppressed during OOB peak-clearing climb)
   if (state.speedKmh < 120) {
     state.stallWarn = true;
   } else if (state.speedKmh > 128) {
     state.stallWarn = false;
   }
-  if (state.stallWarn) {
+  if (state.stallWarn && !oobClimbing) {
     state.pitchDeg -= 10 * dtSafe;
   }
 
@@ -511,15 +555,15 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
   const pitchRad = state.pitchDeg * DEG2RAD;
   const vMsPre = Math.max(state.speedKmh / 3.6, 10);
   const yawRateRad = clamp(
-    (15.2 * Math.tan(rollRad)) / vMsPre,
+    ((isOob ? 19.0 : 15.2) * Math.tan(rollRad)) / vMsPre,
     -FLIGHT_CONSTANTS.MAX_YAW_RATE_RAD_S,
     FLIGHT_CONSTANTS.MAX_YAW_RATE_RAD_S
   );
   state.yawDeg = normHeading(state.yawDeg + yawRateRad * RAD2DEG * dtSafe);
 
   // 6. Airspeed integration (heavier climb energy bleed when loaded, gentle/rough scoop drag)
-  const energyAccel = -(35.0 + 7.5 * tankNorm) * Math.sin(pitchRad);
-  const relaxAccel = (vTargetKmh - state.speedKmh) / 2.0;
+  const energyAccel = oobClimbing ? 0 : -(35.0 + 7.5 * tankNorm) * Math.sin(pitchRad);
+  const relaxAccel = (vTargetKmh - state.speedKmh) / (isOob ? 0.9 : 2.0);
   const dragAccel = state.scooping
     ? -(state.scoopQuality === 'rough' ? FLIGHT_CONSTANTS.SCOOP_DRAG * 2.1 : FLIGHT_CONSTANTS.SCOOP_DRAG)
     : 0;
@@ -720,11 +764,11 @@ export function stepFlight(state, input = {}, terrain, dt, options = {}) {
 
   // 10. Water drop, 0.25 s minimum tactical burst & upward drop buoyancy lift surge!
   const wasReleasing = state.releasing;
-  if (input.dropJustPressed && state.tankPct > 0.01 && !state.scooping) {
+  if (safeInput.dropJustPressed && state.tankPct > 0.01 && !state.scooping) {
     state.dropBurstTimer = Math.max(state.dropBurstTimer, FLIGHT_CONSTANTS.MIN_DROP_BURST_S);
   }
 
-  const wantsDrop = Boolean(input.drop) || state.dropBurstTimer > 0;
+  const wantsDrop = Boolean(safeInput.drop) || state.dropBurstTimer > 0;
   if (wantsDrop && state.tankPct > 0 && !state.scooping) {
     state.releasing = true;
     state.tankPct = Math.max(0, state.tankPct - FLIGHT_CONSTANTS.DROP_RATE * dtSafe);
@@ -889,23 +933,30 @@ export function predictDropImpact(planeState, windOrVx, terrainOrVz, fireSimOrTe
   const awz = FLIGHT_CONSTANTS.WIND_DRIFT_FACTOR * windVz;
 
   const x0 = planeState.x;
-  const y0 = planeState.y;
+  const y0 = planeState.y - 1.4;
   const z0 = planeState.z;
 
-  let vx = planeState.vx;
-  let vy = planeState.vy;
-  let vz = planeState.vz;
-  if (!Number.isFinite(vx) || !Number.isFinite(vy) || !Number.isFinite(vz)) {
-    const yawRad = (planeState.yawDeg ?? 0) * DEG2RAD;
-    const pitchRad = (planeState.pitchDeg ?? 0) * DEG2RAD;
-    const vMs = (planeState.speedKmh ?? FLIGHT_CONSTANTS.CRUISE_SPEED_KMH) / 3.6;
-    vx = Math.sin(yawRad) * Math.cos(pitchRad) * vMs;
+  // Use pure aircraft kinematic velocity (excluding upward thermal/buoyancy kicks on the airframe)
+  // so CCIP reticle, Solo drops, Host drops, and Replica drops match to 0.0 m.
+  let vx;
+  let vy;
+  let vz;
+  if (Number.isFinite(planeState.yawDeg) && Number.isFinite(planeState.speedKmh)) {
+    const yawRad = planeState.yawDeg * DEG2RAD;
+    const pitchRad = (Number.isFinite(planeState.pitchDeg) ? planeState.pitchDeg : 0) * DEG2RAD;
+    const vMs = planeState.speedKmh / 3.6;
+    const cosP = Math.cos(pitchRad);
+    vx = Math.sin(yawRad) * cosP * vMs;
     vy = Math.sin(pitchRad) * vMs;
-    vz = -Math.cos(yawRad) * Math.cos(pitchRad) * vMs;
+    vz = -Math.cos(yawRad) * cosP * vMs;
+  } else {
+    vx = Number.isFinite(planeState.vx) ? planeState.vx : 0;
+    vy = Number.isFinite(planeState.vy) ? planeState.vy : 0;
+    vz = Number.isFinite(planeState.vz) ? planeState.vz : 0;
   }
 
   const releaseGroundY = Math.max(terrain.waterLevel, terrain.getHeight(x0, z0));
-  const releaseAgl = Math.max(0, y0 - releaseGroundY);
+  const releaseAgl = Math.max(0, planeState.y - releaseGroundY);
 
   let groundY = releaseGroundY;
   let tFall = 0.4;

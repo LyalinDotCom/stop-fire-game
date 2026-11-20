@@ -57,8 +57,10 @@ const _sharedWorldTextures = {
 function getSharedWorldTextures(onLoaded) {
   if (!_sharedWorldTextures.initialized) {
     _sharedWorldTextures.initialized = true;
-    _sharedWorldTextures.terrain = makeSolidDataTexture(232, 232, 230);
-    _sharedWorldTextures.cabin = makeSolidDataTexture(168, 138, 114);
+    const fallbackTerrain = makeSolidDataTexture(232, 232, 230);
+    const fallbackCabin = makeSolidDataTexture(168, 138, 114);
+    _sharedWorldTextures.terrain = fallbackTerrain;
+    _sharedWorldTextures.cabin = fallbackCabin;
 
     if (typeof window !== 'undefined' && typeof Image !== 'undefined') {
       const loader = new THREE.TextureLoader();
@@ -75,6 +77,7 @@ function getSharedWorldTextures(onLoaded) {
           tex.needsUpdate = true;
           _sharedWorldTextures.terrain = tex;
           for (const cb of _sharedWorldTextures.listeners) cb('terrain', tex);
+          fallbackTerrain.dispose();
         },
         undefined,
         () => {}
@@ -92,6 +95,7 @@ function getSharedWorldTextures(onLoaded) {
           tex.needsUpdate = true;
           _sharedWorldTextures.cabin = tex;
           for (const cb of _sharedWorldTextures.listeners) cb('cabin', tex);
+          fallbackCabin.dispose();
         },
         undefined,
         () => {}

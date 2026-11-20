@@ -6,6 +6,7 @@
 // - Decodes planes, meta, and roster cleanly
 
 import { RING_SIZE, defaultCallsign } from './config.js';
+import { isPermissionDenied } from './RtdbAdapter.js';
 import { decodeFireDelta, decodeFireKey, decodeMeta, decodePlanes } from './protocol.js';
 
 const KEY_RETRY_MS = 500;
@@ -57,6 +58,8 @@ export class StreamClient {
 
     this._ringSnapshot = null;
     this._syncingKey = false;
+    this._initialCatchupDone = false;
+    this._permDenied = false;
     this._keyWaitAt = 0;
     this._retryAt = 0;
     this._retryTimer = null;
@@ -65,6 +68,7 @@ export class StreamClient {
     this._rosterInitialized = false;
     this._knownRosterUids = new Set();
     this.slots = {};
+    this._slotsLoaded = false;
     this.meta = null;
     this.stats = {
       keyFetches: 0,
@@ -104,6 +108,7 @@ export class StreamClient {
       }, () => {}),
       this.adapter.onValue(`${this.basePath}/slots`, (val) => {
         this.slots = val || {};
+        this._slotsLoaded = true;
         this.onSlots?.(this.slots);
       }, () => {}),
     ];
@@ -215,8 +220,8 @@ export class StreamClient {
     );
   }
 
-  _pumpRing() {
-    if (this.stopped || this._syncingKey || !this._ringSnapshot) return;
+  _pumpRing({ suppressEvents = false } = {}) {
+    if (this.stopped || this._syncingKey || this._permDenied || !this._ringSnapshot) return;
 
     // If a wave or operation resync is pending and retry time passed, fetch fireKey first!
     if (this._needsOperationOrWaveSync() && this._nowFn() >= this._retryAt) {
@@ -247,10 +252,13 @@ export class StreamClient {
       return;
     }
 
+    const quiet = suppressEvents || !this._initialCatchupDone;
+
     if (maxEpoch < this.lastFireEpoch) return;
     if (maxEpoch > this.lastFireEpoch) {
       const gap = maxQForMaxEpoch - this.lastFireQ;
-      if (gap >= RING_SIZE || gap < 0) {
+      // gap <= 0 handles divergent failover delta rewrites at the same or reset q!
+      if (gap >= RING_SIZE || gap <= 0) {
         this.stats.gapsDetected++;
         this.resyncFireKey();
         return;
@@ -267,12 +275,16 @@ export class StreamClient {
         }
       }
       for (let q = this.lastFireQ + 1; q <= maxQForMaxEpoch; q++) {
-        if (!this._applyDeltaEntry(byQ.get(q))) return;
+        if (!this._applyDeltaEntry(byQ.get(q), { suppressEvents: quiet })) return;
       }
+      this._initialCatchupDone = true;
       return;
     }
 
-    if (maxQForMaxEpoch <= this.lastFireQ) return;
+    if (maxQForMaxEpoch <= this.lastFireQ) {
+      this._initialCatchupDone = true;
+      return;
+    }
     if (maxQForMaxEpoch - this.lastFireQ >= RING_SIZE) {
       this.stats.gapsDetected++;
       this.resyncFireKey();
@@ -291,11 +303,12 @@ export class StreamClient {
         this.resyncFireKey();
         return;
       }
-      if (!this._applyDeltaEntry(entry)) return;
+      if (!this._applyDeltaEntry(entry, { suppressEvents: quiet })) return;
     }
+    this._initialCatchupDone = true;
   }
 
-  _applyDeltaEntry(entry) {
+  _applyDeltaEntry(entry, { suppressEvents = false } = {}) {
     try {
       const delta = decodeFireDelta(entry.d);
 
@@ -320,13 +333,13 @@ export class StreamClient {
       }
 
       const dirtyIndices = this.fireSim ? this.fireSim.applyExternalDelta(delta) : [];
-      if (delta.scoreEvents?.length) {
+      if (!suppressEvents && delta.scoreEvents?.length) {
         this.onScoreEvents?.(delta.scoreEvents);
       }
-      if (delta.dropOutcomes?.length) {
+      if (!suppressEvents && delta.dropOutcomes?.length) {
         this.onDropOutcomes?.(delta.dropOutcomes);
       }
-      this.onFireDelta?.(delta, { epoch: entry.e, q: entry.q, dirtyIndices });
+      this.onFireDelta?.(delta, { epoch: entry.e, q: entry.q, dirtyIndices, suppressEvents });
 
       if (waveAdvanced) {
         this.resyncFireKey({ forWave: true });
@@ -340,7 +353,7 @@ export class StreamClient {
 
   /** One-shot get(fireKey) on cold start, ring gap > 15, epoch jump, Operation change, or Wave 2+ rollover. */
   async resyncFireKey({ forWave = false } = {}) {
-    if (this.stopped || this._syncingKey) return false;
+    if (this.stopped || this._syncingKey || this._permDenied) return false;
     const now = this._nowFn();
     if (!forWave && now < this._retryAt) return false;
 
@@ -360,10 +373,11 @@ export class StreamClient {
         const decoded = decodeFireKey(key.d);
         const keyWave = decoded.wave || 1;
         const keyOpIndex = typeof decoded.opIndex === 'number' ? decoded.opIndex : this.currentOpIndex;
+        const epochAdvanced = key.e > this.lastFireEpoch;
         const satisfiesWave = this._wantWave > this.currentWave && keyWave >= this._wantWave;
         const satisfiesOp = this._wantOpIndex !== null && keyOpIndex === this._wantOpIndex;
         const opDiffers = keyOpIndex !== this.currentOpIndex;
-        const isNewer = key.e > this.lastFireEpoch || (key.e === this.lastFireEpoch && key.q > this.lastFireQ);
+        const isNewer = epochAdvanced || (key.e === this.lastFireEpoch && key.q > this.lastFireQ);
 
         if (satisfiesOp || opDiffers || satisfiesWave || isNewer || this.lastFireQ < 0) {
           if (opDiffers) {
@@ -371,23 +385,35 @@ export class StreamClient {
             await this.onOperationChange?.(keyOpIndex, decoded);
             if (this.stopped) return false;
           }
-          if (this._wantOpIndex === keyOpIndex) this._wantOpIndex = null;
+          // Newer-epoch fireKey from a failover Host is authoritative: clear stale pending targets so
+          // Replicas never deadlock waiting for an aborted pre-failover op/wave!
+          if (epochAdvanced) {
+            this._wantOpIndex = null;
+            this._wantWave = 0;
+          } else {
+            if (this._wantOpIndex === keyOpIndex) this._wantOpIndex = null;
+            if (this._wantWave <= keyWave) this._wantWave = 0;
+          }
           this.lastFireEpoch = key.e;
           this.lastFireQ = key.q;
           this.currentWave = keyWave;
-          if (this._wantWave <= keyWave) this._wantWave = 0;
           this.fireSim?.applyExternalKey(decoded);
           this.onFireKey?.(decoded, { epoch: key.e, q: key.q, t: key.t });
         }
       }
-    } catch {
-      // Throttled retry below.
+    } catch (err) {
+      if (isPermissionDenied(err)) {
+        // Permanent PERMISSION_DENIED (e.g. invalid shard): stop infinite 500 ms polling loop.
+        this._permDenied = true;
+        return false;
+      }
+      // Throttled retry below for transient network errors.
     } finally {
       this._keyWaitAt = 0;
       this._syncingKey = false;
     }
 
-    if (this.stopped) return false;
+    if (this.stopped || this._permDenied) return false;
 
     const stillNeedsSync = this._needsOperationOrWaveSync();
     const madeProgress =
@@ -412,7 +438,10 @@ export class StreamClient {
       return madeProgress;
     }
 
-    this._pumpRing();
+    // Suppress stale VFX/radio replay during cold-start ring catch-up right after initial fireKey.
+    const coldCatchup = !this._initialCatchupDone;
+    this._pumpRing({ suppressEvents: coldCatchup });
+    this._initialCatchupDone = true;
     return true;
   }
 

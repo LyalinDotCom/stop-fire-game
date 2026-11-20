@@ -11,7 +11,7 @@ const MAX_FLAMES = 3200;
 const MAX_EMBER_BEDS = 1400;
 const MAX_EMBERS = 1200;
 const MAX_SMOKE = 480;
-const MAX_WATER_PUFFS = 520;
+const MAX_WATER_PUFFS = 2048;
 const MAX_STEAM_PUFFS = 540;
 const MAX_WAKE_PUFFS = 220;
 const MAX_IMPACT_RINGS = 24;
@@ -771,11 +771,30 @@ export class VfxSystem {
 
   /**
    * Spawns ballistic billowing water drop curtain puffs following exact FlightModel/FireSim physics.
+   * Optional 9th arg `{ burstCount, protectActive }` lets distant remote drops throttle emission
+   * without overwriting fresh active curtains (`age < 1.2s`).
    */
-  spawnDropVisual(x, y, z, vx, vy, vz, windVx, windVz) {
-    const burstCount = 6;
+  spawnDropVisual(x, y, z, vx, vy, vz, windVx, windVz, options = null) {
+    const burstCount =
+      options && Number.isFinite(options.burstCount)
+        ? Math.max(1, Math.min(12, Math.floor(options.burstCount)))
+        : 6;
+    const protectActive = Boolean(options && options.protectActive);
+
     for (let k = 0; k < burstCount; k++) {
-      const i = this._waterCursor;
+      let i = this._waterCursor;
+      if (protectActive) {
+        let found = -1;
+        for (let step = 0; step < 24; step++) {
+          const cand = (i + step) % MAX_WATER_PUFFS;
+          if (this._waterLife[cand] <= 0 || this._waterAge[cand] >= 1.2) {
+            found = cand;
+            break;
+          }
+        }
+        if (found === -1) continue;
+        i = found;
+      }
       this._waterCursor = (i + 1) % MAX_WATER_PUFFS;
       const o3 = i * 3;
       const o2 = i * 2;
@@ -1090,7 +1109,17 @@ export class VfxSystem {
   /**
    * Advances all VFX pools and updates GPU buffers for the current frame.
    */
-  update({ dt, elapsed, localAircraft, remotePlanes, fireSnapshot, showDropReticle, dropPreview, atmosphere = null }) {
+  update({
+    dt,
+    elapsed,
+    localAircraft,
+    remotePlanes,
+    fireSnapshot,
+    showDropReticle,
+    dropPreview,
+    atmosphere = null,
+    cameraPos = null,
+  }) {
     const safeDt = Math.min(dt || 0.016, 0.05);
     const terrain = this.terrain;
     const gs = terrain.gridSize;
@@ -1220,23 +1249,33 @@ export class VfxSystem {
     this._remoteDropAccum += safeDt;
     if (this._remoteDropAccum >= 0.09 && remotePlanes && remotePlanes.length > 0) {
       this._remoteDropAccum = 0;
+      const refX = cameraPos ? cameraPos.x : localAircraft ? localAircraft.x : null;
+      const refZ = cameraPos ? cameraPos.z : localAircraft ? localAircraft.z : null;
       for (let i = 0; i < remotePlanes.length; i++) {
         const rp = remotePlanes[i];
-        if (rp.releasing) {
-          const yawRad = (rp.yawDeg || 0) * (Math.PI / 180);
-          const vMs = (rp.speedKmh || 158) / 3.6;
-          this.spawnDropVisual(
-            rp.x, rp.y - 1.2, rp.z,
-            Math.sin(yawRad) * vMs, 0, -Math.cos(yawRad) * vMs,
-            windVx, windVz
-          );
+        if (!rp.releasing) continue;
+        let burstCount = 6;
+        if (refX !== null && refZ !== null) {
+          const dist = Math.hypot(rp.x - refX, rp.z - refZ);
+          if (dist > 650) continue;
+          if (dist > 220) burstCount = 2;
         }
+        const yawRad = (rp.yawDeg || 0) * (Math.PI / 180);
+        const pitchRad = (rp.pitchDeg || 0) * (Math.PI / 180);
+        const vMs = (rp.speedKmh || 158) / 3.6;
+        const cosP = Math.cos(pitchRad);
+        this.spawnDropVisual(
+          rp.x, rp.y - 1.2, rp.z,
+          Math.sin(yawRad) * cosP * vMs, Math.sin(pitchRad) * vMs, -Math.cos(yawRad) * cosP * vMs,
+          windVx, windVz,
+          { burstCount, protectActive: true }
+        );
       }
     }
 
     // 5. Step & upload particle/instanced pools
     this._updateEmbers(safeDt, elapsed);
-    this._updateSmoke(safeDt);
+    this._updateSmoke(safeDt, cameraPos);
     this._updateWaterPuffs(safeDt);
     this._updateSteamPuffs(safeDt);
     this._updateWakes(safeDt);
@@ -1405,7 +1444,7 @@ export class VfxSystem {
     const onTarget = Boolean(dropPreview.onTarget || (dropPreview.fireCellsInTarget > 0));
     const nearDist = Number.isFinite(dropPreview.nearFireDistM) ? dropPreview.nearFireDistM : Infinity;
     const isNear = !onTarget && nearDist < 80;
-    const isTooHigh = altZone === 'too_high';
+    const isTooHigh = altZone === 'too_high' && (onTarget || nearDist < 135);
     const isLowDanger = (altZone === 'too_low' && (onTarget || nearDist < 90)) || heatDanger > 0.22;
 
     // Swap concentrated CCIP ring vs wide dashed mist ring when flying too high
@@ -1633,8 +1672,13 @@ export class VfxSystem {
     }
   }
 
-  _updateSmoke(dt) {
+  _updateSmoke(dt, cameraPos = null) {
     let visibleCount = 0;
+    const hasCam = Boolean(cameraPos);
+    const camX = hasCam ? cameraPos.x : 0;
+    const camY = hasCam ? cameraPos.y : 0;
+    const camZ = hasCam ? cameraPos.z : 0;
+
     for (let i = 0; i < MAX_SMOKE; i++) {
       const maxLife = this._smokeLife[i];
       if (maxLife <= 0) continue;
@@ -1648,10 +1692,21 @@ export class VfxSystem {
       const o3 = i * 3;
       const o2 = i * 2;
 
-      this._smokePos[o3] += this._smokeVel[o3] * dt;
-      this._smokePos[o3 + 1] += this._smokeVel[o3 + 1] * (1.0 - t * 0.35) * dt;
-      this._smokePos[o3 + 2] += this._smokeVel[o3 + 2] * dt;
+      const px = this._smokePos[o3] + this._smokeVel[o3] * dt;
+      const py = this._smokePos[o3 + 1] + this._smokeVel[o3 + 1] * (1.0 - t * 0.35) * dt;
+      const pz = this._smokePos[o3 + 2] + this._smokeVel[o3 + 2] * dt;
+      this._smokePos[o3] = px;
+      this._smokePos[o3 + 1] = py;
+      this._smokePos[o3 + 2] = pz;
       this._smokeRot[o2] += this._smokeRot[o2 + 1] * dt;
+
+      // Skip submitting puffs centered directly inside the camera lens; shader smoothstep handles 10..34m fade
+      if (hasCam) {
+        const dx = px - camX;
+        const dy = py - camY;
+        const dz = pz - camZ;
+        if (dx * dx + dy * dy + dz * dz < 100.0) continue;
+      }
 
       const s = this._smokeBaseScale[i] * (0.75 + t * 2.45);
       const fadeIn = Math.min(1.0, t / 0.14);
@@ -1659,7 +1714,7 @@ export class VfxSystem {
       const opacity = fadeIn * fadeOut * 0.86;
       const fireGlow = Math.max(0.0, 1.0 - t * 1.8) * (this._smokeGlowBoost[i] || 0.88);
 
-      this._pos.set(this._smokePos[o3], this._smokePos[o3 + 1], this._smokePos[o3 + 2]);
+      this._pos.set(px, py, pz);
       this._euler.set(this._smokeRot[o2] * 0.5, this._smokeRot[o2], 0, 'YXZ');
       this._quat.setFromEuler(this._euler);
       this._scale.set(s * 1.15, s * 0.88, s * 1.15);

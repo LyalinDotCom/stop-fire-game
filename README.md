@@ -1,4 +1,4 @@
-# EMBER FRONT — Aerial Fire Response Unit (`v0.4.0`)
+# EMBER FRONT — Aerial Fire Response Unit (`v0.5.0`)
 
 Stylized retro-3D arcade aerial firefighting game built with Three.js, Vite, Web Audio + VHF radio comms, and zero-login 100-player Firebase Realtime Database (RTDB) multiplayer.
 

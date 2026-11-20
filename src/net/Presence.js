@@ -3,6 +3,7 @@
 // - Commits `this.connId` ONLY after server ack (prevents un-acked connId on in/$uid and double-write races)
 // - Resolves `this.ready` with null on stop() so callers never hang mid-connect
 
+import { WORLD_ID_RE } from './config.js';
 import { isPermissionDenied } from './RtdbAdapter.js';
 
 const CONN_ALPHABET = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
@@ -118,9 +119,17 @@ export class Presence {
       this._resolveReady?.(id);
       this._resolveReady = null;
       return true;
-    } catch {
+    } catch (err) {
       if (!committed) {
         // Do not overwrite last known good connId on failed write.
+      }
+      const permDenied = isPermissionDenied(err);
+      const invalidWorld = !WORLD_ID_RE.test(this.worldId);
+      // Halt permanent PERMISSION_DENIED loops (e.g. invalid shard ID or repeated denials) and unblock `ready`.
+      if (permDenied && (invalidWorld || this._failures >= 1)) {
+        this._resolveReady?.(null);
+        this._resolveReady = null;
+        return false;
       }
       if (!this.stopped) {
         const wait = RETRY_MS[Math.min(this._failures++, RETRY_MS.length - 1)];

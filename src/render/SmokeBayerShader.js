@@ -7,11 +7,11 @@ attribute float aOpacity;
 attribute float aFireGlow;
 
 varying vec3 vWorldNormal;
+varying vec3 vWorldPos;
 varying float vOpacity;
 varying float vFireGlow;
 
 void main() {
-  vOpacity = aOpacity;
   vFireGlow = aFireGlow;
 
   mat4 instMat = mat4(1.0);
@@ -21,7 +21,16 @@ void main() {
 
   vec4 localPos = instMat * vec4(position, 1.0);
   vec4 worldPosition = modelMatrix * localPos;
+  vec4 centerWorld = modelMatrix * (instMat * vec4(0.0, 0.0, 0.0, 1.0));
+  vWorldPos = worldPosition.xyz;
   vWorldNormal = normalize(mat3(modelMatrix) * mat3(instMat) * normal);
+
+  // Smooth camera-proximity screen-door fade so close smoke puffs never blind the chase camera or hero plane
+  float camDist = min(
+    length(cameraPosition - worldPosition.xyz),
+    length(cameraPosition - centerWorld.xyz)
+  );
+  vOpacity = aOpacity * smoothstep(10.0, 34.0, camDist);
 
   vec4 mvPosition = viewMatrix * worldPosition;
   gl_Position = projectionMatrix * mvPosition;
@@ -40,6 +49,7 @@ uniform vec3 uFireUnderlight;
 uniform vec3 uSunDir;
 
 varying vec3 vWorldNormal;
+varying vec3 vWorldPos;
 varying float vOpacity;
 varying float vFireGlow;
 
@@ -59,8 +69,10 @@ float bayer4x4(vec2 p) {
 }
 
 void main() {
+  float fragCamDist = length(cameraPosition - vWorldPos);
+  float opacity = vOpacity * smoothstep(10.0, 26.0, fragCamDist);
   float threshold = bayer4x4(gl_FragCoord.xy);
-  if (vOpacity <= threshold) {
+  if (opacity <= threshold) {
     discard;
   }
 

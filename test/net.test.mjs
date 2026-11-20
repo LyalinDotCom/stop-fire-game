@@ -8,6 +8,7 @@ import { MEGA_BASIN_OP, OPERATIONS } from '../src/config/operations.js';
 import { FireSim } from '../src/sim/FireSim.js';
 import { generateTerrain } from '../src/sim/TerrainGen.js';
 
+import { AuthorityElection } from '../src/net/AuthorityElection.js';
 import { HostBroadcaster } from '../src/net/HostBroadcaster.js';
 import { Link, STALL_KICK_SEC } from '../src/net/Link.js';
 import { buildLobbyInviteUrl, listLiveLobbies, pickHostableShard } from '../src/net/LobbyDirectory.js';
@@ -17,6 +18,7 @@ import { PlaneInterpolator, shortestAngleDeltaDeg } from '../src/net/PlaneInterp
 import { Presence } from '../src/net/Presence.js';
 import { isPermissionDenied } from '../src/net/RtdbAdapter.js';
 import { SlotAllocator, WORLD_TTL_MS } from '../src/net/SlotAllocator.js';
+import { StreamClient } from '../src/net/StreamClient.js';
 import { WorldSession } from '../src/net/WorldSession.js';
 import { parseNetQuery, sanitizeCallsign } from '../src/net/config.js';
 import {
@@ -935,7 +937,8 @@ test('Audit #4: Expired uidToSlot reload re-claims same slot index with 0 reject
   hub.advanceTime(50000);
   const rejBefore = hub.stats.rejectedWrites;
 
-  // Simulate tab reload with same browserLocalPersistence UID and fresh connId
+  // Simulate tab reload with same browserLocalPersistence UID and fresh acked presence connId
+  await client.set(`worlds/${WORLD_ID}/presence/reloader-1`, { conn: 'ConnReload02', at: client.serverTimestamp() });
   const alloc = new SlotAllocator(client, WORLD_ID, { nowFn: () => hub.now() });
   const res = await alloc.claim({ callsign: 'RELOAD-23', colorIdx: 3, connId: 'ConnReload02', buildHash: BUILD_HASH });
   assert.equal(res.seated, true, 'reload after expired slot must re-seat cleanly');
@@ -2353,4 +2356,235 @@ test('#77: 300-frame 60 Hz quantitative smoothness under 220 ms inputs, ±120 ms
 
   hbB?.stop();
   hbA.stop();
+});
+
+// ============================================================================
+// 11. #90 CARBON HIGH MULTIPLAYER, SECURITY RULES & EDGE-CASE REGRESSION SUITE
+// ============================================================================
+test('#90 #1, #5 & #12: 23-hr config refresh, public cap=100 & expiresAt>=1h DoS defense, bounded q<=+64, presence-fenced slots & orphan GC', async () => {
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const worldId = 'megabasin-11';
+  const attacker = hub.createClient('dos-uid');
+  await attacker.set(`worlds/${worldId}/presence/dos-uid`, { conn: 'ConnDos00001', at: attacker.serverTimestamp() });
+  const t0 = hub.now();
+
+  // DoS 1: public shard with cap=1 MUST be denied!
+  await assert.rejects(
+    attacker.update(`worlds/${worldId}`, {
+      config: { mode: 'megabasin', mapId: 'op01', cap: 1, protocolVersion: 1, buildHash: BUILD_HASH, createdAt: attacker.serverTimestamp(), expiresAt: t0 + WORLD_TTL_MS },
+      authority: { uid: 'dos-uid', epoch: 1, rev: 0, leaseUntil: t0 + 8000 },
+      'slots/0': { uid: 'dos-uid', conn: 'ConnDos00001', at: attacker.serverTimestamp(), leaseUntil: t0 + 40000 },
+      'uidToSlot/dos-uid': 0,
+      'roster/0': { uid: 'dos-uid', name: 'DOS', color: 0, at: attacker.serverTimestamp() },
+    }),
+    /PERMISSION_DENIED/
+  );
+
+  // DoS 2: expiresAt < now + 3600000 (1 second TTL) MUST be denied!
+  await assert.rejects(
+    attacker.update(`worlds/${worldId}`, {
+      config: { mode: 'megabasin', mapId: 'op01', cap: 100, protocolVersion: 1, buildHash: BUILD_HASH, createdAt: attacker.serverTimestamp(), expiresAt: t0 + 1000 },
+      authority: { uid: 'dos-uid', epoch: 1, rev: 0, leaseUntil: t0 + 8000 },
+      'slots/0': { uid: 'dos-uid', conn: 'ConnDos00001', at: attacker.serverTimestamp(), leaseUntil: t0 + 40000 },
+      'uidToSlot/dos-uid': 0,
+      'roster/0': { uid: 'dos-uid', name: 'DOS', color: 0, at: attacker.serverTimestamp() },
+    }),
+    /PERMISSION_DENIED/
+  );
+
+  // Legitimate bootstrap on megabasin-11
+  const { host } = await bootstrapWorld(hub, 'host-1', worldId);
+
+  // #90 #5: q = 1,000,000,000 poisoning on planes and fireRing MUST be denied!
+  await assert.rejects(
+    host.set(`worlds/${worldId}/planes`, { e: 1, q: 1_000_000_000, t: host.serverTimestamp(), p: '' }),
+    /PERMISSION_DENIED/
+  );
+  await assert.rejects(
+    host.set(`worlds/${worldId}/fireRing/0`, { e: 1, q: 999_999_984, t: host.serverTimestamp(), d: '{"w":[0,0],"ms":0}' }),
+    /PERMISSION_DENIED/
+  );
+
+  // #90 #12: Presence-less slot squatting MUST be denied!
+  const squatter = hub.createClient('squat-1');
+  await assert.rejects(
+    squatter.update(`worlds/${worldId}`, {
+      'slots/7': { uid: 'squat-1', conn: 'ConnSquat001', at: squatter.serverTimestamp(), leaseUntil: hub.now() + 40000 },
+      'uidToSlot/squat-1': 7,
+      'roster/7': { uid: 'squat-1', name: 'SQUAT', color: 1, at: squatter.serverTimestamp() },
+    }),
+    /PERMISSION_DENIED/
+  );
+
+  // #90 #1: Advance 24 hours past config.expiresAt -> new host MUST cleanly refresh config & publish worldsIndex!
+  hub.advanceTime(24 * 3600 * 1000);
+  const newHost = hub.createClient('host-day2');
+  await newHost.set(`worlds/${worldId}/presence/host-day2`, { conn: 'ConnDay20001', at: newHost.serverTimestamp() });
+  const alloc = new SlotAllocator(newHost, worldId, { nowFn: () => hub.now() });
+  const claim = await alloc.claim({ callsign: 'DAY2', colorIdx: 2, connId: 'ConnDay20001', buildHash: BUILD_HASH });
+  assert.equal(claim.seated, true, 'must seat cleanly after 24h config expiry');
+  assert.equal(claim.createdWorld, true, 'must atomically refresh expired config + authority');
+  assert.ok(hub.inspect(`worlds/${worldId}/config/expiresAt`) > hub.now() + 20 * 3600 * 1000);
+
+  // Verify HostBroadcaster publishes worldsIndex cleanly and sweeps orphan roster/presence/in leaves!
+  const op0 = OPERATIONS[0];
+  const terrain = generateTerrain(op0);
+  hub._root.worlds[worldId].roster['88'] = { uid: 'ghost-88', name: 'GHOST', color: 0, at: hub.now() - 60000 };
+  hub._root.worlds[worldId].presence['ghost-88'] = { conn: 'ConnGhost088', at: hub.now() - 60000, away: true };
+  hub._root.worlds[worldId].in = hub._root.worlds[worldId].in || {};
+  hub._root.worlds[worldId].in['ghost-88'] = { s: 1, t: hub.now() - 60000, c: 'ConnGhost088', d: '[0,0,0,0,0,0,158,0,0]' };
+
+  const hb = new HostBroadcaster(newHost, worldId, {
+    terrain, fireSim: new FireSim(terrain, { isMegaBasin: true }),
+    epoch: claim.initialAuthority.epoch, opIndex: 0, buildHash: BUILD_HASH, localSlotId: claim.slotId,
+    enableBackgroundTicker: false,
+  });
+  await hb.start({ forceFreshMission: true });
+  assert.equal(hub.inspect(`worldsIndex/${worldId}/players`), 1, 'worldsIndex published cleanly after 24h config refresh');
+  await hb.evictDeadSlots();
+  assert.equal(hub.inspect(`worlds/${worldId}/roster/88`), null, 'orphan roster/88 swept');
+  assert.equal(hub.inspect(`worlds/${worldId}/presence/ghost-88`), null, 'orphan presence swept');
+  assert.equal(hub.inspect(`worlds/${worldId}/in/ghost-88`), null, 'orphan in/$uid swept');
+  hb.stop();
+});
+
+test('#90 #3 & #7: encodePlanes preserves 0 km/h crashed planes (no underground burrow) & encodeFireKey fits fragmented 160x160 grid', () => {
+  // #90 #3: crashed plane encodes speedKmh=0 and stays stationary in PlaneInterpolator!
+  const wire = encodePlanes([
+    { slotId: 4, x: 100, y: 25, z: 100, yawDeg: 0, pitchDeg: 0, rollDeg: 0, speedKmh: 0, crashed: true, tankPct: 0 },
+    { slotId: 5, x: 200, y: 80, z: 200, yawDeg: 90, pitchDeg: 0, rollDeg: 0, speedKmh: 158, tankPct: 80 },
+  ]);
+  const dec = decodePlanes(wire);
+  assert.equal(dec[0].speedKmh, 0, 'crashed plane must decode to 0 km/h');
+  assert.equal(dec[0].crashed, true);
+  assert.ok(Math.abs(dec[1].speedKmh - 158) <= 2, `flying plane must decode near 158 km/h (got ${dec[1].speedKmh})`);
+
+  const interp = new PlaneInterpolator();
+  for (let i = 0; i < 20; i++) {
+    interp.pushSnapshot([dec[0]], 1000 + i * 125, null, 1000 + i * 125);
+  }
+  const afterCrash = interp.sample(3200)[0];
+  assert.ok(afterCrash, 'crashed plane still renders');
+  assert.equal(Math.hypot(afterCrash.x - 100, afterCrash.z - 100), 0, 'crashed plane must NOT burrow underground');
+
+  // #90 #7: adversarial 160x160 checkerboard grid + 100 scores NEVER throws > 12288 chars!
+  const cells = new Uint8Array(160 * 160);
+  for (let i = 0; i < cells.length; i++) {
+    cells[i] = (i % 2 === 0) ? 13 : ((i % 3 === 0) ? 14 : (i % 5 === 0 ? 0 : 7));
+  }
+  const scores = new Map();
+  for (let s = 0; s < 100; s++) scores.set(s, 500 + s * 70);
+  const keyStr = encodeFireKey({
+    gridSize: 160, cells, cabinHp: new Uint8Array(10).fill(100),
+    windDirDeg: 90, windSpeedKt: 12, wave: 1, opIndex: 0, missionScore: 50000, status: 'active',
+    intermissionTimer: 0, slotScores: scores,
+  });
+  assert.ok(keyStr.length <= 12288, `fragmented 160x160 fireKey must fit <= 12288 chars (got ${keyStr.length})`);
+  const decodedKey = decodeFireKey(keyStr);
+  assert.equal(decodedKey.cells.length, 160 * 160);
+});
+
+test('#90 #2, #4, #6.4, #9, #10 & #15: invalid shard halts PERMISSION_DENIED loops, vacate awaits claim, slot eviction/recycle resets track, abdicate cooldown stops thrash, static host no 340m drift', async () => {
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+
+  // #90 #2: Invalid world ID halts Presence & StreamClient immediately (no infinite hang/loop!)
+  const badClient = hub.createClient('bad-link-u');
+  const badLink = new Link(badClient, { nowFn: () => hub.now(), disableTicker: true });
+  const badPres = new Presence(badClient, 'invalid-room-99', badLink, { nowFn: () => hub.now() });
+  const readyRes = await badPres.ready;
+  assert.equal(readyRes, null, 'Presence on invalid shard must resolve ready with null instead of hanging forever');
+  await badPres.stop();
+
+  const badStream = new StreamClient(badClient, 'invalid-room-99', { nowFn: () => hub.now() });
+  await badStream.start();
+  assert.equal(badStream._permDenied, true, 'StreamClient must halt polling on permanent PERMISSION_DENIED');
+  badStream.stop();
+
+  // #90 #6.4: SlotAllocator.vacate() awaits in-flight claim() leaving 0 orphaned leaves!
+  const worldId = 'megabasin-12';
+  await bootstrapWorld(hub, 'host-r', worldId);
+  const racer = hub.createClient('racer-1');
+  await racer.set(`worlds/${worldId}/presence/racer-1`, { conn: 'ConnRacer001', at: racer.serverTimestamp() });
+  const origUpdate = racer.update.bind(racer);
+  let releaseUpdate = null;
+  let delayedOnce = true;
+  racer.update = async (p, u) => {
+    if (delayedOnce) {
+      delayedOnce = false;
+      await new Promise((r) => { releaseUpdate = r; });
+    }
+    return origUpdate(p, u);
+  };
+  const alloc = new SlotAllocator(racer, worldId, { nowFn: () => hub.now() });
+  const claimP = alloc.claim({ callsign: 'RACER', colorIdx: 1, connId: 'ConnRacer001', buildHash: BUILD_HASH });
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  const vacateP = alloc.vacate();
+  releaseUpdate?.();
+  await Promise.all([claimP, vacateP]);
+  assert.equal(alloc.isSeated, false, 'vacate() during in-flight claim() must leave allocator unseated');
+  assert.equal(hub.inspect(`worlds/${worldId}/uidToSlot/racer-1`), null, 'no orphaned uidToSlot after claim+vacate race');
+
+  // #90 #9 & #15: PlaneInterpolator immediately evicts vacated slot, resets on uid recycle, and caps static plane drift!
+  const interp = new PlaneInterpolator();
+  const slots1 = { '5': { uid: 'pilot-A', leaseUntil: 99999 } };
+  interp.pushSnapshot([{ slotId: 5, x: 0, y: 80, z: 0, yawDeg: 0, pitchDeg: 0, rollDeg: 0, speedKmh: 158, tankPct: 100 }], 1000, null, 1000, slots1, 1000);
+  interp.pushSnapshot([{ slotId: 5, x: 0, y: 80, z: -11, yawDeg: 0, pitchDeg: 0, rollDeg: 0, speedKmh: 158, tankPct: 100 }], 1250, null, 1250, slots1, 1250);
+  assert.equal(interp.sample(1300, { activeSlots: slots1, serverNow: 1300 }).length, 1);
+  // Vacate slot 5 -> must disappear IMMEDIATELY (0 lingering frozen frames!)
+  assert.equal(interp.sample(1350, { activeSlots: {}, serverNow: 1350 }).length, 0, 'vacated slot must evict immediately');
+  // Recycle slot 5 to pilot-B -> must NOT rubber-band from pilot-A!
+  const slots2 = { '5': { uid: 'pilot-B', leaseUntil: 99999 } };
+  interp.pushSnapshot([{ slotId: 5, x: 480, y: 80, z: 50, yawDeg: 90, pitchDeg: 0, rollDeg: 0, speedKmh: 158, tankPct: 100 }], 1400, null, 1400, slots2, 1400);
+  const recycled = interp.sample(1450, { activeSlots: slots2, serverNow: 1450 })[0];
+  assert.ok(Math.hypot(recycled.x - 480, recycled.z - 50) < 30, `recycled slot must snap to pilot-B (got x=${recycled.x}, z=${recycled.z})`);
+
+  // Static/frozen hidden-Host plane (same coords repeated for 3 s) must NOT drift 340 m!
+  const staticInterp = new PlaneInterpolator();
+  for (let i = 0; i < 24; i++) {
+    staticInterp.pushSnapshot([{ slotId: 1, x: 50, y: 80, z: 50, yawDeg: 0, pitchDeg: 0, rollDeg: 0, speedKmh: 158, tankPct: 100 }], 1000 + i * 125, null, 1000 + i * 125);
+    staticInterp.sample(1000 + i * 125);
+  }
+  const staticPose = staticInterp.sample(4000)[0];
+  assert.ok(Math.hypot(staticPose.x - 50, staticPose.z - 50) < 35, `static hidden Host must not drift 340 m (got dist=${Math.hypot(staticPose.x - 50, staticPose.z - 50).toFixed(1)} m)`);
+
+  // #90 #10: AuthorityElection 6 s post-abdicate cooldown stops immediate self-re-election thrash!
+  const wElec = 'megabasin-13';
+  const { host: eHost } = await bootstrapWorld(hub, 'elec-1', wElec);
+  const elec = new AuthorityElection(eHost, wElec, {
+    canBeHost: () => true,
+    hasOtherPeers: () => true,
+    backoffRangeMs: [10, 10],
+    disablePageHooks: true,
+  });
+  elec.start();
+  await Promise.resolve();
+  assert.equal(elec.isHost, true);
+  await elec.abdicate();
+  assert.equal(elec.isHost, false);
+  hub.advanceTime(1000);
+  assert.equal(await elec.attemptTakeover(), false, 'must suppress self-takeover during 6 s post-abdicate cooldown when peers exist');
+  hub.advanceTime(5500);
+  assert.equal(await elec.attemptTakeover(), true, 'may re-elect after 6 s cooldown expires if no peer took over');
+  await elec.stop({ abdicateIfHost: false });
+
+  // #90 #4: StreamClient clears stale _wantOpIndex on newer-epoch fireKey (no permanent Replica deadlock!)
+  const scWorld = 'megabasin-14';
+  const { host: scHost } = await bootstrapWorld(hub, 'sc-host', scWorld);
+  const scClient = hub.createClient('sc-rep');
+  const op0 = OPERATIONS[0];
+  const scTerrain = generateTerrain(op0);
+  const scSim = new FireSim(scTerrain, { isMegaBasin: false, rollingIntermission: true });
+  const sc = new StreamClient(scClient, scWorld, { fireSim: scSim, opIndex: 0, nowFn: () => hub.now() });
+  const k0 = encodeFireKey({ ...scSim.encodeFullState(), opIndex: 0, gridSize: scSim.gridSize });
+  await scHost.set(`worlds/${scWorld}/fireKey`, { e: 1, q: 1, t: scHost.serverTimestamp(), d: k0 });
+  await sc.start();
+  sc._wantOpIndex = 1; // Simulate latched pre-failover op rollover
+  // Failover Host at epoch=2 publishes fireKey still at opIndex=0 -> must clear _wantOpIndex!
+  await scHost.set(`worlds/${scWorld}/authority`, { uid: 'sc-host', epoch: 1, rev: 1, leaseUntil: scHost.serverTimestamp() });
+  hub.advanceTime(10);
+  await scHost.runTransaction(`worlds/${scWorld}/authority`, (c) => ({ uid: 'sc-host', epoch: c.epoch + 1, rev: c.rev + 1, leaseUntil: hub.now() + 8000 }));
+  await scHost.set(`worlds/${scWorld}/fireKey`, { e: 2, q: 2, t: scHost.serverTimestamp(), d: k0 });
+  await sc.resyncFireKey({ forWave: true });
+  assert.equal(sc._wantOpIndex, null, 'newer-epoch fireKey must clear stale _wantOpIndex so Replica never deadlocks');
+  sc.stop();
 });

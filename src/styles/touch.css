@@ -667,7 +667,10 @@ body.touch-active .ef-overlay-card {
   }
 
   .ef-toast-anchor {
-    left: calc(100% + 6px);
+    left: auto;
+    right: 4px;
+    top: calc(100% + 4px);
+    align-items: flex-end;
   }
 
   .ef-score-toast {
@@ -810,7 +813,7 @@ body.touch-active .ef-overlay-card {
   }
 
   .ef-outcome-banner {
-    top: calc(218px + env(safe-area-inset-top, 0px));
+    top: calc(296px + env(safe-area-inset-top, 0px));
     max-width: calc(100vw - 20px);
     padding: 6px 12px;
   }
@@ -834,8 +837,18 @@ body.touch-active .ef-overlay-card {
     padding: 5px 8px;
   }
 
+  .ef-radio-head {
+    margin-bottom: 2px;
+  }
+
   .ef-radio-line {
     font-size: 9.5px;
+    line-height: 1.24;
+  }
+
+  /* Keep portrait VHF toast single-line so it never reaches .ef-outcome-banner at top: 296px */
+  .ef-radio-line.is-prev {
+    display: none;
   }
 
   /* Lift JIT Hint Pill cleanly ABOVE bottom touch controls */

@@ -124,8 +124,8 @@ async function main() {
         });
       }
 
-      const oldIdx = await adapter.get(`worldsIndex/${WORLD_ID}`).catch(() => null);
-      if (cfg && (!oldIdx || adapter.now() - (oldIdx.updatedAt || 0) >= 5500)) {
+      const oldIdx = await adapter.queryWorldsIndex({ limit: 20 }).then((all) => all?.[WORLD_ID] ?? null).catch(() => null);
+      if (cfg && cfg.expiresAt > adapter.now() && (!oldIdx || adapter.now() - (oldIdx.updatedAt || 0) >= 5500)) {
         await adapter.set(`worldsIndex/${WORLD_ID}`, {
           name: 'Cinderpine Basin',
           mode: 'megabasin',

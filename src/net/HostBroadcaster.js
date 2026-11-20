@@ -35,6 +35,8 @@ export const HOST_SCOOP_MAX_AGL = (FLIGHT_CONSTANTS.SCOOP_EXIT_AGL ?? 11.5) + 0.
 const MIN_DROP_BURST_SEC = 0.25;
 const CRASH_SPEED_THRESHOLD_KMH = 40;
 const STALE_PEER_LEVEL_MS = 1100; // level wings & stop spray if one peer goes silent > 1.1 s
+const HOST_WORLD_TTL_MS = 23 * 3600 * 1000;
+const Q_RESET_THRESHOLD = 900_000_000;
 
 const KMH_TO_MS = 1 / 3.6;
 const DEG_TO_RAD = Math.PI / 180;
@@ -71,6 +73,7 @@ export class HostBroadcaster {
     onOperationAdvance = null,
     onOperationHydrated = null,
     onSimStep = null,
+    onHiddenAutopilotTick = null,
     enableBackgroundTicker = true,
   }) {
     this.adapter = adapter;
@@ -91,6 +94,7 @@ export class HostBroadcaster {
     this.onOperationAdvance = onOperationAdvance;
     this.onOperationHydrated = onOperationHydrated;
     this.onSimStep = onSimStep;
+    this.onHiddenAutopilotTick = onHiddenAutopilotTick;
 
     this.basePath = `worlds/${worldId}`;
     this.running = false;
@@ -126,6 +130,7 @@ export class HostBroadcaster {
     this._lastMetaAt = 0;
     this._lastIndexAt = 0;
     this._lastEvictCheckAt = 0;
+    this._worldResetAt = 0;
     this._simAccum = 0;
     this._planesWriteInFlightSince = 0;
     this._planesWriteToken = 0;
@@ -140,6 +145,10 @@ export class HostBroadcaster {
     this._bgTicker = enableBackgroundTicker
       ? createBackgroundTicker(100, () => {
           if (this.running && this.hydrated && this._bgTicker?.isHidden?.()) {
+            // Keep local autopilot flying while Host tab is hidden so peers don't see a frozen plane.
+            if (this._localAircraft?.autopilot && this.onHiddenAutopilotTick) {
+              try { this.onHiddenAutopilotTick(SIM_STEP_DT); } catch { /* ignore */ }
+            }
             this.step(SIM_STEP_DT);
           }
         })
@@ -179,6 +188,7 @@ export class HostBroadcaster {
     this._pendingScores.length = 0;
     this._pendingDropOutcomes.length = 0;
     this._pilots.clear();
+    this._worldResetAt = this.adapter.now();
     this._needsWaveKeyPublish = true;
     this._advancingOperation = false;
 
@@ -239,8 +249,35 @@ export class HostBroadcaster {
     this._lastIndexAt = indexNode?.updatedAt || 0;
 
     const startNow = this.adapter.now();
+
+    // Refresh expired/near-expiry or misconfigured shard config (prevents 23-hr bricking & cap DoS!).
+    const isPublicShard = /^megabasin-(0[1-9]|1[0-8])$/.test(this.worldId);
+    if (
+      this._config &&
+      ((this._config.expiresAt ?? 0) <= startNow + 3_600_000 || (isPublicShard && this._config.cap !== 100))
+    ) {
+      const refreshedCfg = {
+        mode: 'megabasin',
+        mapId: this._config.mapId || 'op01',
+        cap: isPublicShard ? 100 : (this._config.cap ?? 100),
+        protocolVersion: PROTOCOL_VERSION,
+        buildHash: this.buildHash,
+        createdAt: this.adapter.serverTimestamp(),
+        expiresAt: startNow + HOST_WORLD_TTL_MS,
+      };
+      try {
+        await this.adapter.set(`${this.basePath}/config`, refreshedCfg);
+        this._config = { ...refreshedCfg, createdAt: startNow };
+      } catch {
+        // Keep existing config if another host refreshed concurrently.
+      }
+    }
+
     if (planesNode && Number.isInteger(planesNode.q)) {
-      this.planesSeq = planesNode.q;
+      const planesEpochBumped = this.epoch > (planesNode.e | 0);
+      this.planesSeq = (planesEpochBumped && (forceFreshMission || planesNode.q >= Q_RESET_THRESHOLD))
+        ? 0
+        : planesNode.q;
       if (!forceFreshMission && planesNode.p) {
         try {
           const decoded = decodePlanes(planesNode.p);
@@ -315,14 +352,17 @@ export class HostBroadcaster {
 
     if (forceFreshMission) {
       // Starting a brand-new hosted lobby on a fresh or stale shard:
-      // keep our fresh Operation 01 FireSim, only advance seq past any prior RTDB entries.
+      // keep our fresh Operation 01 FireSim; reset seq to 0 on epoch bump (or if near 1e9 cap).
       let maxQ = Number.isInteger(fireKey?.q) ? fireKey.q : 0;
+      let maxRingE = fireKey?.e | 0;
       if (fireRing && typeof fireRing === 'object') {
         for (const entry of Object.values(fireRing)) {
           if (entry && Number.isInteger(entry.q) && entry.q > maxQ) maxQ = entry.q;
+          if (entry && Number.isInteger(entry.e) && entry.e > maxRingE) maxRingE = entry.e;
         }
       }
-      this.fireSeq = maxQ;
+      const fireEpochBumped = this.epoch > maxRingE;
+      this.fireSeq = (fireEpochBumped || maxQ >= Q_RESET_THRESHOLD) ? 0 : maxQ;
       this._pilots.clear();
     } else if (fireKey && typeof fireKey.d === 'string') {
       try {
@@ -345,13 +385,21 @@ export class HostBroadcaster {
             for (const entry of deltas) {
               try {
                 const delta = decodeFireDelta(entry.d);
-                if (typeof delta.opIndex === 'number' && delta.opIndex !== this.opIndex) continue;
+                // If fireRing rolled over to a newer Operation before the old Host's 4.25 s fireKey fired,
+                // hydrate that newer Operation on the failover Host so Replicas never deadlock!
+                if (typeof delta.opIndex === 'number' && delta.opIndex !== this.opIndex) {
+                  this.opIndex = Math.max(0, Math.min(4, delta.opIndex));
+                  await this.onOperationHydrated?.(this.opIndex, null);
+                }
                 this.fireSim.applyExternalDelta(delta);
                 this.fireSeq = entry.q;
               } catch {
                 // Skip corrupted ring entry.
               }
             }
+          }
+          if (this.epoch > (fireKey.e | 0) && this.fireSeq >= Q_RESET_THRESHOLD) {
+            this.fireSeq = 0;
           }
         }
       } catch {
@@ -577,8 +625,10 @@ export class HostBroadcaster {
         }
       } else {
         const rawIn = this._inputs[uid];
-        const decoded = rawIn && typeof rawIn.d === 'string' ? decodeInput(rawIn.d) : null;
-        const inputSeq = rawIn && Number.isInteger(rawIn.s) ? rawIn.s : null;
+        const stalePreRollover =
+          rawIn && this._worldResetAt > 0 && typeof rawIn.t === 'number' && rawIn.t > 0 && rawIn.t < this._worldResetAt;
+        const decoded = !stalePreRollover && rawIn && typeof rawIn.d === 'string' ? decodeInput(rawIn.d) : null;
+        const inputSeq = !stalePreRollover && rawIn && Number.isInteger(rawIn.s) ? rawIn.s : null;
         if (decoded) {
           const isCrashed = decoded.speedKmh < CRASH_SPEED_THRESHOLD_KMH;
           if (!pilot || pilot.uid !== uid) {
@@ -669,7 +719,15 @@ export class HostBroadcaster {
                   const errDist = Math.hypot(errX, errY, errZ);
                   const maxDist = Math.max(45, MAX_PLAUSIBLE_SPEED_MS * elapsedSec);
 
-                  if (errDist > maxDist && errDist > 1e-3) {
+                  if (errDist > 260) {
+                    // Legitimate respawn or Operation rollover warp -> snap cleanly without 5s drag!
+                    pilot.x = proj.x;
+                    pilot.y = proj.y;
+                    pilot.z = proj.z;
+                    pilot.yawDeg = proj.yawDeg;
+                    pilot.pitchDeg = proj.pitchDeg;
+                    pilot.rollDeg = proj.rollDeg;
+                  } else if (errDist > maxDist && errDist > 1e-3) {
                     const scale = maxDist / errDist;
                     pilot.x = pred.x + errX * scale;
                     pilot.y = pred.y + errY * scale;
@@ -677,7 +735,7 @@ export class HostBroadcaster {
                     pilot.yawDeg = proj.yawDeg;
                     pilot.pitchDeg = proj.pitchDeg;
                     pilot.rollDeg = proj.rollDeg;
-                  } else if (errDist <= 85) {
+                  } else {
                     // Smooth blend between kinematic propagation and age-compensated in/$uid arrival
                     // with anti-backstep guard so uplink jitter NEVER broadcasts a stopped/reversing plane.
                     const alpha = 0.55;
@@ -703,13 +761,6 @@ export class HostBroadcaster {
                     pilot.yawDeg = wrap360(pred.yawDeg + shortestAngleDeltaDeg(pred.yawDeg, proj.yawDeg) * 0.65);
                     pilot.pitchDeg = clamp(pred.pitchDeg + (proj.pitchDeg - pred.pitchDeg) * 0.65, -45, 45);
                     pilot.rollDeg = clamp(pred.rollDeg + (proj.rollDeg - pred.rollDeg) * 0.65, -60, 60);
-                  } else {
-                    pilot.x = proj.x;
-                    pilot.y = proj.y;
-                    pilot.z = proj.z;
-                    pilot.yawDeg = proj.yawDeg;
-                    pilot.pitchDeg = proj.pitchDeg;
-                    pilot.rollDeg = proj.rollDeg;
                   }
                 }
                 if (isDropSeqNewer(decoded.dropSeq, pilot.lastDropSeq)) {
@@ -830,31 +881,28 @@ export class HostBroadcaster {
         if (!isLocalHostPilot) {
           pilot.tankPct = Math.max(0, pilot.tankPct - FLIGHT_CONSTANTS.DROP_RATE * dt);
         }
-        let vx;
-        let vy;
-        let vz;
-        if (
-          isLocalHostPilot &&
-          this._localAircraft &&
-          typeof this._localAircraft.vx === 'number' &&
-          typeof this._localAircraft.vy === 'number' &&
-          typeof this._localAircraft.vz === 'number'
-        ) {
-          vx = this._localAircraft.vx;
-          vy = this._localAircraft.vy;
-          vz = this._localAircraft.vz;
-        } else {
-          const speedMs = pilot.speedKmh * KMH_TO_MS;
-          const yawRad = pilot.yawDeg * DEG_TO_RAD;
-          const pitchRad = pilot.pitchDeg * DEG_TO_RAD;
-          const cosP = Math.cos(pitchRad);
-          vx = Math.sin(yawRad) * cosP * speedMs;
-          vy = Math.sin(pitchRad) * speedMs;
-          vz = -Math.cos(yawRad) * cosP * speedMs;
-        }
+        // Pure kinematic release velocity (matches FlightModel.predictDropImpact & main.js to 0.0 m;
+        // does NOT inject aircraft buoyancy/thermal upward kick into falling water parcels!).
+        const speedMs = pilot.speedKmh * KMH_TO_MS;
+        const yawRad = pilot.yawDeg * DEG_TO_RAD;
+        const pitchRad = pilot.pitchDeg * DEG_TO_RAD;
+        const cosP = Math.cos(pitchRad);
+        const vx = Math.sin(yawRad) * cosP * speedMs;
+        const vy = Math.sin(pitchRad) * speedMs;
+        const vz = -Math.cos(yawRad) * cosP * speedMs;
         const groundY = this.terrain?.getHeight ? this.terrain.getHeight(pilot.x, pilot.z) : waterLevel;
         const releaseAgl = Math.max(4, pilot.y - Math.max(groundY, waterLevel));
-        this.fireSim.spawnWaterParcel(slotId, pilot.x, pilot.y - 1.4, pilot.z, vx, vy, vz, releaseAgl);
+        this.fireSim.spawnWaterParcel(
+          slotId,
+          pilot.x,
+          pilot.y - 1.4,
+          pilot.z,
+          vx,
+          vy,
+          vz,
+          releaseAgl,
+          pilot.lastDropSeq || 0
+        );
       }
     }
 
@@ -1133,7 +1181,7 @@ export class HostBroadcaster {
     }
   }
 
-  async publishWorldsIndex() {
+  async publishWorldsIndex({ playersOverride = null } = {}) {
     if (!this.running || (!this.hydrated && !this._bootstrapping)) return;
     const now = this.adapter.now();
     if (!this._config) {
@@ -1141,7 +1189,9 @@ export class HostBroadcaster {
     }
     if (!this._config) return;
 
-    const players = Math.min(100, this._countLiveSlots(now));
+    const players = playersOverride !== null
+      ? Math.max(0, Math.min(100, Math.floor(playersOverride)))
+      : Math.min(100, this._countLiveSlots(now));
     this._lastIndexAt = now;
     try {
       await this.adapter.set(`worldsIndex/${this.worldId}`, {
@@ -1160,7 +1210,8 @@ export class HostBroadcaster {
   }
 
   /**
-   * Evict slots whose leases expired or whose presence has been away/missing >= 60 s.
+   * Evict slots whose leases expired or whose presence has been away/missing >= 60 s,
+   * AND sweep unseated orphan presence / in / roster entries cleanly.
    * Uses strict conditional leaf deletion AND avoids touching uidToSlot/in/presence
    * if `deadUid` has already re-seated in another live slot!
    */
@@ -1168,9 +1219,11 @@ export class HostBroadcaster {
     if (!this.running || !this.hydrated) return;
     const now = this.adapter.now();
     const myUid = this.adapter.uid;
+    const liveSlotUids = new Set([myUid]);
 
     for (const [slotKey, slotObj] of Object.entries(this._slots)) {
-      if (!slotObj || !slotObj.uid || slotObj.uid === myUid) continue;
+      if (!slotObj || !slotObj.uid) continue;
+      if (slotObj.uid === myUid) continue;
       const deadUid = slotObj.uid;
       const pres = this._presence[deadUid];
       const leaseExpired = typeof slotObj.leaseUntil === 'number' && slotObj.leaseUntil <= now;
@@ -1178,6 +1231,7 @@ export class HostBroadcaster {
 
       if (!leaseExpired && !isAwayOrMissing) {
         this._awaySince.delete(deadUid);
+        liveSlotUids.add(deadUid);
         continue;
       }
 
@@ -1187,13 +1241,16 @@ export class HostBroadcaster {
           since = pres?.at || now;
           this._awaySince.set(deadUid, since);
         }
-        if (now - since < EVICT_AWAY_GRACE_MS) continue;
+        if (now - since < EVICT_AWAY_GRACE_MS) {
+          liveSlotUids.add(deadUid);
+          continue;
+        }
       }
 
       const updates = {
         [`slots/${slotKey}`]: null,
       };
-      if (this._roster[slotKey] && this._roster[slotKey].uid === deadUid) {
+      if (this._roster[slotKey]) {
         updates[`roster/${slotKey}`] = null;
       }
 
@@ -1221,6 +1278,38 @@ export class HostBroadcaster {
         await this.adapter.update(this.basePath, updates);
       } catch {
         // Race with client returning or another eviction; ignore cleanly.
+      }
+    }
+
+    // Sweep orphan slot-less roster entries, unseated stale presence, and unseated in/$uid leaves.
+    const orphanUpdates = {};
+    for (const slotKey of Object.keys(this._roster)) {
+      if (!this._slots[slotKey]) {
+        orphanUpdates[`roster/${slotKey}`] = null;
+      }
+    }
+    const candidateOrphanUids = new Set([
+      ...Object.keys(this._presence),
+      ...Object.keys(this._inputs),
+    ]);
+    for (const uid of candidateOrphanUids) {
+      if (!uid || liveSlotUids.has(uid)) continue;
+      const pres = this._presence[uid];
+      const inp = this._inputs[uid];
+      const presSweepable = pres && (pres.away === true || (now - (pres.at || 0) >= 15000));
+      const inpSweepable = Boolean(inp);
+      if (!presSweepable && !inpSweepable) continue;
+      const mapped = await this.adapter.get(`${this.basePath}/uidToSlot/${uid}`).catch(() => undefined);
+      if (mapped !== null) continue; // Only sweep strictly unseated orphans!
+      if (presSweepable) orphanUpdates[`presence/${uid}`] = null;
+      if (inpSweepable) orphanUpdates[`in/${uid}`] = null;
+    }
+
+    if (Object.keys(orphanUpdates).length > 0) {
+      try {
+        await this.adapter.update(this.basePath, orphanUpdates);
+      } catch {
+        // Ignore concurrent client return/cleanup race.
       }
     }
   }

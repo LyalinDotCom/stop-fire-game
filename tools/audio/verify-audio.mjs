@@ -190,6 +190,189 @@ async function smokeTestRuntime() {
   }
   radio2.dispose();
 
+  // Regression (#89 #5): _drainQueue() 280 ms gap race & full stale pruning
+  {
+    const gapEvents = [];
+    const rGap = new RadioManager(engine);
+    rGap.onTransmission((ev) => gapEvents.push(ev));
+
+    // Queue a fresh high-priority alert AND a stale low-priority entry, then trigger _drainQueue()
+    const now = Date.now();
+    rGap._queue.push(
+      { clip: RADIO_CLIPS_BY_CATEGORY.help_cabin[0], priority: 4, queuedAt: now },
+      { clip: RADIO_CLIPS_BY_CATEGORY.scoop_full[0], priority: 1, queuedAt: now - 15000 },
+    );
+    rGap._drainQueue();
+    // Stale entry behind index 0 must be pruned immediately
+    if (rGap._queue.length !== 1 || rGap._queue[0].clip.category !== 'help_cabin') {
+      throw new Error(`Expected full stale queue pruning, got ${rGap._queue.length} entries`);
+    }
+    if (rGap._drainTimer === null) {
+      throw new Error('Expected _drainTimer to be scheduled during 280 ms gap');
+    }
+    // Priority-0 chatter arriving during the 280 ms gap must NOT drop or preempt queued help_cabin
+    const ignored = rGap.trigger('chatter_misc', { priority: 'low' });
+    if (ignored !== null) {
+      throw new Error('Expected priority-0 chatter during drain gap to be ignored');
+    }
+    if (rGap._queue.length !== 1 || rGap._queue[0].clip.category !== 'help_cabin') {
+      throw new Error('Expected help_cabin to remain intact in queue during drain gap');
+    }
+    // Wait for the 280 ms drain timer to fire
+    await new Promise((r) => setTimeout(r, 340));
+    if (!gapEvents.some((e) => e.category === 'help_cabin' && e.active === true)) {
+      throw new Error(`Expected help_cabin to start after 280 ms drain gap: ${JSON.stringify(gapEvents)}`);
+    }
+
+    // Also verify higher-priority arrival during drain gap cancels _drainTimer and preserves lower item
+    rGap._abortActive();
+    rGap._queue.push({ clip: RADIO_CLIPS_BY_CATEGORY.scoop_full[0], priority: 1, queuedAt: Date.now() });
+    rGap._drainQueue();
+    rGap.trigger('crash_respawn', { priority: 'high' });
+    if (rGap._drainTimer !== null) {
+      throw new Error('Expected _drainTimer to be cancelled when urgent clip starts in gap');
+    }
+    if (!rGap._active || rGap._active.clip.category !== 'crash_respawn') {
+      throw new Error('Expected crash_respawn to start immediately in drain gap');
+    }
+    if (rGap._queue.length !== 1 || rGap._queue[0].clip.category !== 'scoop_full') {
+      throw new Error('Expected scoop_full to stay queued behind crash_respawn');
+    }
+
+    rGap.clearQueue();
+    rGap.dispose();
+  }
+
+  // Regression (#89 #8): AudioEngine crashed engine cut, iOS 'interrupted' unlock, HTMLAudio radio mute/volume sync
+  {
+    const mockParam = () => ({
+      value: 0,
+      lastTarget: null,
+      setTargetAtTime(v) {
+        this.lastTarget = v;
+        this.value = v;
+      },
+      setValueAtTime(v) {
+        this.value = v;
+      },
+      cancelScheduledValues() {},
+      linearRampToValueAtTime(v) {
+        this.value = v;
+      },
+    });
+
+    const e2 = new AudioEngine();
+    let resumed = 0;
+    const mockCtx = {
+      state: 'interrupted',
+      currentTime: 1.0,
+      resume() {
+        resumed++;
+        this.state = 'running';
+        return Promise.resolve();
+      },
+      close() {},
+    };
+    e2._ctx = mockCtx;
+    e2._initialized = true;
+    e2._masterGain = { gain: mockParam() };
+    e2._sfxBusGain = { gain: mockParam() };
+    e2._musicGain = { gain: mockParam() };
+    e2._musicDuckGain = { gain: mockParam() };
+    e2._radioGain = { gain: mockParam() };
+    e2._windFilter = { frequency: mockParam() };
+    e2._windGain = { gain: mockParam() };
+    e2._engineSaw = { frequency: mockParam() };
+    e2._engineSquare = { frequency: mockParam() };
+    e2._engineFilter = { frequency: mockParam() };
+    e2._engineGain = { gain: mockParam() };
+    e2._propWashFilter = { frequency: mockParam() };
+    e2._propWashGain = { gain: mockParam() };
+    e2._fireRoarGain = { gain: mockParam() };
+    e2._fireCrackleGain = { gain: mockParam() };
+    e2._fireCrackleLfo = { frequency: mockParam() };
+    e2._dropFilter = { frequency: mockParam() };
+    e2._dropGain = { gain: mockParam() };
+    e2._scoopGain = { gain: mockParam() };
+    e2._scoopRoughGain = { gain: mockParam() };
+    e2._scoopRoughLfo = { frequency: mockParam() };
+    e2._turbBuffetFilter = { frequency: mockParam() };
+    e2._turbBuffetLfo = { frequency: mockParam() };
+    e2._turbBuffetGain = { gain: mockParam() };
+    e2._turbRattleFilter = { frequency: mockParam() };
+    e2._turbRattleLfo = { frequency: mockParam() };
+    e2._turbRattleGain = { gain: mockParam() };
+    e2._smokeWhooshFilter = { frequency: mockParam() };
+    e2._smokeWhooshGain = { gain: mockParam() };
+
+    const origWindow = globalThis.window;
+    const origAudio = globalThis.Audio;
+    try {
+      globalThis.window = {};
+      e2.unlock();
+      if (resumed !== 1) {
+        throw new Error(`Expected unlock() to resume iOS 'interrupted' AudioContext, resumed=${resumed}`);
+      }
+
+      // Crashed plane cuts engine & prop-wash gain cleanly to 0, then restores on respawn
+      e2.update({ dt: 1 / 60, airspeedKmh: 160, throttle: 0.7, crashed: true });
+      if (e2._engineGain.gain.lastTarget !== 0 || e2._propWashGain.gain.lastTarget !== 0) {
+        throw new Error(
+          `Expected crashed update() to silence engine/propWash, got ${e2._engineGain.gain.lastTarget}/${e2._propWashGain.gain.lastTarget}`,
+        );
+      }
+      e2.update({ dt: 1 / 60, airspeedKmh: 160, throttle: 0.7, crashed: false });
+      if (!(e2._engineGain.gain.lastTarget > 0) || !(e2._propWashGain.gain.lastTarget > 0)) {
+        throw new Error('Expected non-crashed update() to restore engine/propWash gain');
+      }
+
+      // HTMLAudio radio fallback tracks _radioHtmlAudio and responds immediately to mute & volume changes
+      let lastEl = null;
+      globalThis.Audio = class FakeAudio {
+        constructor(url) {
+          this.url = url;
+          this.volume = 1;
+          this.paused = false;
+          this.onended = null;
+          this.onerror = null;
+          lastEl = this;
+        }
+        play() {
+          return Promise.resolve();
+        }
+        pause() {
+          this.paused = true;
+        }
+      };
+
+      e2.setMuted(false);
+      e2.setRadioVolume(0.8);
+      e2._ctx.state = 'suspended'; // force HTMLAudio fallback path
+      const playPromise = e2.playRadioClip('./audio/radio/hit_direct_01.mp3');
+      if (!lastEl || e2._radioHtmlAudio !== lastEl) {
+        throw new Error('Expected _playRadioHtmlFallback to store this._radioHtmlAudio');
+      }
+      e2.setMuted(true);
+      if (lastEl.volume !== 0) {
+        throw new Error(`Expected setMuted(true) to zero fallback radio volume, got ${lastEl.volume}`);
+      }
+      e2.setMuted(false);
+      e2.setRadioVolume(0.4);
+      if (Math.abs(lastEl.volume - 0.4 * 0.85) > 0.005) {
+        throw new Error(`Expected setRadioVolume(0.4) to sync fallback volume, got ${lastEl.volume}`);
+      }
+      lastEl.onended();
+      await playPromise;
+      if (e2._radioHtmlAudio !== null) {
+        throw new Error('Expected _radioHtmlAudio to clear on clip end');
+      }
+    } finally {
+      globalThis.window = origWindow;
+      globalThis.Audio = origAudio;
+      e2.dispose();
+    }
+  }
+
   // Cooldown suppression check (normal priority immediate repeat of help_cabin)
   const suppressed = radio.trigger('help_cabin');
   if (suppressed !== null) {

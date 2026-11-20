@@ -51,6 +51,7 @@ export class WorldSession {
     onEvicted = null,
     onCapacityFull = null,
     onConnectionError = null,
+    onHiddenAutopilotTick = null,
     disableRealTimers = false,
     electionBackoffRangeMs = null,
   }) {
@@ -84,6 +85,7 @@ export class WorldSession {
     this.onEvicted = onEvicted;
     this.onCapacityFull = onCapacityFull;
     this.onConnectionError = onConnectionError;
+    this.onHiddenAutopilotTick = onHiddenAutopilotTick;
 
     this._disableRealTimers = disableRealTimers;
     this._electionBackoffRangeMs = electionBackoffRangeMs;
@@ -226,7 +228,7 @@ export class WorldSession {
           this.onFireSync?.({ full: true, dirtyIndices: null });
         }
       },
-      onFireDelta: (delta) => {
+      onFireDelta: (delta, info) => {
         if (!this.isHost && !this._forceFreshMission && this.fireSim) {
           const dirty = this.fireSim.applyExternalDelta(delta);
           // Drain FireSim's replica drop outcome mirror so it doesn't accumulate;
@@ -237,19 +239,28 @@ export class WorldSession {
           const worldEvents = typeof this.fireSim.drainWorldEvents === 'function'
             ? this.fireSim.drainWorldEvents()
             : [];
-          if (worldEvents.length) {
+          if (!info?.suppressEvents && worldEvents.length) {
             this.onWorldEvents?.(worldEvents);
           }
           this.onFireSync?.({ full: false, dirtyIndices: dirty });
         }
       },
       onPlanes: (planes, info) => {
-        this.interpolator.pushSnapshot(planes, info.arrivedAtMs, this.localSlotId, info.serverTimeMs);
+        const activeSlots = this.stream?._slotsLoaded ? this.stream.slots : null;
+        this.interpolator.pushSnapshot(
+          planes,
+          info.arrivedAtMs,
+          this.localSlotId,
+          info.serverTimeMs,
+          activeSlots,
+          this.adapter.now()
+        );
       },
       onMeta: (meta) => {
         this.onMetaUpdate?.(meta);
       },
       onSlots: (slots) => {
+        this.interpolator.reconcileSlots(slots, this.adapter.now());
         // Reconcile eviction: if Host evicted our slot, unseat locally instead of spamming in/$uid!
         // Ignore stale pre-claim snapshots arriving within 5 s of claim().
         if (this.allocator.isSeated && !this.allocator.recentlyClaimed) {
@@ -373,6 +384,7 @@ export class WorldSession {
         this.stream?.setOperationIndex(opIdx);
         await this.onOperationChange?.(opIdx, keyState);
       },
+      onHiddenAutopilotTick: this.onHiddenAutopilotTick,
       onSimStep: (stepDelta) => {
         if (stepDelta.fullReset) {
           this.onFireSync?.({ full: true, dirtyIndices: null });
@@ -490,6 +502,11 @@ export class WorldSession {
 
     if (!res.seated) {
       if (res.full && this.fallbackOnFull) {
+        // Clean up presence/$uid BEFORE adapter.goOffline() so we never orphan { away: true } on offline_full!
+        if (this.presence) {
+          await this.presence.stop().catch(() => {});
+          this.presence = null;
+        }
         const cap = res.cap ?? MAX_SLOTS;
         const count = res.activeCount ?? cap;
         this._triggerOfflineFallback('offline_full', `Airspace full (${count}/${cap})`);
@@ -505,7 +522,7 @@ export class WorldSession {
     const spawnPose = computeEntrySpawnPose(res.slotId, this.terrain);
 
     if (res.createdWorld) {
-      this.election.notifyInitialHost({
+      this.election.notifyInitialHost(res.initialAuthority || {
         uid: this.adapter.uid,
         epoch: 1,
         rev: 0,
@@ -521,12 +538,22 @@ export class WorldSession {
     return { seated: true, slotId: res.slotId, spawnPose, queued: false };
   }
 
+  async _publishEmptyLobbyIfLastHost() {
+    if (!this.election?.isHost || !this.host?.running || !this.host.hydrated) return;
+    const now = this.adapter.now();
+    const seated = this.stream ? this.stream.getSeatedCount(now) : 1;
+    if (seated <= 1 && (!this.host._lastIndexAt || now - this.host._lastIndexAt >= PACING_MS.worldsIndex + 250)) {
+      await this.host.publishWorldsIndex({ playersOverride: 0 }).catch(() => {});
+    }
+  }
+
   async returnToDemoFlight() {
     this.queued = false;
 
     if (this.election?.isHost) {
       if (this.host?.running && this.host.hydrated) {
         await this.host.publishFireRing().catch(() => {});
+        await this._publishEmptyLobbyIfLastHost();
       }
       await this.election.abdicate();
     }
@@ -750,9 +777,12 @@ export class WorldSession {
       }
     }
 
+    const activeSlots = this.stream?._slotsLoaded ? this.stream.slots : null;
     const remotePlanes = this.interpolator.sample(renderTimeMs, {
       excludeSlotId: this.localSlotId,
       getRosterInfo: (sid) => this.stream.getRosterInfo(sid),
+      activeSlots,
+      serverNow: this.adapter.now(),
     });
 
     const localAuthTank = this.isHost && this.localSlotId !== null
@@ -783,6 +813,7 @@ export class WorldSession {
     if (this.election) {
       if (this.election.isHost && this.host?.running && this.host.hydrated) {
         await this.host.publishFireRing().catch(() => {});
+        await this._publishEmptyLobbyIfLastHost();
       }
       await this.election.stop({ abdicateIfHost: true });
     }

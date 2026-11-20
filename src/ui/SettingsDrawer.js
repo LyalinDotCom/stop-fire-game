@@ -235,9 +235,6 @@ export class SettingsDrawer {
       const url =
         this._currentInviteUrl ||
         (typeof window !== 'undefined' && window.location ? window.location.href : '');
-      if (url && typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(url).catch(() => {});
-      }
       if (this._copyFlashTimer) clearTimeout(this._copyFlashTimer);
       this._copyInviteBtn.textContent = '✓ INVITE COPIED!';
       this._copyInviteBtn.classList.add('is-copied');
