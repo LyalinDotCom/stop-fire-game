@@ -14,8 +14,9 @@ import { StreamClient } from './StreamClient.js';
 import { MAX_SLOTS, PACING_MS, defaultCallsign, getBuildHash, sanitizeCallsign } from './config.js';
 import { encodeInput } from './protocol.js';
 
-const INPUT_SEND_INTERVAL_MS = 250; // 4 Hz nominal (safely above 180 ms server pacing rule)
-const URGENT_DROP_INTERVAL_MS = Math.max(225, PACING_MS.input + 45); // >= 225 ms from acked write to survive RTT jitter
+const INPUT_SEND_INTERVAL_MS = 220; // ~4.55 Hz nominal (safely above 180 ms server pacing rule)
+const URGENT_DROP_INTERVAL_MS = 220; // Immediate drop pacing >= 220 ms
+const INPUT_ACK_MARGIN_MS = PACING_MS.input + 5; // >= 185 ms after server ack eliminates RTT permission_denied
 const DEFAULT_CONNECT_TIMEOUT_MS = 5500;
 const LINK_OFFLINE_FALLBACK_SEC = 12;
 const HOST_PUBLISH_STALL_ABDICATE_MS = 4500;
@@ -390,8 +391,11 @@ export class WorldSession {
 
     const forceFresh = this._forceFreshMission;
     this._forceFreshMission = false;
+    const seedPlanes = isFailover && !forceFresh
+      ? this.interpolator.sample(this._nowPerf(), { excludeSlotId: this.localSlotId })
+      : null;
 
-    this.host.start({ isFailover, forceFreshMission: forceFresh }).then(() => {
+    this.host.start({ isFailover, forceFreshMission: forceFresh, seedPlanes }).then(() => {
       this._updateStatus();
       const waiters = this._hostReadyResolvers.splice(0);
       for (const resolve of waiters) resolve(true);
@@ -580,8 +584,8 @@ export class WorldSession {
     const now = this.adapter.now();
     const urgentDrop = dropSeq !== this._lastSentDropSeq;
     const minInterval = urgentDrop ? URGENT_DROP_INTERVAL_MS : INPUT_SEND_INTERVAL_MS;
-    const lastRefAt = Math.max(this._lastInputSentAt, this._lastInputAckAt);
-    if (lastRefAt > 0 && now - lastRefAt < minInterval) return;
+    if (this._lastInputSentAt > 0 && now - this._lastInputSentAt < minInterval) return;
+    if (this._lastInputAckAt > 0 && now - this._lastInputAckAt < INPUT_ACK_MARGIN_MS) return;
 
     if (this._inputSeqConnId !== connId) {
       this._inputSeq = 0;

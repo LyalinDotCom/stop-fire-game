@@ -1,32 +1,34 @@
-// Vanguard-grade remote aircraft interpolation, adaptive jitter smoothing, and lag isolation.
-// - Adaptive Playback delay (150–320 ms) with EWMA jitter tracking + smooth ±8% clock slew (zero jumps on clumped packets)
-// - Fritsch-Carlson monotone cubic Hermite interpolation for (x, y, z) — zero overshoot or rubber-banding
-// - Shortest-arc angle interpolation for yaw, pitch, roll
-// - Smoothly damped bank-curved dead-reckoning (<= 350 ms cap) using coordinated turn rate:
-//   yawRate = clamp((14.5 * tan(roll)) / v, -1.15, 1.15) rad/s
-// - Exponential correction blending (~140 ms convergence) when delayed packets catch up (zero visual snap/pop)
-// - Per-plane stale wing-leveling coast (> 1.5 s stale for one lagging player without affecting anyone else)
+// Vanguard-grade remote aircraft interpolation, adaptive jitter smoothing, and never-stop flight kinematics.
+// - Adaptive playback delay: >= max(160 ms, 1.55 * ewmaInterval + 2.0 * ewmaJitter) capped at 420 ms,
+//   with gentle ±6% clock slew so the buffer stays continuously fed without starving or popping.
+// - Fritsch-Carlson monotone cubic Hermite interpolation for (x, y, z) — zero overshoot or rubber-banding.
+// - Shortest-arc angle interpolation for yaw, pitch, roll.
+// - Never-stop constant-airspeed bank-curved dead-reckoning up to MAX_EXTRAPOLATE_MS (1200 ms):
+//   a flying airplane NEVER freezes in mid-air during jitter spikes, late packets, or Host failover!
+//   Wings hold steady for 400 ms then gently level out between 400–1200 ms.
+// - Smooth exponential error convergence (tau = 190 ms) with forward-speed floor + max-step limiter
+//   so delayed packets and Host transfers converge with 0 frozen frames and 0 teleport pops.
 
-export const DELAY_MIN_MS = 150;
-export const DELAY_MAX_MS = 320;
-export const MAX_EXTRAPOLATE_MS = 350;
+export const DELAY_MIN_MS = 160;
+export const DELAY_MAX_MS = 420;
+export const MAX_EXTRAPOLATE_MS = 1200;
 
-const MARGIN_MS = 24;
 const WINDOW_MS = 6000;
 const KEEP_MS = 2600;
-const NOMINAL_STEP_MS = 250; // 4 Hz planes broadcast cadence
-const MIN_TIMELINE_STEP_MS = 80; // prevents clumped arrival bursts from producing tiny dt spikes
-const RUN_ON_TAU_SEC = 0.22; // exponential ease-out during dead-reckoning (Vanguard RUN_ON pattern)
-const CORRECTION_TAU_SEC = 0.14; // ~140 ms exponential convergence when delayed packets catch up
-const STALE_COAST_MS = 1500; // per-plane stale threshold -> smooth wing-leveling coast
-const TELEPORT_SPEED_MS = 260; // > 260 m/s (~936 km/h) or >= 350 m jump (respawn / op change) snaps cleanly
+const NOMINAL_STEP_MS = 165; // Initial EWMA spacing (adapts smoothly to 125 ms / 165 ms / 250 ms)
+const MIN_TIMELINE_STEP_MS = 50; // Keeps clumped arrivals monotonic without distorting 8 Hz cadence
+const LEVEL_WINGS_AFTER_SEC = 0.40; // Hold bank 400 ms during extrapolation, then gently level wings
+const CORRECTION_TAU_SEC = 0.19; // ~190 ms exponential convergence when delayed packets catch up
+const STALE_COAST_MS = 1500; // Per-plane stale threshold -> smooth wing-leveling coast
+const TELEPORT_SPEED_MS = 260; // > 260 m/s (~936 km/h) or >= 340 m jump (respawn / op change) snaps cleanly
 const TELEPORT_MIN_DIST = 140;
-const BLEND_MAX_DIST = 340; // offsets under 340 m blend smoothly over 140 ms; larger respawns snap cleanly
-const RATE_MAX = 0.08; // smooth ±8% playback clock slew
-const CATCH_RATE_MAX = 0.24; // gentle catch-up when > 150 ms behind after an outage
-const CATCH_BEHIND_MS = 150;
-const STEER = 1.6;
-const JUMP_MS = 1500;
+const BLEND_MAX_DIST = 340; // Offsets under 340 m blend smoothly; larger respawns snap cleanly
+const RATE_MAX = 0.06; // Gentle ±6% playback clock slew
+const CATCH_RATE_MAX = 0.20; // Smooth catch-up when > 160 ms behind after an outage
+const CATCH_BEHIND_MS = 160;
+const STEER = 1.4;
+const JUMP_MS = 1800;
+const CRASH_SPEED_THRESHOLD_KMH = 40;
 const DEG_TO_RAD = Math.PI / 180;
 const RAD_TO_DEG = 180 / Math.PI;
 const KMH_TO_MS = 1 / 3.6;
@@ -48,56 +50,116 @@ export function shortestAngleDeltaDeg(fromDeg, toDeg) {
   return d;
 }
 
-function p95(list) {
-  if (!list.length) return 0;
-  const sorted = list.map((e) => e[1]).sort((a, b) => a - b);
-  return sorted[Math.min(sorted.length - 1, Math.floor(0.95 * sorted.length))];
+/**
+ * Midpoint-integrated constant-airspeed aircraft kinematics matching FlightModel coordinated turns:
+ *   yawRate = clamp((14.5 * tan(roll)) / v, -1.15, 1.15) rad/s
+ *   dx = sin(yaw) * cos(pitch) * v * dt, dz = -cos(yaw) * cos(pitch) * v * dt, dy = sin(pitch) * v * dt
+ * Optionally levels wings & pitch smoothly once `elapsedSec` exceeds `levelAfterSec`.
+ */
+export function integrateFlightPose(pose, dtSec, { levelAfterSec = Infinity, elapsedSec = 0 } = {}) {
+  if (!pose || dtSec <= 1e-5 || pose.crashed || (pose.speedKmh ?? 0) < CRASH_SPEED_THRESHOLD_KMH) {
+    return {
+      x: pose?.x ?? 0,
+      y: pose?.y ?? 0,
+      z: pose?.z ?? 0,
+      yawDeg: wrap360(pose?.yawDeg ?? 0),
+      pitchDeg: pose?.pitchDeg ?? 0,
+      rollDeg: pose?.rollDeg ?? 0,
+    };
+  }
+
+  const vMs = Math.max(25, pose.speedKmh * KMH_TO_MS);
+  const steps = Math.max(1, Math.min(30, Math.ceil(dtSec / 0.045)));
+  const subDt = dtSec / steps;
+  let x = pose.x;
+  let y = pose.y;
+  let z = pose.z;
+  let yawRad = wrap360(pose.yawDeg) * DEG_TO_RAD;
+  let pitchDeg = clamp(pose.pitchDeg || 0, -45, 45);
+  let rollDeg = clamp(pose.rollDeg || 0, -60, 60);
+  let t = elapsedSec;
+
+  for (let s = 0; s < steps; s++) {
+    t += subDt;
+    if (t > levelAfterSec) {
+      rollDeg *= Math.exp(-subDt / 0.55);
+      pitchDeg *= Math.exp(-subDt / 0.45);
+    }
+    const rollRad = clamp(rollDeg, -55, 55) * DEG_TO_RAD;
+    const pitchRad = clamp(pitchDeg, -35, 35) * DEG_TO_RAD;
+    const yawRate = clamp((14.5 * Math.tan(rollRad)) / vMs, -1.15, 1.15);
+    const horiz = vMs * Math.cos(pitchRad);
+    const vy = vMs * Math.sin(pitchRad);
+
+    yawRad += yawRate * subDt * 0.5;
+    x += Math.sin(yawRad) * horiz * subDt;
+    z += -Math.cos(yawRad) * horiz * subDt;
+    y += vy * subDt;
+    yawRad += yawRate * subDt * 0.5;
+  }
+
+  return {
+    x,
+    y,
+    z,
+    yawDeg: wrap360(yawRad * RAD_TO_DEG),
+    pitchDeg,
+    rollDeg,
+  };
 }
 
 /**
- * Vanguard-style adaptive playback clock smoothing arrival jitter into a 150–320 ms render delay.
- * Uses EWMA jitter + p95 arrival spacing and slews playback rate smoothly (±8%) without hard jumps.
+ * Adaptive playback clock smoothing arrival jitter into a 160–420 ms render delay.
+ * Sizes playback buffer cleanly above real inter-packet spacing:
+ *   targetDelayMs >= max(160, 1.55 * ewmaInterval + 2.0 * ewmaJitter)
+ * and slews playback speed gently (±6%) so the interpolation queue rarely runs dry.
  */
 export class AdaptivePlayback {
   constructor() {
     this.gaps = []; // [arrivalMs, gapMs]
     this.lastArrivalMs = null;
     this.lastTimelineMs = null;
-    this.jitterEwmaMs = 0;
-    this.targetDelayMs = 200; // nominal 200 ms starting delay for 4 Hz stream
+    this.ewmaIntervalMs = NOMINAL_STEP_MS;
+    this.ewmaJitterMs = 12;
+    this.jitterEwmaMs = 12; // Backward-compatible alias
+    this.targetDelayMs = 240;
     this.renderMs = null;
     this.lastWallMs = null;
-    this._offsetMs = null; // timelineMs - arrivalMs (least-delayed envelope)
+    this._offsetMs = null; // timelineMs - arrivalMs (minimum-latency envelope)
   }
 
   heard(arrivalMs, timelineMs = arrivalMs) {
     if (this.lastArrivalMs !== null && arrivalMs > this.lastArrivalMs) {
-      const gap = arrivalMs - this.lastArrivalMs;
+      const gap = clamp(arrivalMs - this.lastArrivalMs, 40, 650);
       this.gaps.push([arrivalMs, gap]);
-      const dev = Math.abs(gap - NOMINAL_STEP_MS);
-      this.jitterEwmaMs = this.jitterEwmaMs * 0.8 + dev * 0.2;
+      const dev = Math.abs(gap - this.ewmaIntervalMs);
+      this.ewmaIntervalMs = this.ewmaIntervalMs * 0.82 + gap * 0.18;
+      this.ewmaJitterMs = this.ewmaJitterMs * 0.80 + dev * 0.20;
+      this.jitterEwmaMs = this.ewmaJitterMs;
     }
     this.lastArrivalMs = arrivalMs;
     this.lastTimelineMs = Math.max(this.lastTimelineMs ?? timelineMs, timelineMs);
 
     const rawOffset = timelineMs - arrivalMs;
-    if (this._offsetMs === null || rawOffset > this._offsetMs) {
+    if (this._offsetMs === null || Math.abs(rawOffset - this._offsetMs) > 500) {
       this._offsetMs = rawOffset;
+    } else if (rawOffset > this._offsetMs) {
+      // Track lowest-latency envelope smoothly without snapping on a single early burst.
+      this._offsetMs += (rawOffset - this._offsetMs) * 0.45;
     } else {
-      this._offsetMs += (rawOffset - this._offsetMs) * 0.05;
+      this._offsetMs += (rawOffset - this._offsetMs) * 0.04;
     }
 
     while (this.gaps.length && arrivalMs - this.gaps[0][0] > WINDOW_MS) {
       this.gaps.shift();
     }
 
-    if (this.gaps.length >= 2) {
-      const spread = p95(this.gaps);
-      const desired = spread * 0.68 + this.jitterEwmaMs * 0.55 + MARGIN_MS;
-      const clamped = clamp(desired, DELAY_MIN_MS, DELAY_MAX_MS);
-      // Smooth target delay itself so spikes don't yank playback speed
-      this.targetDelayMs += (clamped - this.targetDelayMs) * 0.25;
-    }
+    const desired = clamp(
+      Math.max(DELAY_MIN_MS, 1.55 * this.ewmaIntervalMs + 2.0 * this.ewmaJitterMs),
+      DELAY_MIN_MS,
+      DELAY_MAX_MS
+    );
+    this.targetDelayMs += (desired - this.targetDelayMs) * 0.22;
   }
 
   at(nowMs) {
@@ -108,7 +170,7 @@ export class AdaptivePlayback {
     if (this.renderMs === null || Math.abs(desired - this.renderMs) > JUMP_MS) {
       this.renderMs = desired;
     } else if (this.lastWallMs !== null && nowMs > this.lastWallMs) {
-      const dtMs = Math.min(100, nowMs - this.lastWallMs);
+      const dtMs = Math.min(250, nowMs - this.lastWallMs);
       const errSec = (desired - this.renderMs) / 1000;
       const hiRate = (desired - this.renderMs) > CATCH_BEHIND_MS ? CATCH_RATE_MAX : RATE_MAX;
       const rate = 1 + clamp(STEER * errSec, -RATE_MAX, hiRate);
@@ -116,7 +178,7 @@ export class AdaptivePlayback {
     }
     this.lastWallMs = nowMs;
 
-    // Never run further than MAX_EXTRAPOLATE_MS past the newest received sample timeline.
+    // Allow smooth constant-airspeed coasting up to MAX_EXTRAPOLATE_MS (1200 ms) through jitter & failover.
     const ceiling = (this.lastTimelineMs ?? this.lastArrivalMs) + MAX_EXTRAPOLATE_MS;
     this.renderMs = Math.min(this.renderMs, ceiling);
     return this.renderMs;
@@ -126,8 +188,10 @@ export class AdaptivePlayback {
     this.gaps.length = 0;
     this.lastArrivalMs = null;
     this.lastTimelineMs = null;
-    this.jitterEwmaMs = 0;
-    this.targetDelayMs = 200;
+    this.ewmaIntervalMs = NOMINAL_STEP_MS;
+    this.ewmaJitterMs = 12;
+    this.jitterEwmaMs = 12;
+    this.targetDelayMs = 240;
     this.renderMs = null;
     this.lastWallMs = null;
     this._offsetMs = null;
@@ -179,9 +243,9 @@ function evalHermite(p0, p1, m0, m1, u) {
  * Per-aircraft pose track:
  * - Fritsch-Carlson monotone cubic Hermite on (x, y, z)
  * - Shortest-arc angles on (yaw, pitch, roll)
- * - Damped bank-curved dead-reckoning up to MAX_EXTRAPOLATE_MS (350 ms)
- * - Exponential visual error convergence (~140 ms) so delayed packets NEVER pop/snap
- * - Per-plane stale detection (> 1.5 s motionless) -> smooth wing-leveling coast
+ * - Never-stop constant-airspeed bank-curved dead-reckoning up to MAX_EXTRAPOLATE_MS (1200 ms)
+ * - Exponential visual error convergence (~190 ms) with forward-speed floor + max-step limiter
+ *   so remote planes NEVER freeze in mid-air and NEVER pop across the sky!
  */
 export class PlaneTrack {
   constructor(slotId) {
@@ -190,7 +254,7 @@ export class PlaneTrack {
     this.lastSeenMs = 0;
     this.lastMovedMs = 0;
 
-    // Exponential correction blend state (absorbs discontinuities when delayed packets catch up)
+    // Exponential correction blend state (absorbs discontinuities smoothly without pops or stalls)
     this._lastRaw = null;
     this._lastOut = null;
     this._lastSampleWallMs = null;
@@ -206,7 +270,7 @@ export class PlaneTrack {
     const last = this.samples[this.samples.length - 1];
     let stampMs = tMs;
     if (last && stampMs <= last.t) {
-      // Clumped arrival: space slightly ahead so timeline stays strictly monotonic without zero-dt spikes.
+      // Clumped arrival: space ahead so timeline stays strictly monotonic without zero-dt spikes.
       stampMs = last.t + MIN_TIMELINE_STEP_MS;
     }
 
@@ -250,23 +314,29 @@ export class PlaneTrack {
     const dtSec = clamp((nowMs - this._lastSampleWallMs) / 1000, 0, 0.25);
     this._lastSampleWallMs = nowMs;
 
-    // Detect sudden discontinuity in raw evaluated pose (e.g. exiting dead-reckoning or stale peer catch-up)
-    // and absorb it smoothly into exponential error offsets instead of popping across the sky!
+    const isFlying = (raw.speedKmh ?? 0) >= CRASH_SPEED_THRESHOLD_KMH;
+    let isLargeTeleport = false;
+
+    // Detect sudden discontinuity in raw evaluated pose (e.g. exiting dead-reckoning or Host failover)
+    // and fold it into exponential error offsets while projecting forward 1 frame (0 frozen frames!).
     if (this._lastRaw) {
       const jumpDist = Math.hypot(raw.x - this._lastRaw.x, raw.y - this._lastRaw.y, raw.z - this._lastRaw.z);
-      const maxContinuousStep = Math.max(2.5, 95 * Math.max(dtSec, 0.016));
-      if (jumpDist > maxContinuousStep && jumpDist < BLEND_MAX_DIST) {
-        // Fold the discontinuity into our visual error offset so rendered position stays continuous.
-        this._errX = this._lastOut.x - raw.x;
-        this._errY = this._lastOut.y - raw.y;
-        this._errZ = this._lastOut.z - raw.z;
-        this._errYaw = shortestAngleDeltaDeg(raw.yawDeg, this._lastOut.yawDeg);
-        this._errPitch = this._lastOut.pitchDeg - raw.pitchDeg;
-        this._errRoll = this._lastOut.rollDeg - raw.rollDeg;
-      } else if (jumpDist >= BLEND_MAX_DIST) {
+      const maxContinuousStep = Math.max(1.2, 72 * Math.max(dtSec, 0.016));
+      if (jumpDist >= BLEND_MAX_DIST) {
         // Genuine respawn or Operation change teleport -> snap cleanly!
+        isLargeTeleport = true;
         this._errX = this._errY = this._errZ = 0;
         this._errYaw = this._errPitch = this._errRoll = 0;
+      } else if (jumpDist > maxContinuousStep) {
+        const proj = isFlying && dtSec > 0
+          ? integrateFlightPose(this._lastOut, dtSec)
+          : this._lastOut;
+        this._errX = proj.x - raw.x;
+        this._errY = proj.y - raw.y;
+        this._errZ = proj.z - raw.z;
+        this._errYaw = shortestAngleDeltaDeg(raw.yawDeg, proj.yawDeg);
+        this._errPitch = proj.pitchDeg - raw.pitchDeg;
+        this._errRoll = proj.rollDeg - raw.rollDeg;
       }
     }
 
@@ -278,6 +348,56 @@ export class PlaneTrack {
     this._errPitch *= decay;
     this._errRoll *= decay;
 
+    // Never-stop forward-speed floor & anti-pop frame-step clamp for flying aircraft:
+    // ensures convergence never stalls/reverses a flying plane and never jumps > ~2 m in a 60 Hz frame.
+    const staleMs = Math.max(0, nowMs - (this.lastSeenMs || 0));
+    if (isFlying && !isLargeTeleport && dtSec > 0.002 && staleMs <= MAX_EXTRAPOLATE_MS + 350) {
+      const vMs = Math.max(25, raw.speedKmh * KMH_TO_MS);
+      const yawR = wrap360(this._lastOut.yawDeg) * DEG_TO_RAD;
+      const pitchR = clamp(this._lastOut.pitchDeg || 0, -35, 35) * DEG_TO_RAD;
+      const fx = Math.sin(yawR) * Math.cos(pitchR);
+      const fy = Math.sin(pitchR);
+      const fz = -Math.cos(yawR) * Math.cos(pitchR);
+
+      let candX = raw.x + this._errX;
+      let candY = raw.y + this._errY;
+      let candZ = raw.z + this._errZ;
+      let sx = candX - this._lastOut.x;
+      let sy = candY - this._lastOut.y;
+      let sz = candZ - this._lastOut.z;
+
+      const fwdDot = sx * fx + sy * fy + sz * fz;
+      const minFwd = 0.58 * vMs * dtSec; // Strictly >= ~25 m/s at cruise speed (0 frozen frames!)
+      if (fwdDot < minFwd) {
+        const push = minFwd - fwdDot;
+        this._errX += fx * push;
+        this._errY += fy * push;
+        this._errZ += fz * push;
+        const errMag = Math.hypot(this._errX, this._errY, this._errZ);
+        if (errMag > BLEND_MAX_DIST) {
+          const s = BLEND_MAX_DIST / errMag;
+          this._errX *= s;
+          this._errY *= s;
+          this._errZ *= s;
+        }
+        candX = raw.x + this._errX;
+        candY = raw.y + this._errY;
+        candZ = raw.z + this._errZ;
+        sx = candX - this._lastOut.x;
+        sy = candY - this._lastOut.y;
+        sz = candZ - this._lastOut.z;
+      }
+
+      const stepDist = Math.hypot(sx, sy, sz);
+      const maxStep = Math.max(1.8, 82 * dtSec); // Strictly <= ~1.8 m at 60 Hz (0 teleport pops!)
+      if (stepDist > maxStep && stepDist < BLEND_MAX_DIST) {
+        const scale = maxStep / stepDist;
+        this._errX = (this._lastOut.x + sx * scale) - raw.x;
+        this._errY = (this._lastOut.y + sy * scale) - raw.y;
+        this._errZ = (this._lastOut.z + sz * scale) - raw.z;
+      }
+    }
+
     if (Math.abs(this._errX) < 0.01) this._errX = 0;
     if (Math.abs(this._errY) < 0.01) this._errY = 0;
     if (Math.abs(this._errZ) < 0.01) this._errZ = 0;
@@ -287,11 +407,11 @@ export class PlaneTrack {
 
     // Per-plane stale protection: if this ONE remote plane hasn't moved for > 1.5 s (bad Wi-Fi),
     // smoothly level its wings so it doesn't freeze awkwardly in a steep bank.
-    const staleMs = Math.max(0, nowMs - (this.lastMovedMs || this.lastSeenMs));
+    const staleMoveMs = Math.max(0, nowMs - (this.lastMovedMs || this.lastSeenMs));
     let pitchDeg = raw.pitchDeg + this._errPitch;
     let rollDeg = raw.rollDeg + this._errRoll;
-    if (staleMs > STALE_COAST_MS) {
-      const levelFactor = Math.exp(-((staleMs - STALE_COAST_MS) / 600));
+    if (staleMoveMs > STALE_COAST_MS) {
+      const levelFactor = Math.exp(-((staleMoveMs - STALE_COAST_MS) / 600));
       pitchDeg *= levelFactor;
       rollDeg *= levelFactor;
     }
@@ -322,7 +442,26 @@ export class PlaneTrack {
 
     let i = s.length - 1;
     while (i > 0 && s[i - 1].t > renderMs) i--;
-    if (i === 0) return { ...s[0], slotId: this.slotId };
+    if (i === 0) {
+      // Smoothly lead newly appeared flying planes into s[0] instead of parking them motionless
+      // while renderMs catches up to their first sample timestamp!
+      const first = s[0];
+      const leadSec = clamp((first.t - renderMs) / 1000, 0, 0.5);
+      if (leadSec > 1e-4 && (first.speedKmh ?? 0) >= CRASH_SPEED_THRESHOLD_KMH) {
+        const vMs = Math.max(25, first.speedKmh * KMH_TO_MS);
+        const yawR = wrap360(first.yawDeg) * DEG_TO_RAD;
+        const pitchR = clamp(first.pitchDeg || 0, -35, 35) * DEG_TO_RAD;
+        const horiz = vMs * Math.cos(pitchR);
+        return {
+          ...first,
+          slotId: this.slotId,
+          x: first.x - Math.sin(yawR) * horiz * leadSec,
+          y: first.y - vMs * Math.sin(pitchR) * leadSec,
+          z: first.z + Math.cos(yawR) * horiz * leadSec,
+        };
+      }
+      return { ...first, slotId: this.slotId };
+    }
 
     const a = s[i - 1];
     const b = s[i];
@@ -360,56 +499,37 @@ export class PlaneTrack {
   }
 
   /**
-   * Smoothly damped bank-curved dead-reckoning past the newest sample, capped strictly at MAX_EXTRAPOLATE_MS (350 ms).
-   * Coordinated turn rate matches FlightModel: yawRate = clamp(14.5 * tan(roll) / v, -1.15, 1.15).
-   * Uses exponential speed ease-out (Vanguard RUN_ON pattern) so planes slow gracefully instead of overshooting.
+   * Constant-airspeed bank-curved dead-reckoning past the newest sample up to MAX_EXTRAPOLATE_MS (1200 ms).
+   * A flying aircraft NEVER decelerates to a mid-air halt during late packets or Host transfer;
+   * wings hold bank for 400 ms then smoothly level out over 400–1200 ms.
    */
   _extrapolateBanked(overMs, nowMs) {
     const last = this.samples[this.samples.length - 1];
     const clampedSec = clamp(overMs, 0, MAX_EXTRAPOLATE_MS) / 1000;
-    if (clampedSec <= 1e-4) return { ...last, slotId: this.slotId };
-
-    // Exponentially damped effective travel duration (smoothly approaches plateau as overMs -> 350 ms)
-    const effectiveSec = RUN_ON_TAU_SEC * (1 - Math.exp(-clampedSec / RUN_ON_TAU_SEC));
-    const vMs = Math.max(25, last.speedKmh * KMH_TO_MS);
-    const rollRad = clamp(last.rollDeg, -55, 55) * DEG_TO_RAD;
-    const pitchRad = clamp(last.pitchDeg, -35, 35) * DEG_TO_RAD;
-    const yawRate = clamp((14.5 * Math.tan(rollRad)) / vMs, -1.15, 1.15);
-
-    const steps = 4;
-    const subDt = effectiveSec / steps;
-    let x = last.x;
-    let y = last.y;
-    let z = last.z;
-    let yawRad = last.yawDeg * DEG_TO_RAD;
-    const horizSpeed = vMs * Math.cos(pitchRad);
-    const vy = vMs * Math.sin(pitchRad);
-
-    for (let s = 0; s < steps; s++) {
-      yawRad += yawRate * subDt * 0.5;
-      x += Math.sin(yawRad) * horizSpeed * subDt;
-      z += -Math.cos(yawRad) * horizSpeed * subDt;
-      y += vy * subDt;
-      yawRad += yawRate * subDt * 0.5;
+    if (clampedSec <= 1e-4 || (last.speedKmh ?? 0) < CRASH_SPEED_THRESHOLD_KMH) {
+      return { ...last, slotId: this.slotId };
     }
 
-    // Gently relax roll toward level as dead-reckoning stretches out
-    const bankDamp = Math.exp(-clampedSec / 0.6);
+    const integrated = integrateFlightPose(last, clampedSec, {
+      levelAfterSec: LEVEL_WINGS_AFTER_SEC,
+      elapsedSec: 0,
+    });
+
     const staleMs = Math.max(0, nowMs - (this.lastSeenMs || 0));
     const levelDamp = staleMs > STALE_COAST_MS ? Math.exp(-(staleMs - STALE_COAST_MS) / 600) : 1;
 
     return {
       slotId: this.slotId,
-      x,
-      y,
-      z,
-      yawDeg: wrap360(yawRad * RAD_TO_DEG),
-      pitchDeg: last.pitchDeg * bankDamp * levelDamp,
-      rollDeg: last.rollDeg * bankDamp * levelDamp,
+      x: integrated.x,
+      y: integrated.y,
+      z: integrated.z,
+      yawDeg: integrated.yawDeg,
+      pitchDeg: integrated.pitchDeg * levelDamp,
+      rollDeg: integrated.rollDeg * levelDamp,
       speedKmh: last.speedKmh,
       tankPct: last.tankPct,
-      releasing: clampedSec < 0.25 ? last.releasing : false,
-      scooping: clampedSec < 0.25 ? last.scooping : false,
+      releasing: clampedSec < 0.30 ? last.releasing : false,
+      scooping: clampedSec < 0.30 ? last.scooping : false,
       autopilot: last.autopilot,
     };
   }

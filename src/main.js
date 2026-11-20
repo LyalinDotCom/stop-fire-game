@@ -226,6 +226,8 @@ class EmberFrontApp {
     this._mpAdapter = null;
     this._dirAdapter = null;
     this._dirConnectPromise = null;
+    this._lobbyRefreshInFlight = null;
+    this._lobbyAutoRefreshTimer = null;
     this._loopbackHandle = null;
     this._mpClaimPending = false;
     this._modeSwitchSeq = 0;
@@ -308,6 +310,16 @@ class EmberFrontApp {
       if (this.renderer) this.renderer.resize();
     };
     window.addEventListener('resize', this._onResize);
+
+    this._onVisibilityChange = () => {
+      if (this._disposed || document.hidden) return;
+      if (this.hud && this.hud.isLaunchOverlayOpen()) {
+        this.refreshLobbies({ silent: true });
+      }
+    };
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', this._onVisibilityChange);
+    }
 
     // Expose read-only + QA debug hook
     this._exposeDebugHook();
@@ -437,15 +449,45 @@ class EmberFrontApp {
     }
 
     // Default clean launch choice over live scenic DEMO FLIGHT:
-    // FLY SOLO | HOST LOBBY | Live Hosted Lobbies (opt-in Refresh keeps 0 Firebase sockets at boot!)
+    // FLY SOLO | HOST LOBBY | Auto-Refreshing Live Hosted Lobbies (5 s)
     this.mode = 'solo';
     this.lastNetState = this._makeSoloNetState({ connStatus: 'solo' });
     this.hud.showLaunchOverlay(true, {
       lobbies: [],
-      loading: false,
+      loading: true,
       canDismiss: false,
-      statusText: 'Select Solo, Host Lobby, or click ↻ REFRESH to scan live lobbies',
+      autoRefreshSec: 5,
+      statusText: 'Select Solo, Host Lobby, or Join a live squadron',
     });
+    this.refreshLobbies();
+    this._startLobbyAutoRefresh();
+  }
+
+  _startLobbyAutoRefresh() {
+    this._stopLobbyAutoRefresh();
+    this._lobbyAutoRefreshTimer = setInterval(() => {
+      if (this._disposed) {
+        this._stopLobbyAutoRefresh();
+        return;
+      }
+      if (!this.hud || !this.hud.isLaunchOverlayOpen()) {
+        this._stopLobbyAutoRefresh();
+        // If user dismissed launch overlay back into Solo, release directory socket cleanly.
+        if (this.mode === 'solo' && !this._mpAdapter) {
+          this._closeDirectoryAdapter().catch(() => {});
+        }
+        return;
+      }
+      if (typeof document !== 'undefined' && document.hidden) return;
+      this.refreshLobbies({ silent: true });
+    }, 5000);
+  }
+
+  _stopLobbyAutoRefresh() {
+    if (this._lobbyAutoRefreshTimer) {
+      clearInterval(this._lobbyAutoRefreshTimer);
+      this._lobbyAutoRefreshTimer = null;
+    }
   }
 
   async _closeDirectoryAdapter() {
@@ -460,7 +502,7 @@ class EmberFrontApp {
   /**
    * Lazily connect or reuse a single shared directory RTDB adapter.
    * Deduplicates concurrent connectFirebase() calls so rapid ↻ REFRESH clicks
-   * never call goOffline() on the shared ember-front-net Database singleton.
+   * and 5 s auto-refreshes never call goOffline() on the shared ember-front-net Database singleton.
    */
   async _ensureDirectoryAdapter() {
     if (this._mpAdapter && !this._mpAdapter._closed) return this._mpAdapter;
@@ -509,32 +551,59 @@ class EmberFrontApp {
     return this._dirConnectPromise;
   }
 
-  /** Fetch live hosted lobbies from bounded RTDB `worldsIndex` without claiming a slot. */
-  async refreshLobbies() {
+  /** Fetch live hosted lobbies from bounded RTDB `worldsIndex` without claiming a slot (deduplicated). */
+  async refreshLobbies({ silent = false } = {}) {
+    if (this._lobbyRefreshInFlight) {
+      return this._lobbyRefreshInFlight;
+    }
     const reqSeq = ++this._lobbyListSeq;
     if (this.hud.isLaunchOverlayOpen()) {
-      this.hud.setLobbies([], { loading: true, error: null });
+      this.hud.setLobbies(silent ? undefined : [], {
+        loading: true,
+        error: null,
+        autoRefreshSec: 5,
+      });
     }
-    try {
-      const [{ listLiveLobbies }, adapter] = await Promise.all([
-        import('./net/LobbyDirectory.js'),
-        this._ensureDirectoryAdapter(),
-      ]);
-      if (reqSeq !== this._lobbyListSeq || this._disposed) return [];
-      if (!adapter || adapter._closed) {
-        this.hud.setLobbies([], { loading: false, error: null });
-        return [];
-      }
 
-      const lobbies = await withTimeout(listLiveLobbies(adapter), 4500, 'Lobby list timed out');
-      if (reqSeq !== this._lobbyListSeq || this._disposed) return lobbies;
-      this.hud.setLobbies(lobbies, { loading: false, error: null });
-      return lobbies;
-    } catch (err) {
-      if (reqSeq !== this._lobbyListSeq || this._disposed) return [];
-      this.hud.setLobbies([], { loading: false, error: 'Live lobby lookup unavailable — Solo works offline.' });
-      return [];
-    }
+    const run = (async () => {
+      try {
+        const [{ listLiveLobbies }, adapter] = await Promise.all([
+          import('./net/LobbyDirectory.js'),
+          this._ensureDirectoryAdapter(),
+        ]);
+        if (reqSeq !== this._lobbyListSeq || this._disposed) return [];
+        if (!adapter || adapter._closed) {
+          if (this.hud.isLaunchOverlayOpen()) {
+            this.hud.setLobbies([], { loading: false, error: null, autoRefreshSec: 5, updatedAt: Date.now() });
+          }
+          return [];
+        }
+
+        const lobbies = await withTimeout(listLiveLobbies(adapter), 4500, 'Lobby list timed out');
+        if (reqSeq !== this._lobbyListSeq || this._disposed) return lobbies;
+        if (this.hud.isLaunchOverlayOpen()) {
+          this.hud.setLobbies(lobbies, { loading: false, error: null, autoRefreshSec: 5, updatedAt: Date.now() });
+        }
+        return lobbies;
+      } catch (err) {
+        if (reqSeq !== this._lobbyListSeq || this._disposed) return [];
+        if (this.hud.isLaunchOverlayOpen()) {
+          this.hud.setLobbies(silent ? undefined : [], {
+            loading: false,
+            error: 'Live lobby lookup unavailable — Solo works offline.',
+            autoRefreshSec: 5,
+          });
+        }
+        return [];
+      } finally {
+        if (this._lobbyRefreshInFlight === run) {
+          this._lobbyRefreshInFlight = null;
+        }
+      }
+    })();
+
+    this._lobbyRefreshInFlight = run;
+    return run;
   }
 
   async _teardownNetwork() {
@@ -574,6 +643,8 @@ class EmberFrontApp {
    */
   async launchSolo({ autoControl = true, opConfig = null } = {}) {
     const seq = ++this._modeSwitchSeq;
+    ++this._lobbyListSeq;
+    this._stopLobbyAutoRefresh();
     this._unlockAndStartAtmosphere();
     this.hud.setLaunchBusy(null);
     this.hud.showLaunchOverlay(false);
@@ -581,6 +652,9 @@ class EmberFrontApp {
       this._handleToggleDrawer(false);
     }
 
+    if (this._dirConnectPromise) {
+      await this._dirConnectPromise.catch(() => null);
+    }
     await this._teardownNetwork();
     if (seq !== this._modeSwitchSeq) return;
 
@@ -610,6 +684,7 @@ class EmberFrontApp {
    * NEVER persisted to localStorage — reloading the page always retries live!
    */
   _enterOfflineLocalMission(kind = 'offline_error', reason = 'Live airspace unavailable', { keepManual = false } = {}) {
+    this._stopLobbyAutoRefresh();
     const resolvedKind = kind === 'offline_full' ? 'offline_full' : 'offline_error';
     const session = this._mpSession;
     const adapter = this._mpAdapter;
@@ -660,6 +735,8 @@ class EmberFrontApp {
    */
   async hostLobby({ preferredWorldId = null } = {}) {
     const seq = ++this._modeSwitchSeq;
+    ++this._lobbyListSeq;
+    this._stopLobbyAutoRefresh();
     this._unlockAndStartAtmosphere();
     if (this.hud.isDrawerOpen()) {
       this._handleToggleDrawer(false);
@@ -801,6 +878,8 @@ class EmberFrontApp {
    */
   async joinLobby(worldId, { autoSeat = true, opConfig = null, ignoreSimFull = false } = {}) {
     const seq = ++this._modeSwitchSeq;
+    ++this._lobbyListSeq;
+    this._stopLobbyAutoRefresh();
     if (autoSeat) {
       this._unlockAndStartAtmosphere();
     }
@@ -1051,18 +1130,15 @@ class EmberFrontApp {
     if (this.hud.isDrawerOpen()) {
       this._handleToggleDrawer(false);
     }
-    const hasLiveAdapter = Boolean(this._mpAdapter && !this._mpAdapter._closed);
     this.hud.showLaunchOverlay(true, {
       lobbies: [],
-      loading: hasLiveAdapter,
+      loading: true,
       canDismiss: true,
-      statusText: hasLiveAdapter
-        ? 'Switch between Solo, Host Lobby, or Join a live squadron'
-        : 'Switch mode or click ↻ REFRESH to scan live lobbies',
+      autoRefreshSec: 5,
+      statusText: 'Switch between Solo, Host Lobby, or Join a live squadron',
     });
-    if (hasLiveAdapter) {
-      this.refreshLobbies();
-    }
+    this.refreshLobbies();
+    this._startLobbyAutoRefresh();
   }
 
   _buildWorld(opConfig, { preservePilot = false } = {}) {
@@ -2008,11 +2084,57 @@ class EmberFrontApp {
       joinLobby(worldId, opts) {
         return app.joinLobby(worldId, opts);
       },
-      refreshLobbies() {
-        return app.refreshLobbies();
+      refreshLobbies(opts) {
+        return app.refreshLobbies(opts);
       },
       openLaunchMenu() {
         return app.openLaunchMenu();
+      },
+      getRemotePlaneRenderPositions() {
+        const list = app.remotePlanes || [];
+        const fleet = app.renderer?._remoteFleet;
+        const matArr = fleet?.bodyMesh?.instanceMatrix?.array || null;
+        const activeCount = fleet?.activeCount ?? 0;
+        return list.map((p, i) => {
+          let renderX = p.x;
+          let renderY = p.y;
+          let renderZ = p.z;
+          if (matArr && i < activeCount) {
+            const base = i * 16;
+            renderX = matArr[base + 12];
+            renderY = matArr[base + 13];
+            renderZ = matArr[base + 14];
+          }
+          return {
+            slotId: p.slotId,
+            callsign: p.callsign || `EF-${String(p.slotId ?? i).padStart(2, '0')}`,
+            x: p.x,
+            y: p.y,
+            z: p.z,
+            renderX,
+            renderY,
+            renderZ,
+            yawDeg: p.yawDeg,
+            pitchDeg: p.pitchDeg,
+            rollDeg: p.rollDeg,
+            speedKmh: p.speedKmh,
+          };
+        });
+      },
+      getSessionInfo() {
+        const pb = app._mpSession?.interpolator?.playback;
+        return {
+          mode: app.mode,
+          isHost: Boolean(app._isHosting),
+          worldId: app.lastNetState?.worldId || null,
+          planesIntervalMs: app._mpSession?.host?.getPlanesIntervalMs?.() ?? null,
+          playbackDelayMs: pb ? Math.round(pb.targetDelayMs) : null,
+          ewmaIntervalMs: pb ? Math.round(pb.ewmaIntervalMs) : null,
+          ewmaJitterMs: pb ? Math.round(pb.ewmaJitterMs) : null,
+          lobbyAutoRefreshActive: Boolean(app._lobbyAutoRefreshTimer),
+          dirAdapterConnected: Boolean(app._dirAdapter && !app._dirAdapter._closed && app._dirAdapter.connected),
+          mpAdapterConnected: Boolean(app._mpAdapter && !app._mpAdapter._closed && app._mpAdapter.connected),
+        };
       },
       takeControl() {
         return app.takeControl();
@@ -2106,8 +2228,12 @@ class EmberFrontApp {
 
   dispose() {
     this._disposed = true;
+    this._stopLobbyAutoRefresh();
     if (this._rafId) cancelAnimationFrame(this._rafId);
     window.removeEventListener('resize', this._onResize);
+    if (typeof document !== 'undefined' && this._onVisibilityChange) {
+      document.removeEventListener('visibilitychange', this._onVisibilityChange);
+    }
     this._offRadioTx?.();
     this._teardownNetwork();
     this.touchControls?.dispose?.();

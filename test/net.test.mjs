@@ -2145,3 +2145,212 @@ test('#71: Replica urgent drop in/$uid enforces >= 225 ms ack pacing and retries
 
   await repSess.stop();
 });
+
+test('#77: 300-frame 60 Hz quantitative smoothness under 220 ms inputs, ±120 ms broadcast jitter & Host transfer (0 stops, <= 2.5 m step)', async () => {
+  const op0 = OPERATIONS[0];
+  const terrain = generateTerrain(op0);
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const worldId = 'megabasin-09';
+  const { host: hostA } = await bootstrapWorld(hub, 'host-a', worldId);
+  const { client: hostB } = await seatClient(hub, 'host-b', 1, 'ConnHostB001', worldId);
+  const { client: flyerClient, conn: flyerConn } = await seatClient(hub, 'flyer-c', 2, 'ConnFlyer002', worldId);
+
+  const hbA = new HostBroadcaster(hostA, worldId, {
+    terrain, fireSim: new FireSim(terrain, { isMegaBasin: true }),
+    epoch: 1, opIndex: 0, buildHash: BUILD_HASH, localSlotId: 0, enableBackgroundTicker: false,
+  });
+  await hbA.start();
+
+  // Verify adaptive planes broadcast rates across pilot counts: 8 Hz (<=12), 6 Hz (13–40), 4 Hz (41–100)
+  assert.equal(hbA.getPlanesIntervalMs(), 125, '<= 12 pilots must broadcast at 8 Hz (125 ms)');
+  const savedSlots = { ...hbA._slots };
+  for (let s = 3; s < 20; s++) hbA._slots[String(s)] = { uid: `tmp-${s}`, leaseUntil: hub.now() + 30000 };
+  assert.equal(hbA.getPlanesIntervalMs(), 165, '13–40 pilots must broadcast at 6 Hz (165 ms)');
+  for (let s = 20; s < 55; s++) hbA._slots[String(s)] = { uid: `tmp-${s}`, leaseUntil: hub.now() + 30000 };
+  assert.equal(hbA.getPlanesIntervalMs(), 250, '41–100 pilots must broadcast at 4 Hz (250 ms)');
+  hbA._slots = savedSlots;
+
+  const interp = new PlaneInterpolator();
+  const downlinkQueue = []; // { deliverAtMs, planes, serverTimeMs }
+  const uplinkQueue = []; // { deliverAtMs, seq, payload }
+  let rng = 424242;
+  const rand = () => {
+    rng = (rng * 1664525 + 1013904223) >>> 0;
+    return rng / 0x100000000;
+  };
+
+  // True continuous 60 Hz flyer state (158 km/h = 43.89 m/s, smooth banking curve)
+  const flyer = {
+    x: -120, y: 82, z: 220, yawDeg: 18, pitchDeg: 1.5, rollDeg: 14, speedKmh: 158,
+  };
+  let flyerSeq = 0;
+  let lastInputEmitMs = -1000;
+  let lastPlanesSeenQ = -1;
+  let lastPlanesSeenE = 0;
+
+  let activeHost = hbA;
+  let hbB = null;
+  let failoverStarted = false;
+  let failoverDone = false;
+  const failoverStartFrame = 150;
+  const failoverGapFrames = 27; // ~450 ms Host transfer blackout
+
+  const frameDtSec = 1 / 60;
+  const frameDtMs = 1000 / 60;
+  const warmupFrames = 36; // 600 ms warmup to fill initial playback buffer
+  const measureFrames = 300; // 5.0 seconds @ 60 Hz
+
+  let prevPose = null;
+  let minRenderedSpeed = Infinity;
+  let maxFrameStep = 0;
+  let frozenFrames = 0;
+  const speeds = [];
+
+  // Seed initial flyer packet at t=0
+  await flyerClient.set(`worlds/${worldId}/in/flyer-c`, {
+    s: ++flyerSeq,
+    t: flyerClient.serverTimestamp(),
+    c: flyerConn,
+    d: encodeInput({ ...flyer, releasing: false, scooping: false }, 0),
+  });
+  lastInputEmitMs = hub.now();
+  activeHost.step(0.1);
+  await activeHost.publishPlanes();
+
+  for (let f = 0; f < warmupFrames + measureFrames; f++) {
+    const now = hub.now();
+
+    // Advance true flyer kinematics smoothly at 60 Hz
+    const vMs = flyer.speedKmh / 3.6;
+    const rollRad = (flyer.rollDeg * Math.PI) / 180;
+    const pitchRad = (flyer.pitchDeg * Math.PI) / 180;
+    const yawRate = (14.5 * Math.tan(rollRad)) / vMs;
+    const yawRad = (flyer.yawDeg * Math.PI) / 180 + yawRate * frameDtSec * 0.5;
+    flyer.x += Math.sin(yawRad) * vMs * Math.cos(pitchRad) * frameDtSec;
+    flyer.z += -Math.cos(yawRad) * vMs * Math.cos(pitchRad) * frameDtSec;
+    flyer.y += vMs * Math.sin(pitchRad) * frameDtSec;
+    flyer.yawDeg = ((((yawRad + yawRate * frameDtSec * 0.5) * 180) / Math.PI) % 360 + 360) % 360;
+    flyer.rollDeg = 14 * Math.sin(f * 0.025); // gentle S-turn banks
+
+    // Emit in/$uid every 220 ms with 20–65 ms uplink jitter
+    if (now - lastInputEmitMs >= 220) {
+      lastInputEmitMs = now;
+      const uplinkDelay = Math.round(20 + rand() * 45);
+      uplinkQueue.push({
+        deliverAtMs: now + uplinkDelay,
+        seq: ++flyerSeq,
+        payload: { ...flyer, releasing: false, scooping: false },
+      });
+    }
+    while (uplinkQueue.length > 0 && uplinkQueue[0].deliverAtMs <= now) {
+      const pkt = uplinkQueue.shift();
+      await flyerClient.set(`worlds/${worldId}/in/flyer-c`, {
+        s: pkt.seq,
+        t: flyerClient.serverTimestamp(),
+        c: flyerConn,
+        d: encodeInput(pkt.payload, 0),
+      }).catch(() => {});
+    }
+
+    // Trigger live Host transfer at frame (warmupFrames + failoverStartFrame) with ~450 ms blackout
+    const mFrame = f - warmupFrames;
+    if (!failoverStarted && mFrame === failoverStartFrame) {
+      failoverStarted = true;
+      hbA.stop();
+      activeHost = null;
+      await hostA.set(`worlds/${worldId}/authority`, {
+        uid: 'host-a', epoch: 1, rev: 1, leaseUntil: hostA.serverTimestamp(),
+      });
+    }
+    if (failoverStarted && !failoverDone && mFrame === failoverStartFrame + failoverGapFrames) {
+      failoverDone = true;
+      const tx = await hostB.runTransaction(`worlds/${worldId}/authority`, (cur) => ({
+        uid: 'host-b',
+        epoch: cur.epoch + 1,
+        rev: cur.rev + 1,
+        leaseUntil: hub.now() + 8000,
+      }));
+      assert.equal(tx.committed, true, 'Host B must win failover authority');
+      const seedPlanes = interp.sample(now, { excludeSlotId: 1 });
+      hbB = new HostBroadcaster(hostB, worldId, {
+        terrain, fireSim: new FireSim(terrain, { isMegaBasin: true }),
+        epoch: tx.value.epoch, opIndex: 0, buildHash: BUILD_HASH, localSlotId: 1, enableBackgroundTicker: false,
+      });
+      await hbB.start({ isFailover: true, seedPlanes });
+      activeHost = hbB;
+    }
+
+    // Step active Host at 60 Hz (runs 10 Hz internal sim + 8 Hz adaptive planes broadcast)
+    if (activeHost) {
+      activeHost.step(frameDtSec);
+      await Promise.resolve();
+      const planesNode = hub.inspect(`worlds/${worldId}/planes`);
+      if (
+        planesNode &&
+        (planesNode.e > lastPlanesSeenE || (planesNode.e === lastPlanesSeenE && planesNode.q > lastPlanesSeenQ))
+      ) {
+        lastPlanesSeenE = planesNode.e;
+        lastPlanesSeenQ = planesNode.q;
+        // Inject realistic ±120 ms downlink jitter (30 ms base + [0..240] ms jitter -> ±120 ms around 150 ms)
+        const jitterMs = Math.round(30 + rand() * 240);
+        downlinkQueue.push({
+          deliverAtMs: now + jitterMs,
+          planes: decodePlanes(planesNode.p),
+          serverTimeMs: planesNode.t,
+        });
+        downlinkQueue.sort((a, b) => a.deliverAtMs - b.deliverAtMs);
+      }
+    }
+
+    // Deliver jittered planes packets to PlaneInterpolator
+    while (downlinkQueue.length > 0 && downlinkQueue[0].deliverAtMs <= now) {
+      const msg = downlinkQueue.shift();
+      interp.pushSnapshot(msg.planes, now, 1, msg.serverTimeMs);
+    }
+
+    // Sample rendered remote flyer at 60 Hz
+    const rendered = interp.sample(now, { excludeSlotId: 1 });
+    const pose = rendered.find((p) => p.slotId === 2);
+    if (mFrame >= 0) {
+      assert.ok(pose, `remote flyer must render on frame ${mFrame}`);
+      if (prevPose) {
+        const stepM = Math.hypot(pose.x - prevPose.x, pose.y - prevPose.y, pose.z - prevPose.z);
+        const speedMs = stepM / frameDtSec;
+        speeds.push(speedMs);
+        if (speedMs < minRenderedSpeed) minRenderedSpeed = speedMs;
+        if (stepM > maxFrameStep) maxFrameStep = stepM;
+        if (speedMs < 22) frozenFrames++;
+      }
+      prevPose = pose;
+    }
+
+    hub.advanceTime(frameDtMs);
+  }
+
+  speeds.sort((a, b) => a - b);
+  const medianSpeed = speeds[Math.floor(speeds.length / 2)];
+  console.log(
+    `[#77 60Hz Smoothness] frames=${speeds.length}, minSpeed=${minRenderedSpeed.toFixed(1)} m/s, median=${medianSpeed.toFixed(1)} m/s, maxStep=${maxFrameStep.toFixed(2)} m, frozen=${frozenFrames}`
+  );
+
+  assert.equal(
+    frozenFrames,
+    0,
+    `expected 0 stopped/frozen frames (< 22 m/s), got ${frozenFrames} (minSpeed=${minRenderedSpeed.toFixed(1)} m/s)`
+  );
+  assert.ok(
+    minRenderedSpeed >= 22,
+    `minRenderedSpeed must stay >= 22 m/s across 300 frames + Host transfer (got ${minRenderedSpeed.toFixed(1)} m/s)`
+  );
+  assert.ok(
+    maxFrameStep <= 2.5,
+    `maxFrameStep must stay <= 2.5 m across 300 frames + Host transfer (got ${maxFrameStep.toFixed(2)} m)`
+  );
+  assert.ok(
+    medianSpeed >= 34 && medianSpeed <= 54,
+    `median rendered speed expected near 44 m/s cruise (got ${medianSpeed.toFixed(1)} m/s)`
+  );
+
+  hbB?.stop();
+  hbA.stop();
+});

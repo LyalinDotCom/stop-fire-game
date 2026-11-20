@@ -1976,7 +1976,7 @@ body {
 }
 
 /* ==========================================================================
-   11. Sleek Minimal Launch & Live Lobby Browser Overlay (over live DEMO FLIGHT)
+   11. High-Contrast Launch & Auto-Refreshing Live Lobby Browser Overlay
    ========================================================================== */
 .ef-launch-overlay {
   position: absolute;
@@ -1984,102 +1984,106 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: calc(16px + env(safe-area-inset-top, 0px))
-    calc(14px + env(safe-area-inset-right, 0px))
-    calc(16px + env(safe-area-inset-bottom, 0px))
-    calc(14px + env(safe-area-inset-left, 0px));
+  padding: calc(18px + env(safe-area-inset-top, 0px))
+    calc(16px + env(safe-area-inset-right, 0px))
+    calc(18px + env(safe-area-inset-bottom, 0px))
+    calc(16px + env(safe-area-inset-left, 0px));
   background: radial-gradient(
     ellipse at 50% 48%,
-    rgba(8, 15, 20, 0.24) 0%,
-    rgba(7, 13, 18, 0.56) 100%
+    rgba(5, 10, 16, 0.46) 0%,
+    rgba(4, 9, 15, 0.66) 100%
   );
   pointer-events: auto;
   z-index: 29;
 }
 
 .ef-launch-card {
-  width: 404px;
-  max-width: calc(100vw - 24px);
-  max-height: calc(100dvh - 28px);
+  width: min(580px, 92vw);
+  max-height: calc(100dvh - 36px);
   overflow-y: auto;
-  background: rgba(12, 20, 26, 0.86);
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  border-top: 3px solid var(--ef-orange);
-  border-radius: 6px;
-  padding: 18px 18px 14px;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  box-shadow: 0 22px 58px rgba(0, 0, 0, 0.58);
+  background: rgba(8, 15, 23, 0.92);
+  border: 1px solid rgba(196, 220, 234, 0.24);
+  border-top: 4px solid #f37233;
+  border-radius: 10px;
+  padding: 26px 28px 20px;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  box-shadow:
+    0 28px 72px rgba(0, 0, 0, 0.72),
+    0 0 0 1px rgba(255, 255, 255, 0.06),
+    0 -4px 32px rgba(243, 114, 51, 0.22);
   display: flex;
   flex-direction: column;
-  gap: 13px;
+  gap: 18px;
 }
 
 .ef-launch-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 10px;
+  gap: 12px;
 }
 
 .ef-launch-brand {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 4px;
 }
 
 .ef-launch-kicker {
   font-family: var(--ef-font-mono);
-  font-size: 9.5px;
+  font-size: 11px;
   font-weight: 800;
-  letter-spacing: 0.18em;
+  letter-spacing: 0.22em;
   color: var(--ef-orange-soft);
   text-transform: uppercase;
 }
 
 .ef-launch-title {
   margin: 0;
-  font-size: 24px;
+  font-size: clamp(26px, 4vw, 32px);
   font-weight: 900;
   letter-spacing: 0.08em;
-  color: #f7fafb;
-  line-height: 1.1;
+  color: #ffffff;
+  line-height: 1.08;
+  text-shadow: 0 2px 14px rgba(0, 0, 0, 0.55);
 }
 
 .ef-launch-sub {
-  margin-top: 3px;
-  font-size: 11px;
+  margin-top: 2px;
+  font-size: 13px;
   font-weight: 500;
-  color: var(--ef-text-muted);
-  line-height: 1.35;
+  color: #c4d4df;
+  line-height: 1.4;
 }
 
 .ef-launch-close {
   appearance: none;
-  width: 28px;
-  height: 28px;
-  border-radius: 4px;
-  border: 1px solid rgba(255, 255, 255, 0.16);
-  background: rgba(255, 255, 255, 0.06);
-  color: var(--ef-text);
-  font-size: 17px;
+  width: 34px;
+  height: 34px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(255, 255, 255, 0.08);
+  color: #f4f8fa;
+  font-size: 20px;
   line-height: 1;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   flex-shrink: 0;
+  transition: background 0.14s ease, border-color 0.14s ease;
 }
 
 .ef-launch-close:hover {
-  background: rgba(243, 114, 51, 0.24);
+  background: rgba(243, 114, 51, 0.28);
   border-color: var(--ef-orange);
 }
 
 .ef-launch-primary-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 9px;
+  gap: 12px;
 }
 
 .ef-launch-btn {
@@ -2087,12 +2091,19 @@ body {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
-  gap: 3px;
-  padding: 11px 12px;
-  border-radius: 4px;
+  justify-content: center;
+  gap: 5px;
+  min-height: 76px;
+  padding: 15px 18px;
+  border-radius: 7px;
   cursor: pointer;
   text-align: left;
-  transition: transform 0.1s ease, background 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
+  transition: transform 0.12s ease, background 0.14s ease, border-color 0.14s ease, box-shadow 0.14s ease;
+}
+
+.ef-launch-btn:focus-visible {
+  outline: 2px solid #ffffff;
+  outline-offset: 2px;
 }
 
 .ef-launch-btn:disabled {
@@ -2101,150 +2112,249 @@ body {
 }
 
 .ef-launch-btn.is-solo {
-  background: linear-gradient(135deg, rgba(243, 114, 51, 0.94), rgba(235, 134, 62, 0.92));
-  border: 1px solid rgba(255, 186, 138, 0.65);
-  color: #101920;
-  box-shadow: 0 6px 20px rgba(243, 114, 51, 0.26);
+  background: linear-gradient(135deg, #f37233 0%, #f59548 100%);
+  border: 1px solid rgba(255, 212, 174, 0.8);
+  color: #0d161d;
+  box-shadow: 0 8px 26px rgba(243, 114, 51, 0.34);
 }
 
 .ef-launch-btn.is-solo:hover:not(:disabled) {
-  background: linear-gradient(135deg, #fb8345, #f6a05c);
+  background: linear-gradient(135deg, #ff8142 0%, #ffaa5e 100%);
+  box-shadow: 0 10px 30px rgba(243, 114, 51, 0.48);
   transform: translateY(-1px);
 }
 
 .ef-launch-btn.is-host {
-  background: rgba(92, 225, 230, 0.14);
-  border: 1px solid rgba(92, 225, 230, 0.54);
-  color: #eff9fa;
+  background: linear-gradient(135deg, rgba(42, 146, 166, 0.34), rgba(22, 74, 92, 0.56));
+  border: 1.5px solid rgba(92, 225, 230, 0.78);
+  color: #f4fbfc;
+  box-shadow: 0 8px 24px rgba(22, 140, 158, 0.24);
 }
 
 .ef-launch-btn.is-host:hover:not(:disabled) {
-  background: rgba(92, 225, 230, 0.24);
-  border-color: var(--ef-cyan);
+  background: linear-gradient(135deg, rgba(64, 184, 206, 0.46), rgba(28, 96, 118, 0.68));
+  border-color: #8df2f7;
+  box-shadow: 0 10px 28px rgba(92, 225, 230, 0.34);
   transform: translateY(-1px);
 }
 
 .ef-launch-btn-title {
   font-family: var(--ef-font-mono);
-  font-size: 12.5px;
-  font-weight: 800;
+  font-size: 16px;
+  font-weight: 900;
   letter-spacing: 0.1em;
   text-transform: uppercase;
+  line-height: 1.15;
 }
 
 .ef-launch-btn-sub {
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 600;
-  opacity: 0.82;
+  opacity: 0.88;
+  line-height: 1.25;
 }
 
 .ef-launch-lobbies {
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  padding-top: 10px;
-  border-top: 1px solid rgba(255, 255, 255, 0.1);
+  gap: 10px;
+  padding: 14px 15px 13px;
+  border-radius: 8px;
+  background: rgba(15, 27, 39, 0.84);
+  border: 1px solid rgba(114, 212, 224, 0.26);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
 .ef-launch-lobbies-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 8px;
 }
 
 .ef-launch-lobbies-meta {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
 }
 
 .ef-launch-lobbies-label {
   font-family: var(--ef-font-mono);
-  font-size: 9.5px;
+  font-size: 12px;
   font-weight: 800;
   letter-spacing: 0.14em;
-  color: var(--ef-text-muted);
+  color: #eaf4f8;
 }
 
 .ef-launch-lobbies-count {
   font-family: var(--ef-font-mono);
-  font-size: 9.5px;
+  font-size: 11px;
   font-weight: 800;
-  padding: 1px 6px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(56, 242, 139, 0.18);
+  border: 1px solid rgba(56, 242, 139, 0.55);
+  color: #5ef8a4;
+}
+
+.ef-launch-lobbies-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.ef-launch-auto-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
   border-radius: 999px;
   background: rgba(56, 242, 139, 0.12);
-  border: 1px solid rgba(56, 242, 139, 0.35);
-  color: var(--ef-emerald);
+  border: 1px solid rgba(56, 242, 139, 0.38);
+  font-family: var(--ef-font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #7bf9b3;
+  white-space: nowrap;
+}
+
+.ef-launch-auto-badge .ef-live-dot {
+  width: 6.5px;
+  height: 6.5px;
+  border-radius: 50%;
+  background: var(--ef-emerald);
+  box-shadow: 0 0 8px rgba(56, 242, 139, 0.95);
+  animation: efPulseDot 1.6s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.ef-launch-auto-badge.is-syncing {
+  background: rgba(92, 225, 230, 0.16);
+  border-color: rgba(92, 225, 230, 0.52);
+  color: #9bf4f8;
+}
+
+.ef-launch-auto-badge.is-syncing .ef-live-dot {
+  background: var(--ef-cyan);
+  box-shadow: 0 0 8px rgba(92, 225, 230, 0.95);
+  animation: efPulseDot 0.65s ease-in-out infinite;
+}
+
+.ef-launch-auto-badge.is-warn {
+  background: rgba(246, 183, 60, 0.14);
+  border-color: rgba(246, 183, 60, 0.45);
+  color: #ffd37a;
+}
+
+.ef-launch-auto-badge.is-warn .ef-live-dot {
+  background: var(--ef-amber);
+  box-shadow: 0 0 7px rgba(246, 183, 60, 0.9);
+}
+
+.ef-launch-updated {
+  font-family: var(--ef-font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  color: #8ea5b5;
+  letter-spacing: 0.04em;
 }
 
 .ef-launch-refresh-btn {
   appearance: none;
-  padding: 3px 8px;
-  border-radius: 3px;
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  color: var(--ef-text-muted);
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 5px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  color: #e4eff5;
   font-family: var(--ef-font-mono);
-  font-size: 9.5px;
-  font-weight: 700;
-  letter-spacing: 0.08em;
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
-  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease, transform 0.2s ease;
 }
 
 .ef-launch-refresh-btn:hover:not(:disabled) {
-  background: rgba(255, 255, 255, 0.12);
-  border-color: rgba(255, 255, 255, 0.3);
-  color: #f4f7f8;
+  background: rgba(92, 225, 230, 0.22);
+  border-color: var(--ef-cyan);
+  color: #ffffff;
+}
+
+.ef-launch-refresh-btn.is-syncing {
+  border-color: rgba(92, 225, 230, 0.65);
+  color: var(--ef-cyan);
+  animation: efSpinRefresh 0.9s linear infinite;
 }
 
 .ef-launch-lobbies-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  max-height: 152px;
+  gap: 8px;
+  min-height: 136px;
+  max-height: 212px;
   overflow-y: auto;
   padding-right: 2px;
 }
 
 .ef-lobby-empty {
-  padding: 13px 10px;
-  border-radius: 4px;
-  border: 1px dashed rgba(255, 255, 255, 0.14);
-  background: rgba(255, 255, 255, 0.02);
+  flex: 1;
+  min-height: 120px;
+  padding: 18px 14px;
+  border-radius: 6px;
+  border: 1px dashed rgba(180, 210, 228, 0.24);
+  background: rgba(8, 16, 24, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
   text-align: center;
-  font-size: 11px;
-  color: var(--ef-text-muted);
+  font-size: 13px;
+  font-weight: 500;
+  color: #b7cbd8;
+  line-height: 1.4;
 }
 
 .ef-lobby-empty.is-error {
-  border-color: rgba(246, 183, 60, 0.36);
-  color: #ffd37a;
+  border-color: rgba(246, 183, 60, 0.48);
+  background: rgba(44, 28, 12, 0.36);
+  color: #ffd886;
 }
 
 .ef-lobby-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 8px 10px;
-  border-radius: 4px;
-  background: rgba(255, 255, 255, 0.045);
-  border: 1px solid rgba(255, 255, 255, 0.1);
+  gap: 12px;
+  min-height: 54px;
+  padding: 10px 13px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.065);
+  border: 1px solid rgba(190, 220, 235, 0.18);
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+
+.ef-lobby-row:hover {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(92, 225, 230, 0.42);
 }
 
 .ef-lobby-info {
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
 }
 
 .ef-lobby-name {
-  font-size: 12px;
+  font-size: 14.5px;
   font-weight: 800;
-  color: #f4f7f8;
+  color: #ffffff;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2252,9 +2362,9 @@ body {
 
 .ef-lobby-meta {
   font-family: var(--ef-font-mono);
-  font-size: 9.5px;
+  font-size: 11px;
   font-weight: 600;
-  color: var(--ef-text-muted);
+  color: #9fb7c7;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2263,39 +2373,48 @@ body {
 .ef-lobby-right {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 10px;
   flex-shrink: 0;
 }
 
 .ef-lobby-pilots {
   font-family: var(--ef-font-mono);
-  font-size: 10px;
+  font-size: 12px;
   font-weight: 800;
-  color: var(--ef-emerald);
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(56, 242, 139, 0.16);
+  border: 1px solid rgba(56, 242, 139, 0.56);
+  color: #5ef8a4;
+  white-space: nowrap;
 }
 
 .ef-lobby-pilots.is-full {
-  color: #ff9c75;
+  background: rgba(255, 118, 76, 0.16);
+  border-color: rgba(255, 118, 76, 0.56);
+  color: #ffb293;
 }
 
 .ef-lobby-join-btn {
   appearance: none;
-  padding: 5px 11px;
-  border-radius: 3px;
-  background: rgba(56, 242, 139, 0.16);
-  border: 1px solid rgba(56, 242, 139, 0.62);
-  color: var(--ef-emerald);
+  padding: 8px 18px;
+  border-radius: 5px;
+  background: rgba(56, 242, 139, 0.22);
+  border: 1.5px solid rgba(56, 242, 139, 0.78);
+  color: #6ffcb0;
   font-family: var(--ef-font-mono);
-  font-size: 10px;
-  font-weight: 800;
-  letter-spacing: 0.1em;
+  font-size: 12px;
+  font-weight: 900;
+  letter-spacing: 0.12em;
   cursor: pointer;
-  transition: background 0.12s ease, border-color 0.12s ease;
+  transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease, transform 0.1s ease;
 }
 
 .ef-lobby-join-btn:hover:not(:disabled) {
-  background: rgba(56, 242, 139, 0.3);
-  border-color: var(--ef-emerald);
+  background: #38f28b;
+  border-color: #7dffb7;
+  color: #091811;
+  transform: translateY(-1px);
 }
 
 .ef-lobby-join-btn:disabled {
@@ -2308,10 +2427,10 @@ body {
 
 .ef-launch-footer {
   font-family: var(--ef-font-mono);
-  font-size: 9.5px;
+  font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.05em;
-  color: var(--ef-text-dim);
+  color: #93aab9;
   text-align: center;
 }
 
@@ -2505,6 +2624,11 @@ body {
   50% { filter: brightness(1.26); }
 }
 
+@keyframes efSpinRefresh {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 /* ==========================================================================
    Responsive Scaling (1280x720, 1920x1080, and compact screens)
    ========================================================================== */
@@ -2565,56 +2689,139 @@ body {
 }
 
 @media (max-width: 640px) {
+  .ef-launch-overlay {
+    padding: calc(52px + env(safe-area-inset-top, 0px))
+      calc(12px + env(safe-area-inset-right, 0px))
+      calc(16px + env(safe-area-inset-bottom, 0px))
+      calc(12px + env(safe-area-inset-left, 0px));
+  }
   .ef-launch-card {
-    width: 358px;
-    padding: 14px 14px 12px;
-    gap: 10px;
+    width: min(580px, calc(100vw - 24px));
+    max-height: calc(100dvh - 68px);
+    padding: 18px 16px 15px;
+    gap: 13px;
+  }
+  .ef-launch-kicker {
+    font-size: 10px;
   }
   .ef-launch-title {
-    font-size: 20px;
+    font-size: 24px;
   }
   .ef-launch-sub {
-    font-size: 10.5px;
-  }
-  .ef-launch-btn {
-    padding: 9px 10px;
-  }
-  .ef-launch-btn-title {
     font-size: 11.5px;
   }
+  .ef-launch-primary-grid {
+    gap: 9px;
+  }
+  .ef-launch-btn {
+    min-height: 68px;
+    padding: 12px 12px;
+  }
+  .ef-launch-btn-title {
+    font-size: 13.5px;
+  }
+  .ef-launch-btn-sub {
+    font-size: 10.5px;
+  }
+  .ef-launch-lobbies {
+    padding: 11px 11px 10px;
+    gap: 8px;
+  }
+  .ef-launch-auto-badge {
+    font-size: 9px;
+    padding: 2px 7px;
+  }
+  .ef-launch-updated {
+    display: none;
+  }
   .ef-launch-lobbies-list {
-    max-height: 164px;
+    min-height: 116px;
+    max-height: 196px;
+  }
+  .ef-lobby-empty {
+    min-height: 104px;
+    font-size: 12px;
+  }
+  .ef-lobby-row {
+    min-height: 50px;
+    padding: 8px 10px;
+    gap: 8px;
+  }
+  .ef-lobby-name {
+    font-size: 13px;
+  }
+  .ef-lobby-meta {
+    font-size: 10px;
+  }
+  .ef-lobby-pilots {
+    font-size: 11px;
+    padding: 3px 8px;
+  }
+  .ef-lobby-join-btn {
+    padding: 7px 13px;
+    font-size: 11px;
   }
 }
 
 @media (max-height: 500px) {
   .ef-launch-overlay {
-    padding: 8px 12px;
+    padding: calc(46px + env(safe-area-inset-top, 0px))
+      calc(14px + env(safe-area-inset-right, 0px))
+      calc(10px + env(safe-area-inset-bottom, 0px))
+      calc(14px + env(safe-area-inset-left, 0px));
   }
   .ef-launch-card {
-    width: 448px;
-    max-height: calc(100dvh - 16px);
-    padding: 11px 14px 10px;
-    gap: 8px;
+    width: min(560px, calc(100vw - 28px));
+    max-height: calc(100dvh - 56px);
+    padding: 13px 16px 11px;
+    gap: 10px;
+  }
+  .ef-launch-kicker {
+    font-size: 9.5px;
   }
   .ef-launch-title {
-    font-size: 18px;
+    font-size: 20px;
   }
   .ef-launch-sub {
-    font-size: 10px;
+    font-size: 11px;
     margin-top: 1px;
   }
   .ef-launch-btn {
-    padding: 7px 10px;
+    min-height: 54px;
+    padding: 9px 13px;
+    gap: 2px;
+  }
+  .ef-launch-btn-title {
+    font-size: 13.5px;
+  }
+  .ef-launch-btn-sub {
+    font-size: 10.5px;
   }
   .ef-launch-lobbies {
-    padding-top: 7px;
-    gap: 5px;
+    padding: 9px 11px;
+    gap: 6px;
   }
   .ef-launch-lobbies-list {
-    max-height: 98px;
+    min-height: 92px;
+    max-height: 128px;
+  }
+  .ef-lobby-empty {
+    min-height: 82px;
+    padding: 10px;
+    font-size: 12px;
   }
   .ef-lobby-row {
-    padding: 6px 8px;
+    min-height: 44px;
+    padding: 7px 10px;
+  }
+  .ef-lobby-name {
+    font-size: 13px;
+  }
+  .ef-lobby-join-btn {
+    padding: 6px 14px;
+    font-size: 11px;
+  }
+  .ef-launch-footer {
+    font-size: 10px;
   }
 }

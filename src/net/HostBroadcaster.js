@@ -1,13 +1,16 @@
 // Authoritative Host simulation runner and RTDB broadcaster for EMBER FRONT Mega-Basin.
 // - Runs FireSim at 10 Hz (using BackgroundWorker when tab is hidden)
+// - Continuously propagates remote aircraft kinematics at 10 Hz + blends arriving in/$uid poses
+// - Adaptive planes broadcast rate: 8 Hz (<= 12 pilots), 6 Hz (13–40), 4 Hz (41–100) + sub-tick micro-projection
 // - Validates client in/$uid speed/scoop/tank bounds + minimum 0.25 s drop burst on dropSeq increment
 // - Publishes full fireKey immediately when Wave 2+ fullReset occurs (respecting >= 4 s pacing)
 // - Evicts dead/away slots (>= 60 s grace, strict conditional leaf deletes, safe if deadUid re-seated)
-// - Publishes planes (4 Hz), fireRing/{q%16} (2 Hz), fireKey (5 s), meta (0.5 Hz), worldsIndex (10 s)
+// - Publishes planes (8/6/4 Hz adaptive), fireRing/{q%16} (2 Hz), fireKey (5 s), meta (0.5 Hz), worldsIndex (10 s)
 
 import { createBackgroundTicker } from '../sim/BackgroundWorker.js';
 import { FLIGHT_CONSTANTS } from '../sim/FlightModel.js';
 import { PACING_MS, PROTOCOL_VERSION, RING_SIZE, defaultCallsign, getBuildHash } from './config.js';
+import { integrateFlightPose, shortestAngleDeltaDeg } from './PlaneInterpolator.js';
 import {
   decodeFireDelta,
   decodeFireKey,
@@ -20,7 +23,9 @@ import {
 } from './protocol.js';
 
 export const SIM_STEP_DT = 0.1; // 10 Hz
-export const PLANES_INTERVAL_MS = 250; // 4 Hz
+export const PLANES_INTERVAL_SMALL_MS = 125; // 8 Hz (<= 12 pilots)
+export const PLANES_INTERVAL_MED_MS = 165; // 6 Hz (13–40 pilots)
+export const PLANES_INTERVAL_MS = 250; // 4 Hz (41–100 pilots)
 export const FIRE_RING_INTERVAL_MS = 500; // 2 Hz
 export const FIRE_KEY_INTERVAL_MS = 5000; // 0.2 Hz (>= 4 s rule)
 export const META_INTERVAL_MS = 2000; // 0.5 Hz (>= 0.8 s rule)
@@ -29,16 +34,19 @@ export const EVICT_AWAY_GRACE_MS = 60000; // >= 60 s grace before evicting away 
 export const HOST_SCOOP_MAX_AGL = (FLIGHT_CONSTANTS.SCOOP_EXIT_AGL ?? 11.5) + 0.5; // Tracks forgiving lake scoop ceiling
 const MIN_DROP_BURST_SEC = 0.25;
 const CRASH_SPEED_THRESHOLD_KMH = 40;
-const STALE_PEER_COAST_START_MS = 90; // integrate smooth dead-reckoning between 250 ms client beats AND through drops
 const STALE_PEER_LEVEL_MS = 1100; // level wings & stop spray if one peer goes silent > 1.1 s
 
 const KMH_TO_MS = 1 / 3.6;
 const DEG_TO_RAD = Math.PI / 180;
-const RAD_TO_DEG = 180 / Math.PI;
 const MAX_PLAUSIBLE_SPEED_MS = 72;
 
 function clamp(v, lo, hi) {
   return v < lo ? lo : (v > hi ? hi : v);
+}
+
+function wrap360(deg) {
+  const m = deg % 360;
+  return m < 0 ? m + 360 : m;
 }
 
 function isDropSeqNewer(nextSeq, prevSeq) {
@@ -55,7 +63,7 @@ export class HostBroadcaster {
     buildHash = getBuildHash(),
     worldName = 'Cinderpine Basin',
     localSlotId = null,
-    planesIntervalMs = PLANES_INTERVAL_MS,
+    planesIntervalMs = null,
     onScoreEvents = null,
     onImpactEvents = null,
     onDropOutcomes = null,
@@ -74,7 +82,8 @@ export class HostBroadcaster {
     this.buildHash = buildHash;
     this.worldName = worldName;
     this.localSlotId = localSlotId;
-    this.planesIntervalMs = planesIntervalMs;
+    this._fixedPlanesIntervalMs = typeof planesIntervalMs === 'number' && planesIntervalMs > 0 ? planesIntervalMs : null;
+    this.planesIntervalMs = this._fixedPlanesIntervalMs ?? PLANES_INTERVAL_SMALL_MS;
     this.onScoreEvents = onScoreEvents;
     this.onImpactEvents = onImpactEvents;
     this.onDropOutcomes = onDropOutcomes;
@@ -188,7 +197,7 @@ export class HostBroadcaster {
     }
   }
 
-  async start({ isFailover = false, forceFreshMission = false } = {}) {
+  async start({ isFailover = false, forceFreshMission = false, seedPlanes = null } = {}) {
     if (this.running) return;
     this.running = true;
     this._bootstrapping = true;
@@ -229,28 +238,37 @@ export class HostBroadcaster {
     this._lastMetaAt = metaNode?.t || 0;
     this._lastIndexAt = indexNode?.updatedAt || 0;
 
+    const startNow = this.adapter.now();
     if (planesNode && Number.isInteger(planesNode.q)) {
       this.planesSeq = planesNode.q;
       if (!forceFreshMission && planesNode.p) {
         try {
           const decoded = decodePlanes(planesNode.p);
+          const staleAgeSec = planesNode.t ? clamp((startNow - planesNode.t) / 1000, 0, 1.0) : 0;
           for (const p of decoded) {
+            const isCrashed = (p.speedKmh ?? 0) < CRASH_SPEED_THRESHOLD_KMH;
+            const proj = !isCrashed && staleAgeSec > 0.01
+              ? integrateFlightPose(p, staleAgeSec, { levelAfterSec: 0.4, elapsedSec: 0 })
+              : p;
             this._pilots.set(p.slotId, {
               slotId: p.slotId,
               uid: this._slots[String(p.slotId)]?.uid || null,
-              x: p.x,
-              y: p.y,
-              z: p.z,
-              yawDeg: p.yawDeg,
-              pitchDeg: p.pitchDeg,
-              rollDeg: p.rollDeg,
+              x: proj.x,
+              y: proj.y,
+              z: proj.z,
+              yawDeg: proj.yawDeg,
+              pitchDeg: proj.pitchDeg,
+              rollDeg: proj.rollDeg,
               speedKmh: p.speedKmh,
               tankPct: p.tankPct,
               releasing: p.releasing,
               scooping: p.scooping,
               autopilot: p.autopilot,
+              crashed: isCrashed,
               flags: p.flags,
               lastInputT: 0,
+              lastInputSeq: null,
+              lastFreshAt: startNow,
               lastDropSeq: 0,
               dropBurstTimer: 0,
             });
@@ -258,6 +276,40 @@ export class HostBroadcaster {
         } catch {
           // Ignore malformed old planes payload.
         }
+      }
+    }
+
+    // On Host failover, overlay live interpolated poses from the new Host's PlaneInterpolator so
+    // every remote plane glides smoothly across Host transfer with zero snap or freeze!
+    if (isFailover && !forceFreshMission && Array.isArray(seedPlanes) && seedPlanes.length > 0) {
+      for (const sp of seedPlanes) {
+        if (!sp || !Number.isInteger(sp.slotId)) continue;
+        const slotObj = this._slots[String(sp.slotId)];
+        if (!slotObj || typeof slotObj.uid !== 'string') continue;
+        const existing = this._pilots.get(sp.slotId);
+        const isCrashed = (sp.speedKmh ?? 0) < CRASH_SPEED_THRESHOLD_KMH;
+        this._pilots.set(sp.slotId, {
+          slotId: sp.slotId,
+          uid: slotObj.uid,
+          x: sp.x,
+          y: sp.y,
+          z: sp.z,
+          yawDeg: wrap360(sp.yawDeg || 0),
+          pitchDeg: clamp(sp.pitchDeg || 0, -45, 45),
+          rollDeg: clamp(sp.rollDeg || 0, -60, 60),
+          speedKmh: isCrashed ? 0 : clamp(sp.speedKmh || 155, FLIGHT_CONSTANTS.MIN_SPEED_KMH, FLIGHT_CONSTANTS.MAX_SPEED_KMH),
+          tankPct: existing ? existing.tankPct : (sp.tankPct ?? 100),
+          releasing: !!sp.releasing,
+          scooping: !!sp.scooping,
+          autopilot: !!sp.autopilot,
+          crashed: isCrashed,
+          flags: existing?.flags ?? 0,
+          lastInputT: existing?.lastInputT ?? 0,
+          lastInputSeq: existing?.lastInputSeq ?? null,
+          lastFreshAt: startNow,
+          lastDropSeq: existing?.lastDropSeq ?? 0,
+          dropBurstTimer: 0,
+        });
       }
     }
 
@@ -333,6 +385,12 @@ export class HostBroadcaster {
       this._lastIndexAt = Math.max(this._lastIndexAt, (indexNode?.updatedAt || 0) + 250);
     }
 
+    // Seed local Host aircraft and publish an immediate new-epoch planes frame on failover/start
+    // so replicas glide seamlessly across Host transfer without waiting for the next interval tick.
+    if (this._pilots.size > 0 || (this.localSlotId !== null && this._localAircraft)) {
+      await this.publishPlanes().catch(() => {});
+    }
+
     if (!this.running) {
       this._bootstrapping = false;
       return;
@@ -349,6 +407,15 @@ export class HostBroadcaster {
   getPilotTank(slotId) {
     const p = this._pilots.get(slotId);
     return p ? p.tankPct : null;
+  }
+
+  /** Adaptive planes broadcast cadence: 8 Hz (<=12), 6 Hz (13–40), 4 Hz (41–100). */
+  getPlanesIntervalMs(now = this.adapter.now()) {
+    if (this._fixedPlanesIntervalMs) return this._fixedPlanesIntervalMs;
+    const live = this._countLiveSlots(now);
+    if (live <= 12) return PLANES_INTERVAL_SMALL_MS;
+    if (live <= 40) return PLANES_INTERVAL_MED_MS;
+    return PLANES_INTERVAL_MS;
   }
 
   /** Oldest unacknowledged Host publish write age (ms); 0 when healthy. */
@@ -385,6 +452,7 @@ export class HostBroadcaster {
     }
 
     const now = this.adapter.now();
+    this.planesIntervalMs = this.getPlanesIntervalMs(now);
 
     if (now - this._lastPlanesAt >= this.planesIntervalMs) {
       this._lastPlanesAt = now;
@@ -566,74 +634,142 @@ export class HostBroadcaster {
                 pilot.autopilot = decoded.autopilot;
                 pilot.flags = decoded.flags;
               } else {
+                const nextSpeed = clamp(decoded.speedKmh, FLIGHT_CONSTANTS.MIN_SPEED_KMH, FLIGHT_CONSTANTS.MAX_SPEED_KMH);
+                const ageSec = clamp((now - (rawIn.t || now)) / 1000, 0, 0.35);
+                const decodedPose = {
+                  x: decoded.x,
+                  y: decoded.y,
+                  z: decoded.z,
+                  yawDeg: decoded.yawDeg,
+                  pitchDeg: clamp(decoded.pitchDeg, -45, 45),
+                  rollDeg: clamp(decoded.rollDeg, -60, 60),
+                  speedKmh: nextSpeed,
+                  crashed: false,
+                };
+                const proj = ageSec > 0.005 ? integrateFlightPose(decodedPose, ageSec) : decodedPose;
+
                 if (pilot.crashed) {
                   // Remote pilot respawned on perimeter air corridor — snap immediately with empty tank.
                   pilot.crashed = false;
                   pilot.tankPct = 0;
-                  pilot.x = decoded.x;
-                  pilot.y = decoded.y;
-                  pilot.z = decoded.z;
+                  pilot.x = proj.x;
+                  pilot.y = proj.y;
+                  pilot.z = proj.z;
+                  pilot.yawDeg = proj.yawDeg;
+                  pilot.pitchDeg = proj.pitchDeg;
+                  pilot.rollDeg = proj.rollDeg;
                 } else {
                   const elapsedSec = Math.max(0.1, Math.min(2.0, (now - prevFreshAt) / 1000 || dt));
-                  const dx = decoded.x - pilot.x;
-                  const dy = decoded.y - pilot.y;
-                  const dz = decoded.z - pilot.z;
-                  const dist = Math.hypot(dx, dy, dz);
+                  const prevX = pilot.x;
+                  const prevZ = pilot.z;
+                  const pred = integrateFlightPose(pilot, dt);
+                  const errX = proj.x - pred.x;
+                  const errY = proj.y - pred.y;
+                  const errZ = proj.z - pred.z;
+                  const errDist = Math.hypot(errX, errY, errZ);
                   const maxDist = Math.max(45, MAX_PLAUSIBLE_SPEED_MS * elapsedSec);
-                  if (dist > maxDist && dist > 1e-3) {
-                    const scale = maxDist / dist;
-                    pilot.x += dx * scale;
-                    pilot.y += dy * scale;
-                    pilot.z += dz * scale;
+
+                  if (errDist > maxDist && errDist > 1e-3) {
+                    const scale = maxDist / errDist;
+                    pilot.x = pred.x + errX * scale;
+                    pilot.y = pred.y + errY * scale;
+                    pilot.z = pred.z + errZ * scale;
+                    pilot.yawDeg = proj.yawDeg;
+                    pilot.pitchDeg = proj.pitchDeg;
+                    pilot.rollDeg = proj.rollDeg;
+                  } else if (errDist <= 85) {
+                    // Smooth blend between kinematic propagation and age-compensated in/$uid arrival
+                    // with anti-backstep guard so uplink jitter NEVER broadcasts a stopped/reversing plane.
+                    const alpha = 0.55;
+                    let nx = pred.x + errX * alpha;
+                    const ny = pred.y + errY * alpha;
+                    let nz = pred.z + errZ * alpha;
+
+                    const yawRad = wrap360(pred.yawDeg) * DEG_TO_RAD;
+                    const fx = Math.sin(yawRad);
+                    const fz = -Math.cos(yawRad);
+                    const vMs = Math.max(25, nextSpeed * KMH_TO_MS);
+                    const fwdMove = (nx - prevX) * fx + (nz - prevZ) * fz;
+                    const minFwd = 0.45 * vMs * dt;
+                    if (fwdMove < minFwd) {
+                      const push = minFwd - fwdMove;
+                      nx += fx * push;
+                      nz += fz * push;
+                    }
+
+                    pilot.x = nx;
+                    pilot.y = ny;
+                    pilot.z = nz;
+                    pilot.yawDeg = wrap360(pred.yawDeg + shortestAngleDeltaDeg(pred.yawDeg, proj.yawDeg) * 0.65);
+                    pilot.pitchDeg = clamp(pred.pitchDeg + (proj.pitchDeg - pred.pitchDeg) * 0.65, -45, 45);
+                    pilot.rollDeg = clamp(pred.rollDeg + (proj.rollDeg - pred.rollDeg) * 0.65, -60, 60);
                   } else {
-                    pilot.x = decoded.x;
-                    pilot.y = decoded.y;
-                    pilot.z = decoded.z;
+                    pilot.x = proj.x;
+                    pilot.y = proj.y;
+                    pilot.z = proj.z;
+                    pilot.yawDeg = proj.yawDeg;
+                    pilot.pitchDeg = proj.pitchDeg;
+                    pilot.rollDeg = proj.rollDeg;
                   }
                 }
                 if (isDropSeqNewer(decoded.dropSeq, pilot.lastDropSeq)) {
                   pilot.dropBurstTimer = Math.max(pilot.dropBurstTimer, MIN_DROP_BURST_SEC);
                   pilot.lastDropSeq = decoded.dropSeq;
                 }
-                pilot.yawDeg = decoded.yawDeg;
-                pilot.pitchDeg = clamp(decoded.pitchDeg, -45, 45);
-                pilot.rollDeg = clamp(decoded.rollDeg, -60, 60);
-                pilot.speedKmh = clamp(decoded.speedKmh, FLIGHT_CONSTANTS.MIN_SPEED_KMH, FLIGHT_CONSTANTS.MAX_SPEED_KMH);
+                pilot.speedKmh = nextSpeed;
                 pilot.releasing = decoded.releasing;
                 pilot.scooping = decoded.scooping;
                 pilot.autopilot = decoded.autopilot;
                 pilot.flags = decoded.flags;
               }
             } else if (!pilot.crashed) {
-              // Strict per-pilot lag isolation: this ONE peer missed its beat; gently coast & level wings
-              // without stalling the Host or affecting any healthy peer!
+              // Continuous 10 Hz kinematic propagation between in/$uid beats (zero dead-zone stop!)
+              // with gentle wing-leveling once silent > 400 ms and strict per-pilot lag isolation.
               const staleMs = Math.max(0, now - (pilot.lastFreshAt || now));
-              if (staleMs > STALE_PEER_COAST_START_MS) {
-                const vMs = Math.max(25, (pilot.speedKmh || 155) * KMH_TO_MS);
-                const rollRad = clamp(pilot.rollDeg || 0, -55, 55) * DEG_TO_RAD;
-                const pitchRad = clamp(pilot.pitchDeg || 0, -35, 35) * DEG_TO_RAD;
-                const yawRate = clamp((14.5 * Math.tan(rollRad)) / vMs, -1.15, 1.15);
-                let yawRad = ((pilot.yawDeg || 0) * DEG_TO_RAD) + yawRate * dt;
-                const horiz = vMs * Math.cos(pitchRad);
-                pilot.x += Math.sin(yawRad) * horiz * dt;
-                pilot.z += -Math.cos(yawRad) * horiz * dt;
-                pilot.y += vMs * Math.sin(pitchRad) * dt;
-                pilot.yawDeg = (((yawRad * RAD_TO_DEG) % 360) + 360) % 360;
-                // Smoothly level wings & pitch only once peer is genuinely lagging (> 400 ms silent)
-                if (staleMs > 400) {
-                  pilot.rollDeg *= Math.exp(-dt / 0.75);
-                  pilot.pitchDeg *= Math.exp(-dt / 0.55);
-                }
-                const safeFloor = (this.terrain?.getHeight
-                  ? Math.max(this.terrain.waterLevel ?? 12, this.terrain.getHeight(pilot.x, pilot.z))
-                  : (this.terrain?.waterLevel ?? 12)) + 24;
-                if (pilot.y < safeFloor) pilot.y = safeFloor;
-                if (staleMs > STALE_PEER_LEVEL_MS) {
-                  pilot.releasing = false;
-                  pilot.scooping = false;
-                }
+              const next = integrateFlightPose(pilot, dt, {
+                levelAfterSec: 0.4,
+                elapsedSec: staleMs / 1000,
+              });
+              pilot.x = next.x;
+              pilot.y = next.y;
+              pilot.z = next.z;
+              pilot.yawDeg = next.yawDeg;
+              pilot.pitchDeg = next.pitchDeg;
+              pilot.rollDeg = next.rollDeg;
+
+              const ground = this.terrain?.getHeight
+                ? Math.max(this.terrain.waterLevel ?? 12, this.terrain.getHeight(pilot.x, pilot.z))
+                : (this.terrain?.waterLevel ?? 12);
+              const safeFloor = ground + (staleMs > 400 ? 24 : 3.5);
+              if (pilot.y < safeFloor) pilot.y = safeFloor;
+              if (staleMs > STALE_PEER_LEVEL_MS) {
+                pilot.releasing = false;
+                pilot.scooping = false;
               }
             }
+          }
+        } else if (pilot && !pilot.crashed) {
+          // Seeded remote peer (e.g. right after Host transfer) before its first in/$uid arrives:
+          // keep propagating smoothly so it NEVER freezes across Host failover!
+          const staleMs = Math.max(0, now - (pilot.lastFreshAt || now));
+          const next = integrateFlightPose(pilot, dt, {
+            levelAfterSec: 0.4,
+            elapsedSec: staleMs / 1000,
+          });
+          pilot.x = next.x;
+          pilot.y = next.y;
+          pilot.z = next.z;
+          pilot.yawDeg = next.yawDeg;
+          pilot.pitchDeg = next.pitchDeg;
+          pilot.rollDeg = next.rollDeg;
+          const ground = this.terrain?.getHeight
+            ? Math.max(this.terrain.waterLevel ?? 12, this.terrain.getHeight(pilot.x, pilot.z))
+            : (this.terrain?.waterLevel ?? 12);
+          const safeFloor = ground + (staleMs > 400 ? 24 : 3.5);
+          if (pilot.y < safeFloor) pilot.y = safeFloor;
+          if (staleMs > STALE_PEER_LEVEL_MS) {
+            pilot.releasing = false;
+            pilot.scooping = false;
           }
         }
       }
@@ -785,8 +921,73 @@ export class HostBroadcaster {
   }
 
   async publishPlanes() {
-    if (!this.running || !this.hydrated) return;
-    const planes = Array.from(this._pilots.values()).sort((a, b) => a.slotId - b.slotId);
+    if (!this.running || (!this.hydrated && !this._bootstrapping)) return;
+
+    // Ensure local Host aircraft is always synced with its exact live 60 Hz pose at broadcast time.
+    if (this.localSlotId !== null && this._localAircraft) {
+      const a = this._localAircraft;
+      const isCrashed = !!a.crashed;
+      let localPilot = this._pilots.get(this.localSlotId);
+      if (!localPilot) {
+        localPilot = {
+          slotId: this.localSlotId,
+          uid: this.adapter.uid,
+          x: a.x,
+          y: a.y,
+          z: a.z,
+          yawDeg: a.yawDeg,
+          pitchDeg: a.pitchDeg,
+          rollDeg: a.rollDeg,
+          speedKmh: isCrashed ? 0 : a.speedKmh,
+          tankPct: isCrashed ? 0 : (a.tankPct ?? 100),
+          releasing: isCrashed ? false : !!a.releasing,
+          scooping: isCrashed ? false : !!a.scooping,
+          autopilot: !!a.autopilot,
+          crashed: isCrashed,
+          flags: 0,
+          lastInputT: this.adapter.now(),
+          lastDropSeq: this._localDropSeq,
+          dropBurstTimer: 0,
+        };
+        this._pilots.set(this.localSlotId, localPilot);
+      } else {
+        localPilot.x = a.x;
+        localPilot.y = a.y;
+        localPilot.z = a.z;
+        localPilot.yawDeg = a.yawDeg;
+        localPilot.pitchDeg = a.pitchDeg;
+        localPilot.rollDeg = a.rollDeg;
+        localPilot.speedKmh = isCrashed ? 0 : a.speedKmh;
+        localPilot.tankPct = isCrashed ? 0 : (typeof a.tankPct === 'number' ? a.tankPct : localPilot.tankPct);
+        localPilot.releasing = isCrashed ? false : !!a.releasing;
+        localPilot.scooping = isCrashed ? false : !!a.scooping;
+        localPilot.autopilot = !!a.autopilot;
+        localPilot.crashed = isCrashed;
+      }
+    }
+
+    // Sub-tick micro-projection: eliminate 10 Hz sim / 8 Hz (125 ms) broadcast beat aliasing
+    // by projecting flying remote pilots forward by the fractional _simAccum elapsed since last tick!
+    const subSec = clamp(this._simAccum, 0, SIM_STEP_DT);
+    const planes = Array.from(this._pilots.values())
+      .sort((a, b) => a.slotId - b.slotId)
+      .map((pilot) => {
+        const isLocal = this.localSlotId !== null && pilot.slotId === this.localSlotId && !!this._localAircraft;
+        if (isLocal || pilot.crashed || subSec <= 0.002 || (pilot.speedKmh ?? 0) < CRASH_SPEED_THRESHOLD_KMH) {
+          return pilot;
+        }
+        const proj = integrateFlightPose(pilot, subSec);
+        return {
+          ...pilot,
+          x: proj.x,
+          y: proj.y,
+          z: proj.z,
+          yawDeg: proj.yawDeg,
+          pitchDeg: proj.pitchDeg,
+          rollDeg: proj.rollDeg,
+        };
+      });
+
     this.lastPublishedPlanes = planes;
     const p = encodePlanes(planes);
     const q = ++this.planesSeq;

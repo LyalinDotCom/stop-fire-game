@@ -245,6 +245,8 @@ export class HudController {
     this._lobbies = [];
     this._lobbiesLoading = false;
     this._lobbiesError = null;
+    this._hasLoadedLobbies = false;
+    this._lastLobbiesUpdatedAt = 0;
 
     // Outcome toast & peripheral flash timers
     this._outcomeHideTimer = null;
@@ -635,7 +637,7 @@ export class HudController {
     soloBtn.type = 'button';
     soloBtn.setAttribute('data-action', 'launch-solo');
     soloBtn.appendChild(el('span', 'ef-launch-btn-title', 'FLY SOLO'));
-    soloBtn.appendChild(el('span', 'ef-launch-btn-sub', 'Instant local mission'));
+    soloBtn.appendChild(el('span', 'ef-launch-btn-sub', 'Instant local mission (offline)'));
     soloBtn.addEventListener('click', () => {
       if (this._launchBusy) return;
       if (this._callbacks.onLaunchSolo) {
@@ -651,7 +653,7 @@ export class HudController {
     hostBtn.type = 'button';
     hostBtn.setAttribute('data-action', 'launch-host');
     hostBtn.appendChild(el('span', 'ef-launch-btn-title', 'HOST LOBBY'));
-    hostBtn.appendChild(el('span', 'ef-launch-btn-sub', 'Live co-op + invite link'));
+    hostBtn.appendChild(el('span', 'ef-launch-btn-sub', 'Start live room · up to 100 pilots'));
     hostBtn.addEventListener('click', () => {
       if (this._launchBusy) return;
       if (this._callbacks.onHostLobby) {
@@ -665,7 +667,7 @@ export class HudController {
 
     card.appendChild(primaryGrid);
 
-    // Live Lobbies Directory Section
+    // Live Lobbies Directory Section (high-contrast inset box + auto-refresh indicator)
     const lobbiesWrap = el('div', 'ef-launch-lobbies');
     const lobbiesHead = el('div', 'ef-launch-lobbies-head');
 
@@ -675,8 +677,21 @@ export class HudController {
     lobbiesMeta.appendChild(this._lobbiesCountEl);
     lobbiesHead.appendChild(lobbiesMeta);
 
-    const refreshBtn = el('button', 'ef-launch-refresh-btn', '↻ REFRESH');
+    const lobbiesControls = el('div', 'ef-launch-lobbies-controls');
+    const autoBadge = el('span', 'ef-launch-auto-badge');
+    autoBadge.setAttribute('data-auto-refresh', '5s');
+    autoBadge.appendChild(el('span', 'ef-live-dot'));
+    this._lobbiesAutoTextEl = el('span', 'ef-launch-auto-text', 'AUTO-REFRESHING · 5s');
+    autoBadge.appendChild(this._lobbiesAutoTextEl);
+    this._lobbiesAutoEl = autoBadge;
+    lobbiesControls.appendChild(autoBadge);
+
+    this._lobbiesUpdatedEl = el('span', 'ef-launch-updated ef-hidden', '');
+    lobbiesControls.appendChild(this._lobbiesUpdatedEl);
+
+    const refreshBtn = el('button', 'ef-launch-refresh-btn', '↻');
     refreshBtn.type = 'button';
+    refreshBtn.title = 'Refresh live lobbies now';
     refreshBtn.setAttribute('data-action', 'refresh-lobbies');
     refreshBtn.setAttribute('aria-label', 'Refresh live lobbies');
     refreshBtn.addEventListener('click', () => {
@@ -684,7 +699,9 @@ export class HudController {
       if (this._callbacks.onRefreshLobbies) this._callbacks.onRefreshLobbies();
     });
     this._launchRefreshBtn = refreshBtn;
-    lobbiesHead.appendChild(refreshBtn);
+    lobbiesControls.appendChild(refreshBtn);
+
+    lobbiesHead.appendChild(lobbiesControls);
     lobbiesWrap.appendChild(lobbiesHead);
 
     this._lobbiesListEl = el('div', 'ef-launch-lobbies-list');
@@ -703,7 +720,7 @@ export class HudController {
   /**
    * Shows or hides the sleek translucent launch & live lobby browser card over live DEMO FLIGHT.
    */
-  showLaunchOverlay(visible, { lobbies, loading, error, canDismiss, statusText } = {}) {
+  showLaunchOverlay(visible, { lobbies, loading, error, canDismiss, statusText, autoRefreshSec } = {}) {
     const show = Boolean(visible);
     this._launchOpen = show;
     if (typeof canDismiss === 'boolean') {
@@ -711,10 +728,11 @@ export class HudController {
     }
     this._launchCloseBtn.classList.toggle('ef-hidden', !this._launchCanDismiss);
 
-    if (lobbies !== undefined || loading !== undefined || error !== undefined) {
+    if (lobbies !== undefined || loading !== undefined || error !== undefined || autoRefreshSec !== undefined) {
       this.setLobbies(lobbies !== undefined ? lobbies : this._lobbies, {
         loading: loading !== undefined ? Boolean(loading) : this._lobbiesLoading,
         error: error !== undefined ? error : this._lobbiesError,
+        autoRefreshSec,
       });
     }
     if (typeof statusText === 'string') {
@@ -738,11 +756,48 @@ export class HudController {
 
   /**
    * Updates the Live Lobbies list shown inside the Launch Overlay (strictly DOM textContent).
+   * Preserves existing rows during background auto-refreshes to prevent list flicker.
    */
-  setLobbies(lobbies, { loading = false, error = null } = {}) {
-    this._lobbies = Array.isArray(lobbies) ? lobbies.slice(0, 20) : [];
-    this._lobbiesLoading = Boolean(loading);
+  setLobbies(lobbies, { loading = false, error = null, autoRefreshSec = 5, updatedAt = null } = {}) {
+    const isLoading = Boolean(loading);
+    const hasIncoming = Array.isArray(lobbies);
+    if (!isLoading) {
+      this._lobbies = hasIncoming ? lobbies.slice(0, 20) : [];
+      this._hasLoadedLobbies = true;
+    } else if (hasIncoming && (lobbies.length > 0 || !this._hasLoadedLobbies)) {
+      this._lobbies = lobbies.slice(0, 20);
+    }
+
+    this._lobbiesLoading = isLoading;
     this._lobbiesError = error ? String(error) : null;
+
+    if (this._lobbiesAutoEl && this._lobbiesAutoTextEl) {
+      const sec = Math.max(1, Math.round(Number(autoRefreshSec) || 5));
+      this._lobbiesAutoEl.setAttribute('data-auto-refresh', `${sec}s`);
+      this._lobbiesAutoEl.classList.toggle('is-syncing', isLoading);
+      this._lobbiesAutoEl.classList.toggle('is-warn', Boolean(this._lobbiesError) && !isLoading);
+      this._lobbiesAutoTextEl.textContent = isLoading
+        ? 'SCANNING LIVE...'
+        : this._lobbiesError
+          ? `RETRYING · ${sec}s`
+          : `AUTO-REFRESHING · ${sec}s`;
+    }
+
+    if (this._launchRefreshBtn) {
+      this._launchRefreshBtn.classList.toggle('is-syncing', isLoading);
+    }
+
+    if (!isLoading && !this._lobbiesError && this._lobbiesUpdatedEl) {
+      const ts = Number.isFinite(updatedAt) ? updatedAt : Date.now();
+      this._lastLobbiesUpdatedAt = ts;
+      const d = new Date(ts);
+      const hh = String(d.getHours()).padStart(2, '0');
+      const mm = String(d.getMinutes()).padStart(2, '0');
+      const ss = String(d.getSeconds()).padStart(2, '0');
+      this._lobbiesUpdatedEl.textContent = `${hh}:${mm}:${ss}`;
+      this._lobbiesUpdatedEl.classList.remove('ef-hidden');
+    }
+
     this._renderLobbiesList();
   }
 
@@ -770,7 +825,7 @@ export class HudController {
     this._lobbiesListEl.replaceChildren();
     this._lobbiesCountEl.textContent = String(this._lobbies.length);
 
-    if (this._lobbiesLoading) {
+    if (this._lobbiesLoading && this._lobbies.length === 0) {
       this._lobbiesListEl.appendChild(
         el('div', 'ef-lobby-empty', 'Scanning live airspace frequencies...')
       );
@@ -786,7 +841,7 @@ export class HudController {
 
     if (this._lobbies.length === 0) {
       this._lobbiesListEl.appendChild(
-        el('div', 'ef-lobby-empty', 'No active lobbies — Host one!')
+        el('div', 'ef-lobby-empty', 'No active lobbies yet — click HOST LOBBY to start one!')
       );
       return;
     }
@@ -819,7 +874,7 @@ export class HudController {
       row.appendChild(info);
 
       const right = el('div', 'ef-lobby-right');
-      const pilotsChip = el('span', `ef-lobby-pilots${isFull ? ' is-full' : ''}`, `${pilots}/${cap}`);
+      const pilotsChip = el('span', `ef-lobby-pilots${isFull ? ' is-full' : ''}`, `${pilots} / ${cap}`);
       right.appendChild(pilotsChip);
 
       const joinBtn = el('button', 'ef-lobby-join-btn', isFull ? 'FULL' : 'JOIN');
