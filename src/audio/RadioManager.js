@@ -40,14 +40,14 @@ const CATEGORY_PRIORITY = Object.freeze({
   damage_hit: 3,
   fire_contained: 3,
   operation_advance: 3,
-  hit_direct: 2,
+  drop_too_high: 3,
+  hit_direct: 3,
   hit_partial: 2,
-  drop_too_high: 2,
-  turbulence_smoke: 2,
   miss_overshoot: 2,
   miss_short: 2,
   miss_wide: 2,
   mission_start: 2,
+  turbulence_smoke: 1,
   scoop_full: 1,
   scoop_rough: 1,
   mp_join: 1,
@@ -240,9 +240,10 @@ export class RadioManager {
     const entry = { clip, priority, queuedAt: nowMs };
 
     if (this._active) {
-      // Preempt low-priority chatter immediately for urgent/combat callouts
+      // Preempt ambient chatter & routine advisories immediately for drop/urgent callouts
       const shouldPreempt =
         (this._active.priority === 0 && priority >= 2) ||
+        (this._active.priority <= 1 && priority >= 3) ||
         (priority >= 4 && this._active.priority < 4);
 
       if (shouldPreempt) {

@@ -113,12 +113,12 @@ export function evaluateDropAltitude(releaseAgl) {
       radiusMult = 0.85 + 0.15 * u;
     } else if (agl <= 52) {
       const u = clamp((agl - 42) / 10, 0, 1);
-      coolingMult = 1.8 - 0.45 * u;
-      radiusMult = 1.0 + 0.08 * u;
+      coolingMult = 1.8 - 0.65 * u;
+      radiusMult = 1.0;
     } else {
       const u = clamp((agl - 52) / 6, 0, 1);
-      coolingMult = 1.35 - 0.47 * u;
-      radiusMult = 1.08 + 0.06 * u;
+      coolingMult = 1.15 - 0.43 * u;
+      radiusMult = 1.0 + 0.08 * u;
     }
     return {
       altZone: 'optimal',
@@ -129,10 +129,11 @@ export function evaluateDropAltitude(releaseAgl) {
     };
   }
 
-  // > 58 m AGL: wind shears water load into wide weak mist (1.0x @ 55 m -> 0.22x @ 100 m+)
-  const t = clamp((agl - 55) / 45, 0, 1);
-  const coolingMult = Math.max(0.22, 1.0 - (1.0 - 0.22) * Math.pow(t, 0.85));
-  const radiusMult = 1.14 + 0.50 * clamp((agl - 58) / 42, 0, 1);
+  // > 58 m AGL: wind shear & convective evaporation shred water load into weak wide mist
+  // Decays sharply from 0.72x @ 58 m -> ~0.25x @ 70 m -> ~0.05x @ 88 m -> 0.04x floor @ 95 m+
+  const excess = Math.max(0, agl - FLIGHT_CONSTANTS.DROP_ALT_TOO_HIGH);
+  const coolingMult = Math.max(0.04, 0.72 * Math.exp(-excess / 11.5));
+  const radiusMult = 1.08 + 0.56 * clamp(excess / 42, 0, 1);
   return {
     altZone: 'too_high',
     dropQuality: 'misted_high',

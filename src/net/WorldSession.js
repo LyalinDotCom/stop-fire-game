@@ -15,6 +15,7 @@ import { MAX_SLOTS, PACING_MS, defaultCallsign, getBuildHash, sanitizeCallsign }
 import { encodeInput } from './protocol.js';
 
 const INPUT_SEND_INTERVAL_MS = 250; // 4 Hz nominal (safely above 180 ms server pacing rule)
+const URGENT_DROP_INTERVAL_MS = Math.max(225, PACING_MS.input + 45); // >= 225 ms from acked write to survive RTT jitter
 const DEFAULT_CONNECT_TIMEOUT_MS = 5500;
 const LINK_OFFLINE_FALLBACK_SEC = 12;
 const HOST_PUBLISH_STALL_ABDICATE_MS = 4500;
@@ -97,6 +98,8 @@ export class WorldSession {
     this._connectTimer = null;
     this._status = 'syncing';
     this._lastInputSentAt = 0;
+    this._lastInputAckAt = 0;
+    this._inputWriteInFlight = false;
     this._inputInFlightSince = 0;
     this._inputSeq = 0;
     this._inputSeqConnId = null;
@@ -534,6 +537,8 @@ export class WorldSession {
     }
 
     this._lastInputSentAt = 0;
+    this._lastInputAckAt = 0;
+    this._inputWriteInFlight = false;
     this._inputSeq = 0;
     this._inputSeqConnId = null;
     this._idleCountdown = null;
@@ -569,22 +574,27 @@ export class WorldSession {
     // Host consumes its own aircraft directly; skip redundant in/$uid self-write while hosting.
     if (this.isHost) return;
 
+    // Never overlap in/$uid writes (prevents RTT jitter from colliding on the 180 ms server rule).
+    if (this._inputWriteInFlight) return;
+
     const now = this.adapter.now();
     const urgentDrop = dropSeq !== this._lastSentDropSeq;
-    const minInterval = urgentDrop ? (PACING_MS.input + 15) : INPUT_SEND_INTERVAL_MS;
-    if (now - this._lastInputSentAt < minInterval) return;
+    const minInterval = urgentDrop ? URGENT_DROP_INTERVAL_MS : INPUT_SEND_INTERVAL_MS;
+    const lastRefAt = Math.max(this._lastInputSentAt, this._lastInputAckAt);
+    if (lastRefAt > 0 && now - lastRefAt < minInterval) return;
 
     if (this._inputSeqConnId !== connId) {
       this._inputSeq = 0;
       this._inputSeqConnId = connId;
     }
     const seq = ++this._inputSeq;
+    const sentDropSeq = dropSeq;
     const wireState = aircraft.crashed
       ? { ...aircraft, speedKmh: 0, releasing: false, scooping: false }
       : aircraft;
-    const d = encodeInput(wireState, dropSeq);
+    const d = encodeInput(wireState, sentDropSeq);
     this._lastInputSentAt = now;
-    this._lastSentDropSeq = dropSeq;
+    this._inputWriteInFlight = true;
     const path = `worlds/${this.worldId}/in/${this.adapter.uid}`;
     if (!this._inputInFlightSince) this._inputInFlightSince = this._nowPerf();
 
@@ -594,10 +604,16 @@ export class WorldSession {
       c: connId,
       d,
     }).then(() => {
+      this._inputWriteInFlight = false;
       this._inputInFlightSince = 0;
+      this._lastInputAckAt = this.adapter.now();
+      this._lastSentDropSeq = sentDropSeq;
       this.allocator?.markInputWritten();
     }).catch(() => {
+      // Do NOT advance _lastSentDropSeq on rejected/failed write so urgent drop retries cleanly.
+      this._inputWriteInFlight = false;
       this._inputInFlightSince = 0;
+      this._lastInputSentAt = this.adapter.now();
     });
   }
 
@@ -752,6 +768,8 @@ export class WorldSession {
   async stop() {
     if (this.stopped) return;
     this.stopped = true;
+    this._inputWriteInFlight = false;
+    this._lastInputAckAt = 0;
 
     clearTimeout(this._connectTimer);
     this._connectTimer = null;

@@ -171,6 +171,25 @@ async function smokeTestRuntime() {
     throw new Error('Expected scoop_rough clip to trigger');
   }
 
+  // Verify drop_too_high immediately preempts an active turbulence_smoke advisory
+  const preemptEvents = [];
+  const radio2 = new RadioManager(engine);
+  radio2.onTransmission((ev) => preemptEvents.push(ev));
+  radio2.trigger('turbulence_smoke');
+  radio2.trigger('drop_too_high');
+  if (
+    preemptEvents.length < 3 ||
+    preemptEvents[0].category !== 'turbulence_smoke' ||
+    preemptEvents[0].active !== true ||
+    preemptEvents[1].category !== 'turbulence_smoke' ||
+    preemptEvents[1].active !== false ||
+    preemptEvents[2].category !== 'drop_too_high' ||
+    preemptEvents[2].active !== true
+  ) {
+    throw new Error(`Expected drop_too_high to preempt turbulence_smoke immediately: ${JSON.stringify(preemptEvents)}`);
+  }
+  radio2.dispose();
+
   // Cooldown suppression check (normal priority immediate repeat of help_cabin)
   const suppressed = radio.trigger('help_cabin');
   if (suppressed !== null) {

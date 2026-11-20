@@ -1942,9 +1942,10 @@ test('#60: LobbyDirectory lists only live lobbies, picks unused/stale shard, and
     },
   };
 
-  // Seed stale megabasin-02 with expired authority & old dead fireKey (cabin 0 destroyed = 0 HP)
+  // Seed stale megabasin-02 with expired authority & slot lease + old dead fireKey (cabin 0 destroyed = 0 HP)
   await bootstrapWorld(hub, 'old-host', 'megabasin-02');
   hub._root.worlds['megabasin-02'].authority.leaseUntil = now - 10000;
+  hub._root.worlds['megabasin-02'].slots['0'].leaseUntil = now - 10000;
   hub._root.worlds['megabasin-02'].fireKey = {
     e: 1,
     q: 42,
@@ -1990,6 +1991,7 @@ test('#60: LobbyDirectory lists only live lobbies, picks unused/stale shard, and
   assert.equal(keyDecoded.opIndex, 0);
   assert.equal(keyDecoded.cabinHp[0], 100);
   assert.equal(hub.inspect('worldsIndex/megabasin-02/players'), 1);
+  assert.equal(hub.inspect('worldsIndex/megabasin-02/updatedAt'), hub.now(), 'worldsIndex must be freshly published on Host ready');
 
   await freshHostSess.stop();
 });
@@ -2005,4 +2007,141 @@ test('#60: dropQuality (optimal / misted_high / low_risk) round-trips through fi
   assert.equal(dec.dropOutcomes[0].dropQuality, 'optimal');
   assert.equal(dec.dropOutcomes[1].dropQuality, 'misted_high');
   assert.equal(dec.dropOutcomes[2].dropQuality, 'low_risk');
+});
+
+test('#71: HostBroadcaster.start() + concurrent step() produces zero meta/fireKey/worldsIndex permission_denied and immediate players=1', async () => {
+  const op0 = OPERATIONS[0];
+  const terrain = generateTerrain(op0);
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const worldId = 'megabasin-07';
+  await bootstrapWorld(hub, 'host-boot-1', worldId);
+
+  const client = hub.createClient('host-boot-1');
+  const setErrors = [];
+  const origSet = client.set.bind(client);
+  let delayFirstFireKey = true;
+  let releaseFireKey = null;
+  client.set = async (path, val) => {
+    if (delayFirstFireKey && path.endsWith('/fireKey')) {
+      delayFirstFireKey = false;
+      await new Promise((r) => { releaseFireKey = r; });
+    }
+    try {
+      return await origSet(path, val);
+    } catch (err) {
+      setErrors.push({ path, code: err?.code, message: err?.message });
+      throw err;
+    }
+  };
+
+  const sim = new FireSim(terrain, { isMegaBasin: true });
+  const host = new HostBroadcaster(client, worldId, {
+    terrain,
+    fireSim: sim,
+    epoch: 1,
+    opIndex: 0,
+    buildHash: BUILD_HASH,
+    localSlotId: 0,
+    enableBackgroundTicker: false,
+  });
+
+  const startPromise = host.start({ forceFreshMission: true });
+  // Yield until start() suspends on publishFireKey()
+  for (let i = 0; i < 6; i++) await Promise.resolve();
+  assert.equal(host.hydrated, false, 'hydrated must stay false until initial publishes finish');
+
+  // Simulate 150 ms of RAF step() frames firing while initial fireKey publish is still in flight
+  for (let i = 0; i < 10; i++) {
+    hub.advanceTime(16);
+    host.step(0.016);
+  }
+  assert.equal(setErrors.length, 0, 'step() must not race initial publishes');
+
+  // Now let initial fireKey/meta/worldsIndex finish
+  releaseFireKey?.();
+  await startPromise;
+  assert.equal(host.hydrated, true);
+  assert.equal(setErrors.length, 0, `expected zero RTDB errors during Host bootstrap, got: ${JSON.stringify(setErrors)}`);
+  assert.equal(hub.inspect(`worldsIndex/${worldId}/players`), 1, 'worldsIndex must immediately report players=1');
+  assert.ok(hub.inspect(`worlds/${worldId}/meta/d`), 'initial meta must be published cleanly');
+
+  // Immediate subsequent step() frames must ALSO produce zero permission_denied errors
+  for (let i = 0; i < 20; i++) {
+    hub.advanceTime(100);
+    host.step(0.1);
+    await Promise.resolve();
+  }
+  assert.equal(setErrors.length, 0, `expected zero RTDB pacing errors after bootstrap, got: ${JSON.stringify(setErrors)}`);
+  host.stop();
+});
+
+test('#71: Replica urgent drop in/$uid enforces >= 225 ms ack pacing and retries cleanly after a rejected write', async () => {
+  const op0 = OPERATIONS[0];
+  const terrain = generateTerrain(op0);
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const worldId = 'megabasin-08';
+  await bootstrapWorld(hub, 'host-pace-1', worldId);
+
+  const repClient = hub.createClient('rep-pace-2');
+  const repSess = new WorldSession({
+    adapter: repClient,
+    terrain,
+    fireSim: new FireSim(terrain, { isMegaBasin: true }),
+    opConfig: op0,
+    worldId,
+    buildHash: BUILD_HASH,
+    callsign: 'PACE-2',
+    colorIdx: 1,
+    disableRealTimers: true,
+  });
+  await repSess.start();
+  const claim = await repSess.requestManualControl();
+  assert.equal(claim.seated, true);
+
+  const ac = {
+    x: 0, y: 120, z: 0, yawDeg: 0, pitchDeg: 0, rollDeg: 0,
+    speedKmh: 158, tankPct: 100, releasing: false, scooping: false, autopilot: false, crashed: false,
+  };
+
+  // Write #1 succeeds at t0
+  repSess.sendLocalState(ac, 0);
+  await Promise.resolve();
+  await Promise.resolve();
+  const firstWrite = hub.inspect(`worlds/${worldId}/in/rep-pace-2`);
+  assert.equal(firstWrite.s, 1);
+
+  // Advance only 195 ms (previously caused permission_denied under >15 ms jitter): must NOT fire yet!
+  hub.advanceTime(195);
+  ac.releasing = true;
+  repSess.sendLocalState(ac, 1);
+  await Promise.resolve();
+  assert.equal(hub.inspect(`worlds/${worldId}/in/rep-pace-2`).s, 1, 'urgent drop must wait >= 225 ms from ack');
+
+  // Inject one transient failure on next in/$uid write -> dropSeq=1 MUST NOT be swallowed!
+  const origSet = repClient.set.bind(repClient);
+  let failOnce = true;
+  repClient.set = async (path, val) => {
+    if (failOnce && path.includes('/in/rep-pace-2')) {
+      failOnce = false;
+      throw new Error('PERMISSION_DENIED: simulated transient pacing jitter');
+    }
+    return origSet(path, val);
+  };
+
+  hub.advanceTime(35); // total 230 ms since first ack -> attempts dropSeq=1, fails transiently
+  repSess.sendLocalState(ac, 1);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(hub.inspect(`worlds/${worldId}/in/rep-pace-2`).s, 1, 'failed write did not land on server');
+
+  // After another 230 ms, Replica MUST automatically retry and deliver dropSeq=1!
+  hub.advanceTime(230);
+  repSess.sendLocalState(ac, 1);
+  await Promise.resolve();
+  await Promise.resolve();
+  const retried = hub.inspect(`worlds/${worldId}/in/rep-pace-2`);
+  assert.ok(retried.s > 1, 'retried urgent drop must land cleanly on server');
+  assert.equal(decodeInput(retried.d).dropSeq, 1, 'retried packet must preserve dropSeq=1');
+
+  await repSess.stop();
 });

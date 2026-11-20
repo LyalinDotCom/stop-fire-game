@@ -787,7 +787,7 @@ describe('FireSim', () => {
     assert.ok(out.pointsAwarded >= out.cellsExtinguished * SCORE.CELL_PRIMARY);
   });
 
-  it('enforces real altitude drop skill: optimal 34 m AGL extinguishes massive swath vs >100 m AGL misted_high', () => {
+  it('enforces real altitude drop skill on natural fire: 34 m optimal extinguishes massive swath vs 88 m / 105 m misted_high', () => {
     const terrain = generateTerrain(OPERATIONS[0]);
     const seed = terrain.initialFireSeeds[0];
     const center = terrain.gridToWorld(seed.gx, seed.gz);
@@ -796,22 +796,16 @@ describe('FireSim', () => {
     assert.equal(evaluateDropAltitude(12).altZone, 'too_low');
     assert.equal(evaluateDropAltitude(34).altZone, 'optimal');
     assert.ok(evaluateDropAltitude(34).coolingMult >= 1.79, 'peak optimal cooling is 1.8x');
-    assert.equal(evaluateDropAltitude(85).altZone, 'too_high');
+    assert.equal(evaluateDropAltitude(88).altZone, 'too_high');
+    assert.equal(evaluateDropAltitude(88).dropQuality, 'misted_high');
+    assert.ok(evaluateDropAltitude(88).coolingMult <= 0.12, '88m misted cooling sharply diluted');
     assert.equal(evaluateDropAltitude(105).dropQuality, 'misted_high');
-    assert.ok(evaluateDropAltitude(105).coolingMult <= 0.23, '105m misted cooling <= 0.22x');
+    assert.ok(evaluateDropAltitude(105).coolingMult <= 0.08, '105m misted cooling <= 0.08x');
     assert.ok(computeSplashRadius(105, 16) > computeSplashRadius(34, 16) * 1.4, 'high mist widens splash radius');
 
-    // Run identical targeted drop passes over fresh identical Operation 01 fire at 34 m vs 105 m AGL
+    // Run identical targeted 11-parcel drop passes over UNMODIFIED natural Operation 01 fire at 34 m, 88 m, and 105 m AGL
     const runAltitudePass = (agl) => {
       const sim = new FireSim(terrain);
-      // Ramp fire cells to full roaring intensity (10) so misted high-altitude drops can't accidentally snuff weak cells
-      for (let a = 0; a < sim.activeCount; a++) {
-        const idx = sim.activeList[a];
-        if (sim.cells[idx] >= 1 && sim.cells[idx] <= 12) {
-          sim.intensityF[idx] = 10.0;
-          sim.cells[idx] = 10;
-        }
-      }
       const gy = terrain.getHeight(center.x, center.z);
       const plane = createAircraftState({
         x: center.x - 160,
@@ -829,7 +823,7 @@ describe('FireSim', () => {
       for (let i = 0; i < 120; i++) {
         const pred = predictDropImpact(plane, sim, terrain, sim);
         if (!started && pred.impactX >= center.x - 28) started = true;
-        if (started && dropped < 10) {
+        if (started && dropped < 11) {
           const curAgl = Math.max(4, plane.y - terrain.getHeight(plane.x, plane.z));
           sim.spawnWaterParcel(7, plane.x, plane.y, plane.z, plane.vx, plane.vy, plane.vz, curAgl, 1);
           dropped++;
@@ -843,21 +837,36 @@ describe('FireSim', () => {
     };
 
     const optRes = runAltitudePass(34);
-    const highRes = runAltitudePass(105);
+    const high88Res = runAltitudePass(88);
+    const high105Res = runAltitudePass(105);
 
     assert.equal(optRes.pred0.altZone, 'optimal');
-    assert.equal(highRes.pred0.altZone, 'too_high');
+    assert.equal(high88Res.pred0.altZone, 'too_high');
+    assert.equal(high105Res.pred0.altZone, 'too_high');
     assert.ok(optRes.outcome, 'optimal pass emitted outcome');
-    assert.ok(highRes.outcome, 'high pass emitted outcome');
+    assert.ok(high88Res.outcome, '88m high pass emitted outcome');
+    assert.ok(high105Res.outcome, '105m high pass emitted outcome');
     assert.equal(optRes.outcome.dropQuality, 'optimal');
-    assert.equal(highRes.outcome.dropQuality, 'misted_high');
+    assert.equal(optRes.outcome.outcome, 'direct');
+    assert.equal(high88Res.outcome.dropQuality, 'misted_high');
+    assert.equal(high88Res.outcome.outcome, 'partial');
+    assert.equal(high105Res.outcome.dropQuality, 'misted_high');
+    assert.equal(high105Res.outcome.outcome, 'partial');
     assert.ok(
-      optRes.outcome.cellsExtinguished >= 15,
-      `optimal 34m pass extinguished ${optRes.outcome.cellsExtinguished} cells (expected >= 15)`
+      optRes.outcome.cellsExtinguished >= 20,
+      `optimal 34m pass extinguished ${optRes.outcome.cellsExtinguished} cells (expected >= 20)`
     );
     assert.ok(
-      highRes.outcome.cellsExtinguished < optRes.outcome.cellsExtinguished * 0.3,
-      `high 105m misted pass (${highRes.outcome.cellsExtinguished}) must be drastically weaker than optimal 34m (${optRes.outcome.cellsExtinguished})`
+      high88Res.outcome.cellsExtinguished <= 6,
+      `88m misted pass must extinguish <= 6 cells (got ${high88Res.outcome.cellsExtinguished} vs optimal ${optRes.outcome.cellsExtinguished})`
+    );
+    assert.ok(
+      high88Res.outcome.cellsCooled > 0,
+      `88m misted pass still cools fire slightly (cellsCooled=${high88Res.outcome.cellsCooled})`
+    );
+    assert.ok(
+      high105Res.outcome.cellsExtinguished <= 2,
+      `105m misted pass must extinguish <= 2 cells (got ${high105Res.outcome.cellsExtinguished})`
     );
   });
 

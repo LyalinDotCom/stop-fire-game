@@ -225,6 +225,7 @@ class EmberFrontApp {
     this._mpSession = null;
     this._mpAdapter = null;
     this._dirAdapter = null;
+    this._dirConnectPromise = null;
     this._loopbackHandle = null;
     this._mpClaimPending = false;
     this._modeSwitchSeq = 0;
@@ -436,16 +437,15 @@ class EmberFrontApp {
     }
 
     // Default clean launch choice over live scenic DEMO FLIGHT:
-    // FLY SOLO | HOST LOBBY | Live Hosted Lobbies
+    // FLY SOLO | HOST LOBBY | Live Hosted Lobbies (opt-in Refresh keeps 0 Firebase sockets at boot!)
     this.mode = 'solo';
     this.lastNetState = this._makeSoloNetState({ connStatus: 'solo' });
     this.hud.showLaunchOverlay(true, {
       lobbies: [],
-      loading: true,
+      loading: false,
       canDismiss: false,
-      statusText: 'Select Solo or join/host a live co-op squadron',
+      statusText: 'Select Solo, Host Lobby, or click ↻ REFRESH to scan live lobbies',
     });
-    this.refreshLobbies();
   }
 
   async _closeDirectoryAdapter() {
@@ -457,6 +457,58 @@ class EmberFrontApp {
     }
   }
 
+  /**
+   * Lazily connect or reuse a single shared directory RTDB adapter.
+   * Deduplicates concurrent connectFirebase() calls so rapid ↻ REFRESH clicks
+   * never call goOffline() on the shared ember-front-net Database singleton.
+   */
+  async _ensureDirectoryAdapter() {
+    if (this._mpAdapter && !this._mpAdapter._closed) return this._mpAdapter;
+    if (this._dirAdapter && !this._dirAdapter._closed) return this._dirAdapter;
+    if (!this._dirConnectPromise) {
+      const startModeSeq = this._modeSwitchSeq;
+      this._dirConnectPromise = (async () => {
+        const [
+          { FIREBASE_CONFIG },
+          { parseNetQuery },
+          { connectFirebase },
+        ] = await Promise.all([
+          import('./net/firebaseConfig.js'),
+          import('./net/config.js'),
+          import('./net/FirebaseClient.js'),
+        ]);
+        const netCfg = parseNetQuery ? parseNetQuery(window.location.search) : {};
+        if (!FIREBASE_CONFIG.apiKey && !netCfg.emu && !this.query.useEmulator) {
+          return null;
+        }
+        const adapter = await withTimeout(
+          connectFirebase({
+            search: window.location.search,
+            emulatorPorts: netCfg.emulatorPorts || (this.query.useEmulator ? undefined : null),
+            tab: Boolean(netCfg.tab || this.query.perTabAuth),
+            appName: 'ember-front-net',
+          }),
+          5500,
+          'Lobby lookup timed out'
+        );
+        if (this._disposed || (this.mode === 'solo' && this._modeSwitchSeq !== startModeSeq && !this.hud.isLaunchOverlayOpen())) {
+          if (!this._mpAdapter) {
+            try { adapter.goOffline(); } catch { /* ignore */ }
+            await adapter.close().catch(() => {});
+          }
+          return null;
+        }
+        if (!this._mpAdapter) {
+          this._dirAdapter = adapter;
+        }
+        return this._mpAdapter || this._dirAdapter;
+      })().finally(() => {
+        this._dirConnectPromise = null;
+      });
+    }
+    return this._dirConnectPromise;
+  }
+
   /** Fetch live hosted lobbies from bounded RTDB `worldsIndex` without claiming a slot. */
   async refreshLobbies() {
     const reqSeq = ++this._lobbyListSeq;
@@ -464,47 +516,14 @@ class EmberFrontApp {
       this.hud.setLobbies([], { loading: true, error: null });
     }
     try {
-      const [
-        { FIREBASE_CONFIG },
-        { parseNetQuery },
-        { connectFirebase },
-        { listLiveLobbies },
-      ] = await Promise.all([
-        import('./net/firebaseConfig.js'),
-        import('./net/config.js'),
-        import('./net/FirebaseClient.js'),
+      const [{ listLiveLobbies }, adapter] = await Promise.all([
         import('./net/LobbyDirectory.js'),
+        this._ensureDirectoryAdapter(),
       ]);
       if (reqSeq !== this._lobbyListSeq || this._disposed) return [];
-
-      const netCfg = parseNetQuery ? parseNetQuery(window.location.search) : {};
-      if (!FIREBASE_CONFIG.apiKey && !netCfg.emu && !this.query.useEmulator) {
+      if (!adapter || adapter._closed) {
         this.hud.setLobbies([], { loading: false, error: null });
         return [];
-      }
-
-      let adapter = this._mpAdapter || this._dirAdapter;
-      if (!adapter || adapter._closed) {
-        adapter = await withTimeout(
-          connectFirebase({
-            search: window.location.search,
-            emulatorPorts: netCfg.emulatorPorts || (this.query.useEmulator ? undefined : null),
-            tab: Boolean(netCfg.tab || this.query.perTabAuth),
-            appName: 'ember-front-net',
-          }),
-          5000,
-          'Lobby lookup timed out'
-        );
-        if (reqSeq !== this._lobbyListSeq || this._disposed) {
-          if (!this._mpAdapter) {
-            try { adapter.goOffline(); } catch { /* ignore */ }
-            await adapter.close().catch(() => {});
-          }
-          return [];
-        }
-        if (!this._mpAdapter) {
-          this._dirAdapter = adapter;
-        }
       }
 
       const lobbies = await withTimeout(listLiveLobbies(adapter), 4500, 'Lobby list timed out');
@@ -647,7 +666,10 @@ class EmberFrontApp {
     }
     this.hud.setLaunchBusy('Starting hosted lobby...');
 
-    // Tear down any prior live session cleanly first (reuse dirAdapter if open).
+    // Tear down any prior live session cleanly first (await & reuse dirAdapter if open/connecting).
+    if (this._dirConnectPromise) {
+      await this._dirConnectPromise.catch(() => null);
+    }
     const existingDir = this._dirAdapter;
     this._dirAdapter = null;
     await this._teardownNetwork();
@@ -789,6 +811,9 @@ class EmberFrontApp {
       this.hud.setLaunchBusy('Joining live lobby...');
     }
 
+    if (this._dirConnectPromise) {
+      await this._dirConnectPromise.catch(() => null);
+    }
     const existingDir = this._dirAdapter;
     this._dirAdapter = null;
     await this._teardownNetwork();
@@ -1026,13 +1051,18 @@ class EmberFrontApp {
     if (this.hud.isDrawerOpen()) {
       this._handleToggleDrawer(false);
     }
+    const hasLiveAdapter = Boolean(this._mpAdapter && !this._mpAdapter._closed);
     this.hud.showLaunchOverlay(true, {
       lobbies: [],
-      loading: true,
+      loading: hasLiveAdapter,
       canDismiss: true,
-      statusText: 'Switch between Solo, Host Lobby, or Join a live squadron',
+      statusText: hasLiveAdapter
+        ? 'Switch between Solo, Host Lobby, or Join a live squadron'
+        : 'Switch mode or click ↻ REFRESH to scan live lobbies',
     });
-    this.refreshLobbies();
+    if (hasLiveAdapter) {
+      this.refreshLobbies();
+    }
   }
 
   _buildWorld(opConfig, { preservePilot = false } = {}) {
@@ -1409,7 +1439,7 @@ class EmberFrontApp {
         this.audio.playCabinSavedChord();
       }
 
-      // Altitude drop quality coaching on VHF radio
+      // Altitude drop quality coaching on VHF radio (native priority 3 preempts turbulence_smoke)
       if (o.dropQuality === 'misted_high') {
         this.radio.trigger('drop_too_high');
       } else if (o.outcome === 'direct') {

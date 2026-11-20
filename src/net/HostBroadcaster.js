@@ -86,6 +86,7 @@ export class HostBroadcaster {
     this.basePath = `worlds/${worldId}`;
     this.running = false;
     this.hydrated = false;
+    this._bootstrapping = false;
 
     this.planesSeq = 0;
     this.fireSeq = 0;
@@ -174,14 +175,14 @@ export class HostBroadcaster {
 
     if (publishNow && this.running && this.hydrated) {
       const now = this.adapter.now();
-      if (!this._lastFireKeyAt || now - this._lastFireKeyAt >= PACING_MS.fireKey) {
+      if (!this._lastFireKeyAt || now - this._lastFireKeyAt >= PACING_MS.fireKey + 250) {
         this._needsWaveKeyPublish = false;
         this.publishFireKey().catch(() => {});
       }
-      if (!this._lastMetaAt || now - this._lastMetaAt >= PACING_MS.meta) {
+      if (!this._lastMetaAt || now - this._lastMetaAt >= PACING_MS.meta + 250) {
         this.publishMeta().catch(() => {});
       }
-      if (!this._lastIndexAt || now - this._lastIndexAt >= PACING_MS.worldsIndex) {
+      if (!this._lastIndexAt || now - this._lastIndexAt >= PACING_MS.worldsIndex + 250) {
         this.publishWorldsIndex().catch(() => {});
       }
     }
@@ -190,6 +191,7 @@ export class HostBroadcaster {
   async start({ isFailover = false, forceFreshMission = false } = {}) {
     if (this.running) return;
     this.running = true;
+    this._bootstrapping = true;
 
     this._offs = [
       this.adapter.onValue(`${this.basePath}/slots`, (v) => { this._slots = v || {}; }, () => {}),
@@ -205,14 +207,17 @@ export class HostBroadcaster {
         this.adapter.get(`${this.basePath}/fireRing`).catch(() => null),
         this.adapter.get(`${this.basePath}/planes`).catch(() => null),
         this.adapter.get(`${this.basePath}/meta`).catch(() => null),
-        this.adapter.get(`worldsIndex/${this.worldId}`).catch(() => null),
+        this.adapter.queryWorldsIndex({ limit: 20 }).then((all) => all?.[this.worldId] ?? null).catch(() => null),
         this.adapter.get(`${this.basePath}/slots`).catch(() => null),
         this.adapter.get(`${this.basePath}/roster`).catch(() => null),
         this.adapter.get(`${this.basePath}/presence`).catch(() => null),
         this.adapter.get(`${this.basePath}/in`).catch(() => null),
       ]);
 
-    if (!this.running) return;
+    if (!this.running) {
+      this._bootstrapping = false;
+      return;
+    }
 
     this._config = configNode || null;
     this._slots = slots || {};
@@ -307,20 +312,38 @@ export class HostBroadcaster {
     const now = this.adapter.now();
     this._lastPlanesAt = now;
     this._lastFireRingAt = now;
-    this.hydrated = true;
-    this._bgTicker?.start?.();
 
+    // Publish initial snapshots BEFORE flipping hydrated = true so step() cannot
+    // race with start() and fire a duplicate meta/fireKey/worldsIndex write inside pacing rules.
     const epochAdvanced = !fireKey || this.epoch > (fireKey.e | 0);
-    if (epochAdvanced || !this._lastFireKeyAt || now - this._lastFireKeyAt >= PACING_MS.fireKey) {
+    if (epochAdvanced || !this._lastFireKeyAt || now - this._lastFireKeyAt >= PACING_MS.fireKey + 250) {
       await this.publishFireKey().catch(() => {});
+    } else {
+      this._lastFireKeyAt = Math.max(this._lastFireKeyAt, (fireKey?.t || 0) + 250);
     }
     const metaEpochAdvanced = !metaNode || this.epoch > (metaNode.e | 0);
-    if (forceFreshMission && (metaEpochAdvanced || !this._lastMetaAt || now - this._lastMetaAt >= PACING_MS.meta)) {
+    if (metaEpochAdvanced || !this._lastMetaAt || now - this._lastMetaAt >= PACING_MS.meta + 250) {
       await this.publishMeta().catch(() => {});
+    } else {
+      this._lastMetaAt = Math.max(this._lastMetaAt, (metaNode?.t || 0) + 250);
     }
-    if (!this._lastIndexAt || now - this._lastIndexAt >= PACING_MS.worldsIndex) {
+    if (!this._lastIndexAt || now - this._lastIndexAt >= PACING_MS.worldsIndex + 250) {
       await this.publishWorldsIndex().catch(() => {});
+    } else {
+      this._lastIndexAt = Math.max(this._lastIndexAt, (indexNode?.updatedAt || 0) + 250);
     }
+
+    if (!this.running) {
+      this._bootstrapping = false;
+      return;
+    }
+
+    const readyAt = this.adapter.now();
+    this._lastPlanesAt = readyAt;
+    this._lastFireRingAt = readyAt;
+    this._bootstrapping = false;
+    this.hydrated = true;
+    this._bgTicker?.start?.();
   }
 
   getPilotTank(slotId) {
@@ -337,14 +360,19 @@ export class HostBroadcaster {
 
   _countLiveSlots(now) {
     let count = 0;
-    for (const sObj of Object.values(this._slots)) {
-      if (sObj && typeof sObj.leaseUntil === 'number' && sObj.leaseUntil > now) count++;
+    let hasLocal = false;
+    for (const [slotKey, sObj] of Object.entries(this._slots)) {
+      if (sObj && typeof sObj.leaseUntil === 'number' && sObj.leaseUntil > now) {
+        count++;
+        if (this.localSlotId !== null && Number(slotKey) === this.localSlotId) hasLocal = true;
+      }
     }
+    if (!hasLocal && this.localSlotId !== null) count++;
     return count;
   }
 
   step(dtSec) {
-    if (!this.running || !this.hydrated) return;
+    if (!this.running || !this.hydrated || this._bootstrapping) return;
 
     this._simAccum += Math.min(0.5, Math.max(0, dtSec));
     const maxSubsteps = 5;
@@ -366,8 +394,8 @@ export class HostBroadcaster {
       this._lastFireRingAt = now;
       this.publishFireRing().catch(() => {});
     }
-    // Wave 2+ fullReset forces a fireKey publish as soon as >= 4000 ms pacing allows.
-    const keyInterval = this._needsWaveKeyPublish ? PACING_MS.fireKey : FIRE_KEY_INTERVAL_MS;
+    // Wave 2+ fullReset forces a fireKey publish as soon as >= 4250 ms pacing allows.
+    const keyInterval = this._needsWaveKeyPublish ? (PACING_MS.fireKey + 250) : FIRE_KEY_INTERVAL_MS;
     if (now - this._lastFireKeyAt >= keyInterval) {
       this._lastFireKeyAt = now;
       this._needsWaveKeyPublish = false;
@@ -843,7 +871,7 @@ export class HostBroadcaster {
   }
 
   async publishFireKey() {
-    if (!this.running || !this.hydrated) return;
+    if (!this.running || (!this.hydrated && !this._bootstrapping)) return;
     const full = this.fireSim.encodeFullState();
     const d = encodeFireKey({
       ...full,
@@ -851,16 +879,20 @@ export class HostBroadcaster {
       gridSize: this.terrain?.gridSize ?? this.fireSim.gridSize,
     });
     this._lastFireKeyAt = this.adapter.now();
-    await this.adapter.set(`${this.basePath}/fireKey`, {
-      e: this.epoch,
-      q: this.fireSeq,
-      t: this.adapter.serverTimestamp(),
-      d,
-    });
+    try {
+      await this.adapter.set(`${this.basePath}/fireKey`, {
+        e: this.epoch,
+        q: this.fireSeq,
+        t: this.adapter.serverTimestamp(),
+        d,
+      });
+    } finally {
+      this._lastFireKeyAt = this.adapter.now();
+    }
   }
 
   async publishMeta() {
-    if (!this.running || !this.hydrated) return;
+    if (!this.running || (!this.hydrated && !this._bootstrapping)) return;
     const snap = this.fireSim.getSnapshot();
     const now = this.adapter.now();
     const scores = this.fireSim.getSlotScores();
@@ -889,15 +921,19 @@ export class HostBroadcaster {
     });
 
     this._lastMetaAt = now;
-    await this.adapter.set(`${this.basePath}/meta`, {
-      e: this.epoch,
-      t: this.adapter.serverTimestamp(),
-      d,
-    });
+    try {
+      await this.adapter.set(`${this.basePath}/meta`, {
+        e: this.epoch,
+        t: this.adapter.serverTimestamp(),
+        d,
+      });
+    } finally {
+      this._lastMetaAt = this.adapter.now();
+    }
   }
 
   async publishWorldsIndex() {
-    if (!this.running || !this.hydrated) return;
+    if (!this.running || (!this.hydrated && !this._bootstrapping)) return;
     const now = this.adapter.now();
     if (!this._config) {
       this._config = await this.adapter.get(`${this.basePath}/config`).catch(() => null);
@@ -906,16 +942,20 @@ export class HostBroadcaster {
 
     const players = Math.min(100, this._countLiveSlots(now));
     this._lastIndexAt = now;
-    await this.adapter.set(`worldsIndex/${this.worldId}`, {
-      name: this.worldName,
-      mode: 'megabasin',
-      players,
-      cap: this._config.cap ?? 100,
-      buildHash: this._config.buildHash || this.buildHash,
-      protocolVersion: PROTOCOL_VERSION,
-      updatedAt: this.adapter.serverTimestamp(),
-      expiresAt: this._config.expiresAt,
-    });
+    try {
+      await this.adapter.set(`worldsIndex/${this.worldId}`, {
+        name: this.worldName,
+        mode: 'megabasin',
+        players,
+        cap: this._config.cap ?? 100,
+        buildHash: this._config.buildHash || this.buildHash,
+        protocolVersion: PROTOCOL_VERSION,
+        updatedAt: this.adapter.serverTimestamp(),
+        expiresAt: this._config.expiresAt,
+      });
+    } finally {
+      this._lastIndexAt = this.adapter.now();
+    }
   }
 
   /**
@@ -987,6 +1027,7 @@ export class HostBroadcaster {
   stop() {
     if (!this.running) return;
     this.running = false;
+    this._bootstrapping = false;
     this.hydrated = false;
     this._bgTicker?.stop?.();
     for (const off of this._offs) off?.();

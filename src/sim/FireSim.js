@@ -579,14 +579,17 @@ export class FireSim {
    * Apply a landed water parcel splash onto the grid via conflict-free wetDelta.
    * Uses the exact shared evaluateDropAltitude() & computeSplashRadius() formulas matching predictDropImpact().
    * - Optimal 18-52 m (peak 25-42 m): concentrated curtain (up to 1.8x cooling -> massive knockdown)
-   * - Too high > 58 m: wide wind-sheared mist (drops smoothly to 0.22x @ 100 m+)
+   * - Too high > 58 m: wide wind-sheared evaporated mist with quadratic 2D area dilution (refR/R)^2
    */
   _applyWaterSplash(slotId, dropId, x, z, releaseAgl) {
     const altEval = evaluateDropAltitude(releaseAgl);
     const R = computeSplashRadius(releaseAgl, this.cellSize);
     const refR = 44.0 * (this.cellSize / 16.0);
-    const K0 = 6.8;
-    const knockdown = K0 * altEval.coolingMult * Math.pow(refR / R, 0.90);
+    const K0 = 6.0;
+    // True 2D area dilution (refR/R)^2 so wide wind-sheared mist loses liquid density quadratically
+    const areaDilution = Math.min(1.35, (refR * refR) / (R * R));
+    const knockdown = K0 * altEval.coolingMult * areaDilution;
+    const edgeFalloff = altEval.dropQuality === 'misted_high' ? 0.72 : 0.32;
 
     const burst = dropId > 0 ? this._burstsById.get(dropId) : null;
     if (burst) {
@@ -628,7 +631,7 @@ export class FireSim {
 
         const st = cells[idx];
         const isFire = (st >= 1 && st <= 12) || st === CELL_STATE.EMBER_WARN;
-        const falloff = 1.0 - 0.32 * (dSq / rSq);
+        const falloff = 1.0 - edgeFalloff * (dSq / rSq);
         this._recordWet(idx, slotId, dropId, knockdown * falloff, isFire);
         if (isFire) {
           hitActiveFire = true;
@@ -1122,9 +1125,19 @@ export class FireSim {
       const cellsCooled = burst.cooledCellSet.size;
       const pointsAwarded = Math.round(burst.pointsAwarded);
       const targetFireCount = burst.fireCellsTouched.size;
+      const avgReleaseAgl = burst.totalParcels > 0 ? burst.releaseAglSum / burst.totalParcels : 35;
+      const { dropQuality } = evaluateDropAltitude(avgReleaseAgl);
 
       let outcome;
-      if (
+      if (dropQuality === 'misted_high') {
+        if (cellsExtinguished >= 8 && targetFireCount > 0 && cellsExtinguished >= targetFireCount * 0.5) {
+          outcome = 'direct';
+        } else if (cellsExtinguished >= 1 || cellsCooled >= 1) {
+          outcome = 'partial';
+        } else {
+          outcome = 'miss';
+        }
+      } else if (
         cellsExtinguished >= 3 ||
         (cellsExtinguished >= 1 && targetFireCount > 0 && cellsExtinguished >= targetFireCount * 0.5)
       ) {
@@ -1169,9 +1182,6 @@ export class FireSim {
           missType = 'wide';
         }
       }
-
-      const avgReleaseAgl = burst.totalParcels > 0 ? burst.releaseAglSum / burst.totalParcels : 35;
-      const { dropQuality } = evaluateDropAltitude(avgReleaseAgl);
 
       this._emitDropOutcome({
         dropId: burst.id,
