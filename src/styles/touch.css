@@ -551,7 +551,7 @@ body.touch-active .ef-compass-wrap {
 
 /* Move Telemetry from bottom-left -> top-left beneath Op Card (frees left thumbstick) */
 body.touch-active .ef-telemetry-card {
-  top: calc(108px + env(safe-area-inset-top, 0px));
+  top: calc(120px + env(safe-area-inset-top, 0px));
   left: calc(16px + env(safe-area-inset-left, 0px));
   bottom: auto;
   width: 232px;
@@ -560,7 +560,7 @@ body.touch-active .ef-telemetry-card {
 /* Keep auto-hiding VHF radio toast cleanly below Telemetry when speaking */
 body.touch-active .ef-radio-toast {
   position: fixed;
-  top: calc(230px + env(safe-area-inset-top, 0px));
+  top: calc(254px + env(safe-area-inset-top, 0px));
   left: calc(16px + env(safe-area-inset-left, 0px));
   width: 232px;
   max-width: calc(100vw - 32px);
@@ -603,52 +603,67 @@ body.touch-active .ef-overlay-card {
    5. Portrait Mobile Ergonomics (e.g. 390x844, 375x667, <= 640px wide)
    ========================================================================== */
 @media (max-width: 640px) {
+  body.touch-active .ef-left-top-stack,
   .ef-left-top-stack {
     top: calc(8px + env(safe-area-inset-top, 0px));
     left: calc(10px + env(safe-area-inset-left, 0px));
-    width: 168px;
+    width: 186px;
     gap: 6px;
   }
 
   .ef-op-card {
-    padding: 6px 8px 6px 9px;
+    padding: 5px 7px 5px 8px;
   }
 
   .ef-op-toprow {
     margin-bottom: 2px;
     gap: 4px;
+    flex-wrap: nowrap;
   }
 
   .ef-op-code {
-    font-size: 8.5px;
-    letter-spacing: 0.1em;
+    font-size: 8px;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .ef-airspace-chip {
     padding: 1px 5px;
-    font-size: 8px;
-    gap: 4px;
+    font-size: 7.5px;
+    letter-spacing: 0.04em;
+    gap: 3px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .ef-airspace-chip .ef-status-dot {
+    width: 5px;
+    height: 5px;
   }
 
   .ef-op-title {
-    font-size: 12px;
-    margin-bottom: 4px;
+    font-size: 11.5px;
+    line-height: 1.15;
+    margin-bottom: 3px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
   .ef-op-stats {
-    gap: 7px;
-    padding-top: 4px;
+    gap: 6px;
+    padding-top: 3px;
   }
 
   .ef-op-stat-label {
-    font-size: 7.5px;
+    font-size: 7px;
+    line-height: 1.1;
   }
 
   .ef-op-stat-val {
     font-size: 10.5px;
+    line-height: 1.15;
   }
 
   .ef-toast-anchor {
@@ -660,6 +675,7 @@ body.touch-active .ef-overlay-card {
     padding: 2px 6px;
   }
 
+  body.touch-active .ef-topright-cluster,
   .ef-topright-cluster {
     top: calc(8px + env(safe-area-inset-top, 0px));
     right: calc(10px + env(safe-area-inset-right, 0px));
@@ -700,13 +716,13 @@ body.touch-active .ef-overlay-card {
     height: 16px;
   }
 
-  /* Compact Telemetry & Tactical Map tucked in upper corners */
+  /* Compact Telemetry & Tactical Map tucked in upper corners with guaranteed clearance */
   body.touch-active .ef-telemetry-card,
   .ef-telemetry-card {
-    top: calc(74px + env(safe-area-inset-top, 0px));
+    top: calc(84px + env(safe-area-inset-top, 0px));
     left: calc(10px + env(safe-area-inset-left, 0px));
     bottom: auto;
-    width: 168px;
+    width: 186px;
     padding: 5px 8px 6px;
     gap: 4px;
   }
@@ -772,10 +788,10 @@ body.touch-active .ef-overlay-card {
     display: none;
   }
 
-  /* Place Slim Compass cleanly below the Top-Left Telemetry & Top-Right Map */
+  /* Place Slim Compass cleanly below BOTH Top-Left Telemetry and Top-Right Map */
   body.touch-active .ef-compass-wrap,
   .ef-compass-wrap {
-    top: calc(154px + env(safe-area-inset-top, 0px));
+    top: calc(168px + env(safe-area-inset-top, 0px));
     width: 168px;
   }
 
@@ -794,7 +810,7 @@ body.touch-active .ef-overlay-card {
   }
 
   .ef-outcome-banner {
-    top: calc(196px + env(safe-area-inset-top, 0px));
+    top: calc(218px + env(safe-area-inset-top, 0px));
     max-width: calc(100vw - 20px);
     padding: 6px 12px;
   }
@@ -811,9 +827,9 @@ body.touch-active .ef-overlay-card {
   body.touch-active .ef-radio-toast,
   .ef-radio-toast {
     position: fixed;
-    top: calc(196px + env(safe-area-inset-top, 0px));
+    top: calc(218px + env(safe-area-inset-top, 0px));
     left: calc(10px + env(safe-area-inset-left, 0px));
-    width: 192px;
+    width: 210px;
     max-width: calc(100vw - 20px);
     padding: 5px 8px;
   }
@@ -882,10 +898,11 @@ body.touch-active .ef-overlay-card {
 
 /* Ultra-narrow portrait safeguard (<= 360px wide) */
 @media (max-width: 360px) {
+  body.touch-active .ef-left-top-stack,
   .ef-left-top-stack,
   body.touch-active .ef-telemetry-card,
   .ef-telemetry-card {
-    width: 152px;
+    width: 162px;
   }
 
   body.touch-active .ef-map-canvas,
@@ -924,49 +941,67 @@ body.touch-active .ef-overlay-card {
    Wide open center sky corridor + top-corner HUD + bottom-corner thumb controls.
    ========================================================================== */
 @media (max-height: 500px), (orientation: landscape) and (max-height: 540px) {
+  body.touch-active .ef-left-top-stack,
   .ef-left-top-stack {
     top: calc(8px + env(safe-area-inset-top, 0px));
     left: calc(12px + env(safe-area-inset-left, 0px));
-    width: 184px;
+    width: 196px;
     gap: 5px;
   }
 
   .ef-op-card {
-    padding: 5px 8px 5px 9px;
+    padding: 5px 7px 5px 8px;
   }
 
   .ef-op-toprow {
-    margin-bottom: 1px;
+    margin-bottom: 2px;
+    gap: 4px;
+    flex-wrap: nowrap;
   }
 
   .ef-op-code {
-    font-size: 8.5px;
+    font-size: 8px;
+    letter-spacing: 0.06em;
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .ef-airspace-chip {
     padding: 1px 5px;
-    font-size: 8px;
+    font-size: 7.5px;
+    letter-spacing: 0.04em;
+    gap: 3px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  .ef-airspace-chip .ef-status-dot {
+    width: 5px;
+    height: 5px;
   }
 
   .ef-op-title {
-    font-size: 12px;
-    margin-bottom: 4px;
+    font-size: 11.5px;
+    line-height: 1.15;
+    margin-bottom: 3px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
 
   .ef-op-stats {
-    gap: 8px;
+    gap: 7px;
     padding-top: 3px;
   }
 
   .ef-op-stat-label {
-    font-size: 7.5px;
+    font-size: 7px;
+    line-height: 1.1;
   }
 
   .ef-op-stat-val {
     font-size: 10.5px;
+    line-height: 1.15;
   }
 
   /* Slim Compass stays cleanly at top-center between Left Op Card and Right Buttons */
@@ -991,8 +1026,9 @@ body.touch-active .ef-overlay-card {
     margin-top: 2px;
   }
 
+  /* Outcome Banner sits cleanly below top-center VHF radio toast */
   .ef-outcome-banner {
-    top: calc(48px + env(safe-area-inset-top, 0px));
+    top: calc(114px + env(safe-area-inset-top, 0px));
     max-width: 390px;
     padding: 5px 12px;
   }
@@ -1005,6 +1041,7 @@ body.touch-active .ef-overlay-card {
     font-size: 9.5px;
   }
 
+  body.touch-active .ef-topright-cluster,
   .ef-topright-cluster {
     top: calc(8px + env(safe-area-inset-top, 0px));
     right: calc(12px + env(safe-area-inset-right, 0px));
@@ -1040,13 +1077,13 @@ body.touch-active .ef-overlay-card {
     height: 16px;
   }
 
-  /* Telemetry tucked cleanly at top-left below Op Card (115px+ vertical gap above thumbstick!) */
+  /* Telemetry tucked cleanly at top-left BELOW Op Card (zero overlap + ~96px gap above thumbstick!) */
   body.touch-active .ef-telemetry-card,
   .ef-telemetry-card {
-    top: calc(68px + env(safe-area-inset-top, 0px));
+    top: calc(84px + env(safe-area-inset-top, 0px));
     left: calc(12px + env(safe-area-inset-left, 0px));
     bottom: auto;
-    width: 184px;
+    width: 196px;
     padding: 5px 8px;
     gap: 4px;
   }
@@ -1109,18 +1146,35 @@ body.touch-active .ef-overlay-card {
     display: none;
   }
 
+  /* Move VHF Radio Toast out of left thumbstick column -> sleek single-line top-center below Compass */
   body.touch-active .ef-radio-toast,
   .ef-radio-toast {
     position: fixed;
-    top: calc(140px + env(safe-area-inset-top, 0px));
-    left: calc(12px + env(safe-area-inset-left, 0px));
-    width: 184px;
-    max-width: calc(100vw - 24px);
-    padding: 5px 7px;
+    top: calc(54px + env(safe-area-inset-top, 0px));
+    left: 50%;
+    transform: translateX(-50%) translateY(0);
+    width: min(310px, 38vw);
+    max-width: calc(100vw - 440px);
+    padding: 4px 8px;
+  }
+
+  body.touch-active .ef-radio-toast.is-hidden,
+  .ef-radio-toast.is-hidden {
+    transform: translateX(-50%) translateY(-6px);
+  }
+
+  .ef-radio-head {
+    margin-bottom: 2px;
   }
 
   .ef-radio-line {
     font-size: 9.5px;
+    line-height: 1.25;
+  }
+
+  /* Single compact active VHF line in short landscape height */
+  .ef-radio-line.is-prev {
+    display: none;
   }
 
   /* JIT Hint Pill sits cleanly in the wide bottom-center corridor between thumb zones */
