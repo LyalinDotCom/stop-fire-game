@@ -86,7 +86,19 @@ function parseQueryParams() {
     useEmulator: params.has('emu'),
     perTabAuth: params.has('tab'),
     forceTouch: params.get('touch') === '1' || params.get('touch') === 'true',
+    simFull: params.get('simFull') === '1' || params.get('simFull') === 'true',
+    simOffline: params.get('simOffline') === '1' || params.get('simOffline') === 'true',
   };
+}
+
+function withTimeout(promise, ms, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 function computeInitialSpawn(terrain, fireSnapshot, slotId = null, colorIdx = 0, callsign = 'EF-07', autopilot = true) {
@@ -186,6 +198,7 @@ class EmberFrontApp {
 
     // Active multiplayer / loopback handles (lazily loaded)
     this._mpSession = null;
+    this._mpAdapter = null;
     this._loopbackHandle = null;
     this._mpClaimPending = false;
     this._modeSwitchSeq = 0;
@@ -222,14 +235,7 @@ class EmberFrontApp {
       onSettingChange: (key, value) => this._handleSettingChange(key, value),
       onNextOperation: () => this._handleManualAdvanceRequest(),
       onReplay: () => this.hud.showOverlay(null),
-      onResumeLive: () => {
-        if (this._mpSession && typeof this._mpSession.resumeLive === 'function') {
-          this._mpSession.resumeLive();
-          this.hud.showOverlay(null);
-        } else {
-          this.switchMode('mp');
-        }
-      },
+      onResumeLive: () => this.retryLive(),
     });
     this.hud.setAudioMuted(this.audio.isMuted());
 
@@ -276,6 +282,8 @@ class EmberFrontApp {
     return {
       mode,
       status: mode === 'loopback' ? 'live' : 'syncing',
+      connStatus: mode === 'loopback' ? 'online' : 'connecting',
+      offlineReason: null,
       opIndex: this.opIndex,
       pilotsCount: 0,
       pilotsCap: 100,
@@ -286,6 +294,71 @@ class EmberFrontApp {
       idleCountdown: null,
       offlineFallback: false,
     };
+  }
+
+  /**
+   * Cleanly disconnect from Firebase (releasing Spark RTDB sockets immediately)
+   * and transition seamlessly into a fully playable local single-player mission.
+   * NEVER persisted to localStorage — reloading the page always retries live!
+   */
+  _enterOfflineLocalMission(kind = 'offline_error', reason = 'Live airspace unavailable', { keepManual = false } = {}) {
+    const resolvedKind = kind === 'offline_full' ? 'offline_full' : 'offline_error';
+    const session = this._mpSession;
+    const adapter = this._mpAdapter;
+    this._mpSession = null;
+    this._mpAdapter = null;
+    this._isHosting = false;
+    this._mpClaimPending = false;
+    this.remotePlanes = [];
+
+    // Tear down live Firebase session & socket asynchronously without blocking local play.
+    Promise.resolve().then(async () => {
+      if (session) {
+        await session.stop().catch(() => {});
+      }
+      if (adapter) {
+        try { adapter.goOffline(); } catch { /* ignore */ }
+        await adapter.close().catch(() => {});
+      }
+    });
+
+    if (this.aircraft) {
+      this.aircraft.slotId = 0;
+      if (keepManual) {
+        this.aircraft.autopilot = false;
+      }
+    }
+
+    this.lastNetState = {
+      mode: 'mp',
+      status: 'offline',
+      connStatus: resolvedKind,
+      offlineReason: reason,
+      opIndex: this.opIndex,
+      pilotsCount: 1,
+      pilotsCap: 100,
+      localSlotId: 0,
+      personalScore: this.fireSim ? this.fireSim.missionScore : 0,
+      top10: [],
+      queueBanner: null,
+      idleCountdown: null,
+      offlineFallback: true,
+    };
+
+    // Never trap the user behind a modal overlay — keep flying immediately!
+    this.hud.showOverlay(null);
+  }
+
+  async retryLive() {
+    if (this.hud.isDrawerOpen()) {
+      this._handleToggleDrawer(false);
+    }
+    this.hud.showOverlay(null);
+    await this.switchMode('mp', {
+      worldId: this.query.worldParam || undefined,
+      opConfig: this.opConfig || DEFAULT_OPERATION || OPERATIONS[0],
+      ignoreSimFull: true,
+    });
   }
 
   _unlockAndStartAtmosphere() {
@@ -348,6 +421,16 @@ class EmberFrontApp {
         console.warn('[EmberFront] WorldSession stop error:', err);
       }
       this._mpSession = null;
+    }
+
+    if (this._mpAdapter) {
+      try {
+        this._mpAdapter.goOffline();
+      } catch {
+        // ignore
+      }
+      await this._mpAdapter.close().catch(() => {});
+      this._mpAdapter = null;
     }
   }
 
@@ -509,6 +592,18 @@ class EmberFrontApp {
     this._buildWorld(initialOp, { preservePilot: false });
     this.lastNetState = this._makeInitialNetState('mp');
 
+    // Deterministic QA flags (?simFull=1 or ?simOffline=1) bypass Firebase sockets cleanly;
+    // clicking RETRY LIVE passes ignoreSimFull: true so reconnect can also be verified!
+    if (this.query.simFull && !opts.ignoreSimFull) {
+      this._enterOfflineLocalMission('offline_full', 'Airspace full (100/100)');
+      return;
+    }
+    if (this.query.simOffline && !opts.ignoreSimFull) {
+      this._enterOfflineLocalMission('offline_error', 'Live airspace unavailable');
+      return;
+    }
+
+    let adapter = null;
     try {
       const [
         { FIREBASE_CONFIG, DEFAULT_WORLD_ID },
@@ -527,18 +622,27 @@ class EmberFrontApp {
       const worldId = opts.worldId || netCfg.worldId || DEFAULT_WORLD_ID;
 
       if (!FIREBASE_CONFIG.apiKey && !netCfg.emu && !this.query.useEmulator) {
-        throw new Error('Firebase API key not configured (set VITE_FIREBASE_API_KEY or use ?emu)');
+        throw new Error('Firebase API key not configured');
+      }
+      if (typeof navigator !== 'undefined' && navigator.onLine === false && !netCfg.emu && !this.query.useEmulator) {
+        throw new Error('Browser is offline');
       }
 
-      const adapter = await connectFirebase({
-        search: window.location.search,
-        emulatorPorts: netCfg.emulatorPorts || (this.query.useEmulator ? undefined : null),
-        tab: Boolean(netCfg.tab || this.query.perTabAuth),
-      });
+      adapter = await withTimeout(
+        connectFirebase({
+          search: window.location.search,
+          emulatorPorts: netCfg.emulatorPorts || (this.query.useEmulator ? undefined : null),
+          tab: Boolean(netCfg.tab || this.query.perTabAuth),
+        }),
+        6000,
+        'Live airspace connection timed out'
+      );
       if (seq !== this._modeSwitchSeq) {
+        try { adapter.goOffline(); } catch { /* ignore */ }
         await adapter.close().catch(() => {});
         return;
       }
+      this._mpAdapter = adapter;
 
       const session = new WorldSession({
         adapter,
@@ -551,8 +655,12 @@ class EmberFrontApp {
         callsign: this.settings.callsign,
         colorIdx: this.settings.colorIdx,
         mode: 'mp',
+        fallbackOnFull: true,
+        connectTimeoutMs: 5500,
         onStatusChange: (_status, netState) => {
-          if (netState) this.lastNetState = { ...this.lastNetState, ...netState, mode: 'mp' };
+          if (netState && this._mpSession === session) {
+            this.lastNetState = { ...this.lastNetState, ...netState, mode: 'mp' };
+          }
         },
         onScoreEvents: (events) => this._ingestScoreEvents(events),
         onDropOutcomes: (outcomes) => this._handleDropOutcomes(outcomes),
@@ -577,37 +685,46 @@ class EmberFrontApp {
             this.renderer.syncFireGrid(s.cells, s.phases, dirtyIndices, s.cabinHp, s.cabinAtRisk);
           }
         },
+        onCapacityFull: ({ reason } = {}) => {
+          if (this._mpSession !== session) return;
+          this._enterOfflineLocalMission('offline_full', reason || 'Airspace full (100/100)', {
+            keepManual: this._mpClaimPending || Boolean(this.aircraft && !this.aircraft.autopilot),
+          });
+        },
+        onConnectionError: ({ reason } = {}) => {
+          if (this._mpSession !== session) return;
+          this._enterOfflineLocalMission('offline_error', reason || 'Live airspace unavailable', {
+            keepManual: this._mpClaimPending || Boolean(this.aircraft && !this.aircraft.autopilot),
+          });
+        },
         onIdleOffline: () => {
-          const msg = 'Disconnected after 5 minutes idle to save socket bandwidth.';
-          this.hud.showOverlay('offline', { message: msg, reason: msg });
+          if (this._mpSession !== session) return;
+          this._enterOfflineLocalMission('offline_error', 'Disconnected after 5 min idle — reload or retry live');
         },
       });
 
       this._mpSession = session;
-      await session.start();
+      await withTimeout(session.start(), 6000, 'Live airspace sync timed out');
       if (seq !== this._modeSwitchSeq) {
-        await session.stop();
+        await session.stop().catch(() => {});
+        try { adapter.goOffline(); } catch { /* ignore */ }
+        await adapter.close().catch(() => {});
         return;
       }
-      this._syncAllFireCells(this.fireSim.getSnapshot());
+      if (this._mpSession === session && !session.offlineFallback) {
+        this.lastNetState = { ...this.lastNetState, ...session.getNetState(), mode: 'mp' };
+        this._syncAllFireCells(this.fireSim.getSnapshot());
+      }
     } catch (err) {
-      console.warn('[EmberFront] Live shared mission unreachable; running local standby until reconnected:', err);
+      console.warn('[EmberFront] Live shared airspace unavailable; starting playable local single-player mission:', err);
       if (seq !== this._modeSwitchSeq) return;
-      this.lastNetState = {
-        mode: 'mp',
-        status: 'offline',
-        opIndex: this.opIndex,
-        pilotsCount: 1,
-        pilotsCap: 100,
-        localSlotId: null,
-        personalScore: 0,
-        top10: [],
-        queueBanner: null,
-        idleCountdown: null,
-        offlineFallback: true,
-      };
+      if (adapter && !this._mpAdapter) {
+        try { adapter.goOffline(); } catch { /* ignore */ }
+        await adapter.close().catch(() => {});
+      }
       const msg = err?.message || 'Unable to reach Live Shared Airspace';
-      this.hud.showOverlay('offline', { message: msg, reason: msg });
+      const isFullErr = /capacity|full|100/i.test(msg);
+      this._enterOfflineLocalMission(isFullErr ? 'offline_full' : 'offline_error', msg);
     }
   }
 
@@ -766,6 +883,8 @@ class EmberFrontApp {
     } else if (key === 'sfxVolume') {
       this.audio.setSfxVolume(Number(value));
       this.settings.sfxVolume = this.audio.getSfxVolume();
+    } else if (key === 'retryLive' && value) {
+      this.retryLive();
     }
   }
 
@@ -1251,6 +1370,8 @@ class EmberFrontApp {
           renderHeight: stats ? stats.renderHeight : 0,
           remoteCount: stats ? stats.remoteCount : app.remotePlanes.length,
           mode: app.mode,
+          connStatus: app.lastNetState?.connStatus || 'connecting',
+          offlineReason: app.lastNetState?.offlineReason || null,
           opIndex: app.opIndex,
           opId: app.opConfig ? app.opConfig.id : null,
           opName: app.opConfig ? app.opConfig.name : null,
@@ -1323,6 +1444,9 @@ class EmberFrontApp {
       },
       switchMode(mode, opts) {
         return app.switchMode(mode, opts);
+      },
+      retryLive() {
+        return app.retryLive();
       },
       toggleDrawer(force) {
         app._handleToggleDrawer(force);

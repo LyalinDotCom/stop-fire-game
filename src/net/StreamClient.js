@@ -171,7 +171,12 @@ export class StreamClient {
 
     try {
       const planes = decodePlanes(node.p);
-      this.onPlanes?.(planes, { epoch: e, q, arrivedAtMs: this._nowFn() });
+      this.onPlanes?.(planes, {
+        epoch: e,
+        q,
+        arrivedAtMs: this._nowFn(),
+        serverTimeMs: typeof node.t === 'number' && node.t > 0 ? node.t : null,
+      });
     } catch {
       // Ignore malformed planes payload.
     }

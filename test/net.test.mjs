@@ -1458,3 +1458,313 @@ test('Reconciled RTDB rules: fireKey/meta allow immediate failover on epoch bump
   assert.equal(hub.inspect(`worlds/${WORLD_ID}/fireKey/e`), 2);
   assert.equal(hub.inspect(`worlds/${WORLD_ID}/meta/e`), 2);
 });
+
+// ============================================================================
+// 9. #49 CAPACITY-FULL & OFFLINE FALLBACK + #50 LAG ISOLATION & JITTER SMOOTHNESS
+// ============================================================================
+test('#49: 100-player full airspace triggers offline_full fallback, releases RTDB, and fresh reload retries live', async () => {
+  const op0 = OPERATIONS[0];
+  const terrain = generateTerrain(op0);
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  await bootstrapWorld(hub, 'pilot-0');
+
+  // Fill remaining 99 slots (slots 1..99) so airspace is strictly 100/100 full!
+  const now = hub.now();
+  const rootWorld = hub._root.worlds[WORLD_ID];
+  for (let s = 1; s < 100; s++) {
+    const uid = `pilot-${s}`;
+    const conn = `ConnFull${String(s).padStart(4, '0')}`;
+    rootWorld.presence[uid] = { conn, at: now };
+    rootWorld.slots[String(s)] = { uid, conn, at: now, leaseUntil: now + 40000 };
+    rootWorld.uidToSlot[uid] = s;
+    rootWorld.roster[String(s)] = { uid, name: `P-${s}`, color: s % 16, at: now };
+  }
+
+  // Pilot 101 joins with fallbackOnFull: true -> detects 100/100 full immediately and goes offline!
+  const overflowAdapter = hub.createClient('pilot-101');
+  let capFullCalled = false;
+  const overflowSess = new WorldSession({
+    adapter: overflowAdapter,
+    terrain,
+    fireSim: new FireSim(terrain, { isMegaBasin: true }),
+    opConfig: op0,
+    worldId: WORLD_ID,
+    buildHash: BUILD_HASH,
+    callsign: 'OVER-101',
+    colorIdx: 2,
+    fallbackOnFull: true,
+    disableRealTimers: true,
+    onCapacityFull: () => { capFullCalled = true; },
+  });
+
+  await overflowSess.start();
+  assert.equal(capFullCalled, true, 'onCapacityFull must fire when 100/100 slots occupied');
+  const net = overflowSess.getNetState();
+  assert.equal(net.connStatus, 'offline_full', 'connStatus must report offline_full');
+  assert.equal(net.offlineFallback, true, 'offlineFallback must be true');
+  assert.equal(overflowAdapter.connected, false, 'RTDB socket must be released via goOffline() on fallback');
+  await overflowSess.stop();
+
+  // Mid-session takeover full test: vacate slot 99 on join, fill it before requestManualControl()!
+  delete rootWorld.slots['99'];
+  delete rootWorld.uidToSlot['pilot-99'];
+  const lateAdapter = hub.createClient('pilot-102');
+  let takeoverFull = false;
+  const lateSess = new WorldSession({
+    adapter: lateAdapter,
+    terrain,
+    fireSim: new FireSim(terrain, { isMegaBasin: true }),
+    opConfig: op0,
+    worldId: WORLD_ID,
+    buildHash: BUILD_HASH,
+    fallbackOnFull: true,
+    disableRealTimers: true,
+    onCapacityFull: () => { takeoverFull = true; },
+  });
+  await lateSess.start();
+  assert.equal(lateSess.getNetState().connStatus, 'online', 'joins online when 99/100 occupied');
+
+  // Slot 99 fills right before pilot-102 takes manual control
+  rootWorld.slots['99'] = { uid: 'pilot-99', conn: 'ConnFull0099', at: now, leaseUntil: now + 40000 };
+  rootWorld.uidToSlot['pilot-99'] = 99;
+  const claimRes = await lateSess.requestManualControl();
+  assert.equal(claimRes.seated, false);
+  assert.equal(claimRes.full, true);
+  assert.equal(takeoverFull, true, 'full slot claim must trigger onCapacityFull');
+  assert.equal(lateSess.getNetState().connStatus, 'offline_full');
+  assert.equal(lateAdapter.connected, false, 'full takeover fallback must call goOffline()');
+  await lateSess.stop();
+
+  // Simulate fresh page reload after a slot opens -> connects online and claims slot cleanly!
+  delete rootWorld.slots['99'];
+  delete rootWorld.uidToSlot['pilot-99'];
+  const reloadAdapter = hub.createClient('pilot-103');
+  const reloadSess = new WorldSession({
+    adapter: reloadAdapter,
+    terrain,
+    fireSim: new FireSim(terrain, { isMegaBasin: true }),
+    opConfig: op0,
+    worldId: WORLD_ID,
+    buildHash: BUILD_HASH,
+    fallbackOnFull: true,
+    disableRealTimers: true,
+  });
+  await reloadSess.start();
+  assert.equal(reloadSess.getNetState().connStatus, 'online', 'fresh session retries live and connects online');
+  const seatRes = await reloadSess.requestManualControl();
+  assert.equal(seatRes.seated, true, 'reloaded pilot claims open slot');
+  assert.equal(seatRes.slotId, 99);
+  await reloadSess.stop();
+});
+
+test('#49: Prolonged connection failure sets connStatus offline_error and releases RTDB', async () => {
+  const op0 = OPERATIONS[0];
+  const terrain = generateTerrain(op0);
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  await bootstrapWorld(hub, 'host-1');
+
+  const client = hub.createClient('net-drop-1');
+  let errFired = null;
+  const sess = new WorldSession({
+    adapter: client,
+    terrain,
+    fireSim: new FireSim(terrain, { isMegaBasin: true }),
+    opConfig: op0,
+    worldId: WORLD_ID,
+    buildHash: BUILD_HASH,
+    fallbackOnFull: true,
+    disableRealTimers: true,
+    onConnectionError: (e) => { errFired = e; },
+  });
+
+  await sess.start();
+  assert.equal(sess.getNetState().connStatus, 'online');
+
+  // Drop link and hold offline > 12 s
+  client.goOffline();
+  assert.equal(sess.getNetState().connStatus, 'connecting');
+  hub.advanceTime(13000);
+  sess.step(0.1, hub.now());
+
+  assert.ok(errFired, 'onConnectionError must fire after sustained outage');
+  const net = sess.getNetState();
+  assert.equal(net.connStatus, 'offline_error');
+  assert.equal(net.offlineFallback, true);
+  assert.ok(typeof net.offlineReason === 'string' && net.offlineReason.length > 0);
+  await sess.stop();
+});
+
+test('#50: Strict lag isolation + Vanguard jitter smoothness (500-700 ms jitter + 40% drop on 1 peer)', async () => {
+  const op0 = OPERATIONS[0];
+  const terrain = generateTerrain(op0);
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const { host } = await bootstrapWorld(hub, 'host-1');
+  const { client: healthyClient, conn: healthyConn } = await seatClient(hub, 'healthy-1', 1, 'ConnHlth0001');
+  const { client: laggyClient, conn: laggyConn } = await seatClient(hub, 'laggy-2', 2, 'ConnLagy0002');
+
+  const sim = new FireSim(terrain, { isMegaBasin: true });
+  const hb = new HostBroadcaster(host, WORLD_ID, {
+    terrain, fireSim: sim, epoch: 1, opIndex: 0, buildHash: BUILD_HASH, localSlotId: 0, enableBackgroundTicker: false,
+  });
+  await hb.start();
+
+  const interp = new PlaneInterpolator();
+  let healthySeq = 0;
+  let laggySeq = 0;
+
+  // Deterministic pseudo-random jitter/loss for laggy peer (slot 2)
+  const laggyQueue = []; // { deliverAtMs, payload }
+  let rngState = 1337;
+  const nextRand = () => {
+    rngState = (rngState * 1664525 + 1013904223) >>> 0;
+    return rngState / 0x100000000;
+  };
+
+  let prevHealthyPose = null;
+  let prevLaggyPose = null;
+  let maxHealthyFrameStep = 0;
+  let maxLaggyFrameStep = 0;
+  let staleLaggyRoll = 999;
+
+  const startMs = hub.now();
+  const totalSteps = 80; // 8.0 seconds at 100 ms Host steps
+  for (let tick = 0; tick < totalSteps; tick++) {
+    const tSec = tick * 0.1;
+    const now = startMs + tick * 100;
+
+    // 4 Hz client input generation (every 250 ms -> ticks 0, 2, 5, 7, ...)
+    if (tick === 0 || tick % 3 === 0) {
+      // Slot 1: healthy smooth flight (~44 m/s along -Z with gentle curve)
+      const hX = Math.sin(tSec * 0.3) * 80;
+      const hZ = -tSec * 44;
+      const hYaw = (Math.cos(tSec * 0.3) * 18 + 360) % 360;
+      await healthyClient.set(`worlds/${WORLD_ID}/in/healthy-1`, {
+        s: ++healthySeq,
+        t: healthyClient.serverTimestamp(),
+        c: healthyConn,
+        d: encodeInput({
+          x: hX, y: 80, z: hZ, yawDeg: hYaw, pitchDeg: 0, rollDeg: 15, speedKmh: 158, releasing: false,
+        }, 0),
+      });
+
+      // Slot 2: laggy peer with 40% packet drop + 500-700 ms jitter + 2.0 s total Wi-Fi silence (t=4.5..6.5 s)
+      const inSilenceWindow = tSec >= 4.5 && tSec <= 6.5;
+      const dropped = inSilenceWindow || (tick > 0 && nextRand() < 0.4);
+      if (!dropped) {
+        const lX = 200 + tSec * 40;
+        const lZ = -100 + Math.sin(tSec * 0.5) * 40;
+        const jitterDelay = tick === 0 ? 0 : Math.round(500 + nextRand() * 200);
+        laggyQueue.push({
+          deliverAtMs: now + jitterDelay,
+          payload: {
+            x: lX, y: 85, z: lZ, yawDeg: 90, pitchDeg: 2, rollDeg: 38, speedKmh: 155, releasing: false,
+          },
+        });
+      }
+    }
+
+    // Deliver delayed laggy packets whose jitter timer elapsed (respecting 180 ms server pacing rule)
+    while (laggyQueue.length > 0 && laggyQueue[0].deliverAtMs <= now) {
+      const pkt = laggyQueue.shift();
+      await laggyClient.set(`worlds/${WORLD_ID}/in/laggy-2`, {
+        s: ++laggySeq,
+        t: laggyClient.serverTimestamp(),
+        c: laggyConn,
+        d: encodeInput(pkt.payload, 0),
+      }).catch(() => {});
+    }
+
+    // Step Host deterministically at 10 Hz
+    hb.step(0.1);
+
+    // Every 250 ms (every ~3 ticks), push planes snapshot into PlaneInterpolator (with slight arrival jitter)
+    if (tick > 0 && tick % 2 === 0 && hb.lastPublishedPlanes.length > 0) {
+      const arrivalJitter = (tick % 4 === 0) ? 35 : 0;
+      interp.pushSnapshot(hb.lastPublishedPlanes, now + arrivalJitter, 0, now);
+    }
+
+    // Sample rendered poses at 60 Hz across this 100 ms interval (6 frames @ 16.67 ms)
+    for (let f = 0; f < 6; f++) {
+      const frameMs = now + Math.round(f * 16.67);
+      const sampled = interp.sample(frameMs, { excludeSlotId: 0 });
+      const p1 = sampled.find((p) => p.slotId === 1);
+      const p2 = sampled.find((p) => p.slotId === 2);
+
+      if (p1) {
+        if (prevHealthyPose) {
+          const d = Math.hypot(p1.x - prevHealthyPose.x, p1.y - prevHealthyPose.y, p1.z - prevHealthyPose.z);
+          if (d > maxHealthyFrameStep) maxHealthyFrameStep = d;
+        }
+        prevHealthyPose = p1;
+      }
+      if (p2) {
+        if (prevLaggyPose) {
+          const d = Math.hypot(p2.x - prevLaggyPose.x, p2.y - prevLaggyPose.y, p2.z - prevLaggyPose.z);
+          if (d > maxLaggyFrameStep) maxLaggyFrameStep = d;
+        }
+        prevLaggyPose = p2;
+        if (tSec >= 6.2 && tSec <= 6.4) {
+          staleLaggyRoll = Math.abs(p2.rollDeg);
+        }
+      }
+    }
+
+    hub.advanceTime(100);
+  }
+
+  assert.ok(prevHealthyPose && prevLaggyPose, 'both healthy and laggy peers must render');
+  assert.ok(
+    maxHealthyFrameStep < 2.2,
+    `healthy peer must remain silky & isolated from peer lag (max 60Hz frame step=${maxHealthyFrameStep.toFixed(2)} m)`
+  );
+  assert.ok(
+    maxLaggyFrameStep < 5.0,
+    `laggy peer must converge smoothly with zero teleport pops (max 60Hz frame step=${maxLaggyFrameStep.toFixed(2)} m)`
+  );
+  assert.ok(
+    staleLaggyRoll < 12,
+    `stale laggy peer (>1.5s silent) must smoothly level wings (roll=${staleLaggyRoll.toFixed(1)}°)`
+  );
+
+  hb.stop();
+});
+
+test('#50: Laggy Host tracks publish stall wait and self-abdicates when writes stall > 4.5 s with peers present', async () => {
+  const op0 = OPERATIONS[0];
+  const terrain = generateTerrain(op0);
+  const hub = new MockRtdbHub({ initialTime: 1_700_000_000_000 });
+  const hostAdapter = hub.createClient('stall-host');
+  const peerAdapter = hub.createClient('healthy-peer');
+
+  const hostSess = new WorldSession({
+    adapter: hostAdapter, terrain, fireSim: new FireSim(terrain, { isMegaBasin: true }), opConfig: op0,
+    worldId: WORLD_ID, buildHash: BUILD_HASH, callsign: 'SHOST', colorIdx: 0, disableRealTimers: true,
+  });
+  const peerSess = new WorldSession({
+    adapter: peerAdapter, terrain, fireSim: new FireSim(terrain, { isMegaBasin: true }), opConfig: op0,
+    worldId: WORLD_ID, buildHash: BUILD_HASH, callsign: 'HPEER', colorIdx: 1, disableRealTimers: true,
+  });
+
+  await hostSess.start();
+  await hostSess.requestManualControl();
+  await peerSess.start();
+  await peerSess.requestManualControl();
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(hostSess.isHost, true);
+
+  // Black-hole host socket so planes publish hangs in-flight > 4.5 s
+  hub.simulateBlackHole('stall-host', true);
+  hub.advanceTime(300);
+  hostSess.step(0.1, hub.now()); // triggers hanging publishPlanes()
+  await Promise.resolve(); // allow microtask to arm stall timer on genuinely pending write
+  hub.advanceTime(4700);
+  assert.ok(hostSess.host.getPublishWaitMs(hub.now()) > 4500, 'Host must track stalled publish wait > 4500 ms');
+
+  // Stepping hostSess triggers self-abdication so healthy peer isn't dragged down!
+  hostSess.step(0.1, hub.now());
+  assert.equal(hostSess.isHost, false, 'stalled Host with healthy peer present must voluntarily abdicate');
+
+  hub.simulateBlackHole('stall-host', false);
+  await peerSess.stop();
+  await hostSess.stop();
+});

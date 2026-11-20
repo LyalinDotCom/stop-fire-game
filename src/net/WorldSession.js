@@ -15,6 +15,9 @@ import { MAX_SLOTS, defaultCallsign, getBuildHash, sanitizeCallsign } from './co
 import { encodeInput } from './protocol.js';
 
 const INPUT_SEND_INTERVAL_MS = 250; // 4 Hz nominal (safely above 180 ms server pacing rule)
+const DEFAULT_CONNECT_TIMEOUT_MS = 5500;
+const LINK_OFFLINE_FALLBACK_SEC = 12;
+const HOST_PUBLISH_STALL_ABDICATE_MS = 4500;
 
 export class WorldSession {
   constructor({
@@ -28,6 +31,8 @@ export class WorldSession {
     callsign = 'EF-07',
     colorIdx = 0,
     mode = 'mp',
+    fallbackOnFull = false,
+    connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS,
     onStatusChange = null,
     onScoreEvents = null,
     onDropOutcomes = null,
@@ -41,6 +46,8 @@ export class WorldSession {
     onIdleVacate = null,
     onIdleOffline = null,
     onEvicted = null,
+    onCapacityFull = null,
+    onConnectionError = null,
     disableRealTimers = false,
     electionBackoffRangeMs = null,
   }) {
@@ -55,6 +62,8 @@ export class WorldSession {
     this.callsign = sanitizeCallsign(callsign, 'EF-07');
     this.colorIdx = Math.max(0, Math.min(15, Math.floor(colorIdx) || 0));
     this.mode = mode;
+    this.fallbackOnFull = Boolean(fallbackOnFull);
+    this.connectTimeoutMs = connectTimeoutMs;
 
     this.onStatusChange = onStatusChange;
     this.onScoreEvents = onScoreEvents;
@@ -69,6 +78,8 @@ export class WorldSession {
     this.onIdleVacate = onIdleVacate;
     this.onIdleOffline = onIdleOffline;
     this.onEvicted = onEvicted;
+    this.onCapacityFull = onCapacityFull;
+    this.onConnectionError = onConnectionError;
 
     this._disableRealTimers = disableRealTimers;
     this._electionBackoffRangeMs = electionBackoffRangeMs;
@@ -77,7 +88,12 @@ export class WorldSession {
     this.stopped = false;
     this.queued = false;
     this.offlineFallback = false;
-    this._status = 'live';
+    this._everConnected = false;
+    this._offlineKind = null; // null | 'offline_full' | 'offline_error'
+    this._offlineReason = null;
+    this._fallbackTriggered = false;
+    this._connectTimer = null;
+    this._status = 'syncing';
     this._lastInputSentAt = 0;
     this._inputInFlightSince = 0;
     this._inputSeq = 0;
@@ -105,6 +121,30 @@ export class WorldSession {
     return this.allocator?.slotId ?? null;
   }
 
+  _triggerOfflineFallback(kind, reason) {
+    if (this._fallbackTriggered || this.stopped) return;
+    this._fallbackTriggered = true;
+    clearTimeout(this._connectTimer);
+    this._connectTimer = null;
+    this.queued = false;
+    this.offlineFallback = true;
+    this._offlineKind = kind;
+    this._offlineReason = reason;
+    this._stopHost();
+    this.link?.pause();
+    try {
+      this.adapter.goOffline();
+    } catch {
+      // ignore
+    }
+    this._updateStatus();
+    if (kind === 'offline_full') {
+      this.onCapacityFull?.({ reason, cap: MAX_SLOTS });
+    } else {
+      this.onConnectionError?.({ reason, kind });
+    }
+  }
+
   async start() {
     if (this.started) return;
     this.started = true;
@@ -116,13 +156,31 @@ export class WorldSession {
       nowFn,
       disableTicker: this._disableRealTimers,
     });
+    if (this.link.up) {
+      this._everConnected = true;
+    }
 
     this._offLink = this.link.on((up) => {
+      if (up) {
+        this._everConnected = true;
+        clearTimeout(this._connectTimer);
+        this._connectTimer = null;
+      }
       this._updateStatus();
-      if (!up && this.link.downFor() > 25) {
-        this.offlineFallback = true;
+      if (!up && this.link.downFor() > LINK_OFFLINE_FALLBACK_SEC) {
+        this._triggerOfflineFallback('offline_error', 'Lost connection to live airspace');
       }
     });
+
+    if (!this._disableRealTimers && this.connectTimeoutMs > 0 && !this._everConnected) {
+      this._connectTimer = setTimeout(() => {
+        this._connectTimer = null;
+        if (!this.stopped && !this._everConnected && !this.link?.up) {
+          this._triggerOfflineFallback('offline_error', 'Live airspace connection timed out');
+        }
+      }, this.connectTimeoutMs);
+      if (typeof this._connectTimer.unref === 'function') this._connectTimer.unref();
+    }
 
     this.allocator = new SlotAllocator(this.adapter, this.worldId, {
       nowFn: () => this.adapter.now(),
@@ -178,7 +236,7 @@ export class WorldSession {
         }
       },
       onPlanes: (planes, info) => {
-        this.interpolator.pushSnapshot(planes, info.arrivedAtMs, this.localSlotId);
+        this.interpolator.pushSnapshot(planes, info.arrivedAtMs, this.localSlotId, info.serverTimeMs);
       },
       onMeta: (meta) => {
         this.onMetaUpdate?.(meta);
@@ -217,6 +275,7 @@ export class WorldSession {
     this.election = new AuthorityElection(this.adapter, this.worldId, {
       link: this.link,
       canBeHost: () => this.allocator.isSeated && !!this.presence?.connId && !this.presence.record?.away,
+      hasOtherPeers: () => (this.stream ? this.stream.getSeatedCount(this.adapter.now()) > 1 : false),
       backoffRangeMs: this._electionBackoffRangeMs,
       disablePageHooks: this._disableRealTimers,
       onBecameHost: ({ epoch, isFailover }) => {
@@ -232,6 +291,17 @@ export class WorldSession {
 
     this.election.start();
     await this.stream.start();
+
+    if (this.stopped) return;
+
+    if (this.fallbackOnFull) {
+      const cap = await this.allocator.checkCapacity().catch(() => null);
+      if (this.stopped) return;
+      if (cap && cap.full) {
+        this._triggerOfflineFallback('offline_full', `Airspace full (${cap.activeCount}/${cap.cap})`);
+        return;
+      }
+    }
 
     this._offRenewBeat = this.link.every(2000, () => {
       if (this.allocator.isSeated) {
@@ -367,9 +437,15 @@ export class WorldSession {
     });
 
     if (!res.seated) {
+      if (res.full && this.fallbackOnFull) {
+        const cap = res.cap ?? MAX_SLOTS;
+        const count = res.activeCount ?? cap;
+        this._triggerOfflineFallback('offline_full', `Airspace full (${count}/${cap})`);
+        return { seated: false, slotId: null, spawnPose: null, queued: false, full: true };
+      }
       this.queued = !!res.queued;
       this._updateStatus();
-      return { seated: false, slotId: null, spawnPose: null, queued: this.queued };
+      return { seated: false, slotId: null, spawnPose: null, queued: this.queued, full: !!res.full };
     }
 
     this.queued = false;
@@ -528,9 +604,20 @@ export class WorldSession {
 
     const pilotsCount = this.stream ? this.stream.getSeatedCount(this.adapter.now()) : (slotId !== null ? 1 : 0);
 
+    let connStatus = 'online';
+    if (this._offlineKind === 'offline_full') {
+      connStatus = 'offline_full';
+    } else if (this._offlineKind === 'offline_error' || this.offlineFallback) {
+      connStatus = 'offline_error';
+    } else if (!this.link || !this.link.up) {
+      connStatus = 'connecting';
+    }
+
     return {
       mode: this.mode,
       status: this._status,
+      connStatus,
+      offlineReason: this._offlineReason,
       opIndex: this.opIndex,
       pilotsCount,
       pilotsCap: MAX_SLOTS,
@@ -550,7 +637,27 @@ export class WorldSession {
 
     const keyWait = this.stream?.waitingMs(renderTimeMs) || 0;
     const inWait = this._inputInFlightSince ? Math.max(0, renderTimeMs - this._inputInFlightSince) : 0;
-    this.link?.step(Math.max(keyWait, inWait));
+    const hostPublishWait = this.host?.running ? this.host.getPublishWaitMs(this.adapter.now()) : 0;
+    this.link?.step(Math.max(keyWait, inWait, hostPublishWait));
+
+    // Laggy Host self-abdication: if our publish loop stalls > 4.5 s while healthy peers exist, yield cleanly!
+    if (
+      this.isHost &&
+      hostPublishWait > HOST_PUBLISH_STALL_ABDICATE_MS &&
+      (this.stream?.getSeatedCount(this.adapter.now()) || 0) > 1
+    ) {
+      this.election?.abdicate().catch(() => {});
+    }
+
+    // Prolonged connection outage -> clean offline fallback so player keeps flying locally.
+    if (
+      this.link &&
+      !this.link.up &&
+      !this.offlineFallback &&
+      this.link.downFor(renderTimeMs) > LINK_OFFLINE_FALLBACK_SEC
+    ) {
+      this._triggerOfflineFallback('offline_error', 'Live airspace connection lost');
+    }
 
     if (this.allocator) {
       const idle = this.allocator.tickIdle();
@@ -593,6 +700,8 @@ export class WorldSession {
     if (this.stopped) return;
     this.stopped = true;
 
+    clearTimeout(this._connectTimer);
+    this._connectTimer = null;
     this._offLink?.();
     this._offRenewBeat?.();
 

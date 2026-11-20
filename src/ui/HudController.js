@@ -155,6 +155,25 @@ function formatFreq(freq) {
   return /mhz/i.test(s) ? s : `${s} MHz`;
 }
 
+function resolveConnStatus(netState) {
+  if (!netState) return 'connecting';
+  if (
+    netState.connStatus === 'online' ||
+    netState.connStatus === 'connecting' ||
+    netState.connStatus === 'offline_full' ||
+    netState.connStatus === 'offline_error'
+  ) {
+    return netState.connStatus;
+  }
+  if (netState.status === 'syncing') return 'connecting';
+  if (netState.status === 'offline' || netState.offlineFallback) {
+    const reason = String(netState.offlineReason || '').toLowerCase();
+    return reason.includes('full') || reason.includes('100') ? 'offline_full' : 'offline_error';
+  }
+  if (netState.status === 'host' || netState.status === 'live') return 'online';
+  return 'connecting';
+}
+
 export class HudController {
   constructor({
     onToggleAudio,
@@ -189,6 +208,7 @@ export class HudController {
     this._wasAutopilot = true;
     this._manualHintUntilMs = 0;
     this._lastHullHp = 100;
+    this._lastConnStatus = null;
 
     // Outcome toast & peripheral flash timers
     this._outcomeHideTimer = null;
@@ -272,9 +292,10 @@ export class HudController {
     this._opCodeEl = el('span', 'ef-op-code', 'OP 01/05');
     topRow.appendChild(this._opCodeEl);
 
-    this._airspacePill = el('span', 'ef-airspace-chip');
+    this._airspacePill = el('span', 'ef-airspace-chip status-connecting');
+    this._airspacePill.setAttribute('data-conn-status', 'connecting');
     this._airspaceDot = el('span', 'ef-status-dot');
-    this._airspaceText = el('span', null, 'LIVE · 1/100');
+    this._airspaceText = el('span', null, 'CONNECTING');
     this._airspacePill.appendChild(this._airspaceDot);
     this._airspacePill.appendChild(this._airspaceText);
     topRow.appendChild(this._airspacePill);
@@ -564,9 +585,15 @@ export class HudController {
       'is-direct',
       'is-partial',
       'is-miss',
-      'is-damage'
+      'is-damage',
+      'is-offline-notice'
     );
     this._outcomeBannerEl.classList.add(kindClass);
+    if (kindClass === 'is-offline-notice') {
+      this._outcomeBannerEl.setAttribute('data-fallback-notice', 'true');
+    } else {
+      this._outcomeBannerEl.removeAttribute('data-fallback-notice');
+    }
     this._outcomeMainEl.textContent = mainText;
     if (subText) {
       this._outcomeSubEl.textContent = subText;
@@ -579,6 +606,7 @@ export class HudController {
     this._outcomeHideTimer = setTimeout(() => {
       this._outcomeHideTimer = null;
       this._outcomeBannerEl.classList.add('is-hidden');
+      this._outcomeBannerEl.removeAttribute('data-fallback-notice');
     }, durationMs);
   }
 
@@ -830,23 +858,61 @@ export class HudController {
   } = {}) {
     const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
-    // 1. Compact Top-Left Operation & Shared Live Airspace Pill
+    // 1. Compact Top-Left Operation & Online / Offline Status Pill
     const status = (netState && netState.status) || 'live';
+    const connStatus = resolveConnStatus(netState);
     const pilotsCount = Math.max(1, netState && typeof netState.pilotsCount === 'number' ? netState.pilotsCount : 1);
     const pilotsCap = (netState && netState.pilotsCap) || 100;
 
-    this._airspacePill.classList.remove('status-host', 'status-syncing', 'status-offline');
-    if (status === 'host') {
-      this._airspacePill.classList.add('status-host');
-      this._airspaceText.textContent = `LIVE · ${pilotsCount}/${pilotsCap}`;
-    } else if (status === 'syncing') {
-      this._airspacePill.classList.add('status-syncing');
-      this._airspaceText.textContent = `SYNCING · ${pilotsCount}/${pilotsCap}`;
-    } else if (status === 'offline') {
-      this._airspacePill.classList.add('status-offline');
-      this._airspaceText.textContent = 'RECONNECTING';
+    this._airspacePill.classList.remove(
+      'status-online',
+      'status-host',
+      'status-connecting',
+      'status-offline-full',
+      'status-offline-error'
+    );
+    this._airspacePill.setAttribute('data-conn-status', connStatus);
+
+    if (connStatus === 'online') {
+      this._airspacePill.classList.add('status-online');
+      if (status === 'host') this._airspacePill.classList.add('status-host');
+      this._airspaceText.textContent = `ONLINE · ${pilotsCount}/${pilotsCap}`;
+      this._airspacePill.title =
+        status === 'host'
+          ? `Online (Airspace Host) — ${pilotsCount}/${pilotsCap} pilots`
+          : `Online — Live Shared Airspace (${pilotsCount}/${pilotsCap} pilots)`;
+    } else if (connStatus === 'connecting') {
+      this._airspacePill.classList.add('status-connecting');
+      this._airspaceText.textContent = 'CONNECTING';
+      this._airspacePill.title = 'Connecting to Live Shared Airspace...';
+    } else if (connStatus === 'offline_full') {
+      this._airspacePill.classList.add('status-offline-full');
+      this._airspaceText.textContent = 'OFFLINE · FULL';
+      this._airspacePill.title = 'Airspace Full (100/100) — Playing Offline Local Mission. Reload to retry live.';
     } else {
-      this._airspaceText.textContent = `LIVE · ${pilotsCount}/${pilotsCap}`;
+      this._airspacePill.classList.add('status-offline-error');
+      this._airspaceText.textContent = 'OFFLINE · LOCAL';
+      this._airspacePill.title = 'Live Airspace Unavailable — Playing Offline Local Mission. Reload to retry live.';
+    }
+
+    // One-shot ~5s JIT Fallback Notice whenever dropping into offline local fallback
+    if (connStatus !== this._lastConnStatus) {
+      if (connStatus === 'offline_full') {
+        this._showCenterBanner(
+          'is-offline-notice',
+          'AIRSPACE FULL (100/100) — PLAYING OFFLINE • RELOAD TO RETRY LIVE',
+          '',
+          5200
+        );
+      } else if (connStatus === 'offline_error') {
+        this._showCenterBanner(
+          'is-offline-notice',
+          'LIVE AIRSPACE UNAVAILABLE — PLAYING OFFLINE • RELOAD TO RETRY LIVE',
+          '',
+          5200
+        );
+      }
+      this._lastConnStatus = connStatus;
     }
 
     if (opConfig) {

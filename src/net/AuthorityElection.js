@@ -22,6 +22,7 @@ export class AuthorityElection {
     onLostHost = null,
     onAuthorityChange = null,
     canBeHost = () => true,
+    hasOtherPeers = () => true,
     backoffRangeMs = null,
     disablePageHooks = false,
   } = {}) {
@@ -32,6 +33,7 @@ export class AuthorityElection {
     this.onLostHost = onLostHost;
     this.onAuthorityChange = onAuthorityChange;
     this.canBeHost = canBeHost;
+    this.hasOtherPeers = hasOtherPeers;
     this._backoffRangeMs = backoffRangeMs;
 
     this.path = `worlds/${worldId}/authority`;
@@ -177,10 +179,10 @@ export class AuthorityElection {
     const now = this.adapter.now();
 
     if (this.isHost) {
-      // Voluntary abdication if tab hidden > 3 s.
+      // Voluntary abdication if tab hidden > 3 s and healthy peers are present to take over.
       if (isTabHidden()) {
         if (!this._hiddenSince) this._hiddenSince = now;
-        if (now - this._hiddenSince > HIDDEN_ABDICATE_MS) {
+        if (now - this._hiddenSince > HIDDEN_ABDICATE_MS && this.hasOtherPeers()) {
           await this.abdicate();
           return;
         }

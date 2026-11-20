@@ -188,36 +188,40 @@ body {
   flex-shrink: 0;
 }
 
-.ef-airspace-chip.status-host {
-  background: rgba(92, 225, 230, 0.12);
-  border-color: rgba(92, 225, 230, 0.42);
-  color: var(--ef-cyan);
+.ef-airspace-chip.status-online {
+  background: rgba(56, 242, 139, 0.12);
+  border-color: rgba(56, 242, 139, 0.42);
+  color: var(--ef-emerald);
 }
 
-.ef-airspace-chip.status-host .ef-status-dot {
-  background: var(--ef-cyan);
-  box-shadow: 0 0 7px rgba(92, 225, 230, 0.85);
+.ef-airspace-chip.status-online .ef-status-dot {
+  background: var(--ef-emerald);
+  box-shadow: 0 0 8px rgba(56, 242, 139, 0.9);
 }
 
-.ef-airspace-chip.status-syncing {
-  background: rgba(246, 183, 60, 0.12);
-  border-color: rgba(246, 183, 60, 0.42);
+.ef-airspace-chip.status-connecting {
+  background: rgba(246, 183, 60, 0.14);
+  border-color: rgba(246, 183, 60, 0.48);
   color: var(--ef-amber);
 }
 
-.ef-airspace-chip.status-syncing .ef-status-dot {
+.ef-airspace-chip.status-connecting .ef-status-dot {
   background: var(--ef-amber);
-  animation: efPulseDot 1.1s ease-in-out infinite;
+  box-shadow: 0 0 7px rgba(246, 183, 60, 0.85);
+  animation: efPulseDot 1.05s ease-in-out infinite;
 }
 
-.ef-airspace-chip.status-offline {
-  background: rgba(255, 255, 255, 0.05);
-  border-color: rgba(255, 255, 255, 0.18);
-  color: var(--ef-text-muted);
+.ef-airspace-chip.status-offline-full,
+.ef-airspace-chip.status-offline-error {
+  background: rgba(255, 102, 66, 0.14);
+  border-color: rgba(255, 122, 72, 0.56);
+  color: #ffb085;
 }
 
-.ef-airspace-chip.status-offline .ef-status-dot {
-  background: var(--ef-text-dim);
+.ef-airspace-chip.status-offline-full .ef-status-dot,
+.ef-airspace-chip.status-offline-error .ef-status-dot {
+  background: transparent;
+  border: 1.5px solid #ff7a52;
   box-shadow: none;
 }
 
@@ -677,6 +681,19 @@ body {
 
 .ef-outcome-banner.is-damage .ef-outcome-main {
   color: #ff736c;
+}
+
+.ef-outcome-banner.is-offline-notice {
+  border-color: rgba(246, 183, 60, 0.82);
+  background: rgba(34, 21, 12, 0.93);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+  max-width: min(620px, calc(100vw - 24px));
+}
+
+.ef-outcome-banner.is-offline-notice .ef-outcome-main {
+  color: #ffd37a;
+  font-size: 11.5px;
+  white-space: normal;
 }
 
 /* ==========================================================================
@@ -1470,12 +1487,26 @@ body {
   color: var(--ef-emerald);
 }
 
-.ef-airspace-state.status-host { color: var(--ef-cyan); }
-.ef-airspace-state.status-host .ef-status-dot { background: var(--ef-cyan); }
-.ef-airspace-state.status-syncing { color: var(--ef-amber); }
-.ef-airspace-state.status-syncing .ef-status-dot { background: var(--ef-amber); }
-.ef-airspace-state.status-offline { color: var(--ef-text-muted); }
-.ef-airspace-state.status-offline .ef-status-dot { background: var(--ef-text-dim); }
+.ef-airspace-state.status-online { color: var(--ef-emerald); }
+.ef-airspace-state.status-online .ef-status-dot {
+  background: var(--ef-emerald);
+  box-shadow: 0 0 7px rgba(56, 242, 139, 0.85);
+}
+.ef-airspace-state.status-connecting { color: var(--ef-amber); }
+.ef-airspace-state.status-connecting .ef-status-dot {
+  background: var(--ef-amber);
+  animation: efPulseDot 1.05s ease-in-out infinite;
+}
+.ef-airspace-state.status-offline-full,
+.ef-airspace-state.status-offline-error {
+  color: #ffb085;
+}
+.ef-airspace-state.status-offline-full .ef-status-dot,
+.ef-airspace-state.status-offline-error .ef-status-dot {
+  background: transparent;
+  border: 1.5px solid #ff7a52;
+  box-shadow: none;
+}
 
 .ef-airspace-pilots {
   font-family: var(--ef-font-mono);
@@ -1484,16 +1515,39 @@ body {
   color: var(--ef-cyan);
 }
 
+.ef-airspace-conn-line {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ef-cream);
+  line-height: 1.35;
+}
+
+.ef-retry-live-btn {
+  appearance: none;
+  align-self: flex-start;
+  padding: 6px 12px;
+  border-radius: 3px;
+  background: rgba(56, 242, 139, 0.16);
+  border: 1px solid rgba(56, 242, 139, 0.62);
+  color: var(--ef-emerald);
+  font-family: var(--ef-font-mono);
+  font-size: 10.5px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background 0.14s ease, border-color 0.14s ease;
+}
+
+.ef-retry-live-btn:hover {
+  background: rgba(56, 242, 139, 0.28);
+  border-color: var(--ef-emerald);
+}
+
 .ef-airspace-op-title {
   font-size: 13px;
   font-weight: 800;
   color: #f6f8fa;
-}
-
-.ef-airspace-op-sub {
-  font-size: 11px;
-  color: var(--ef-text-muted);
-  line-height: 1.35;
 }
 
 .ef-sector-strip {

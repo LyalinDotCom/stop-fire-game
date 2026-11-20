@@ -14,6 +14,19 @@ export const IDLE_OFFLINE_MS = 300000;
 
 const MAX_CLAIM_RETRIES = 8;
 
+/** Count non-expired active slots in a `worlds/$w/slots` snapshot. */
+export function countActiveSlots(slotsMap, now, excludeUid = null) {
+  if (!slotsMap || typeof slotsMap !== 'object') return 0;
+  let active = 0;
+  for (let s = 0; s < MAX_SLOTS; s++) {
+    const entry = slotsMap[String(s)];
+    if (!entry || typeof entry.leaseUntil !== 'number' || entry.leaseUntil <= now) continue;
+    if (excludeUid && entry.uid === excludeUid) continue;
+    active++;
+  }
+  return active;
+}
+
 /** Compute staggered basin-perimeter entry spawn pose for slotId 0..99. */
 export function computeEntrySpawnPose(slotId, terrain) {
   const halfWorld = terrain?.halfWorld ?? 1024;
@@ -192,6 +205,9 @@ export class SlotAllocator {
         }
       }
 
+      const effectiveCap = Math.max(1, Math.min(MAX_SLOTS, Math.floor(config?.cap ?? cap) || MAX_SLOTS));
+      const activeByOthers = countActiveSlots(slots, now, uid);
+
       // Build shuffled list of vacant (missing or expired) slots.
       const vacant = [];
       for (let s = 0; s < MAX_SLOTS; s++) {
@@ -211,8 +227,16 @@ export class SlotAllocator {
         vacant.unshift(preferredExpiredSlot);
       }
 
-      if (vacant.length === 0) {
-        return { seated: false, slotId: null, createdWorld: false, queued: true };
+      if (vacant.length === 0 || activeByOthers >= effectiveCap) {
+        return {
+          seated: false,
+          slotId: null,
+          createdWorld: false,
+          queued: true,
+          full: true,
+          activeCount: activeByOthers,
+          cap: effectiveCap,
+        };
       }
 
       const creatingWorld = !config;
@@ -280,10 +304,45 @@ export class SlotAllocator {
         }
       }
 
-      return { seated: false, slotId: null, createdWorld: false, queued: true };
+      return {
+        seated: false,
+        slotId: null,
+        createdWorld: false,
+        queued: true,
+        full: true,
+        activeCount: countActiveSlots(slots, this.adapter.now(), uid),
+        cap: effectiveCap,
+      };
     } finally {
       this._claiming = false;
     }
+  }
+
+  /** Inspect current world capacity (returns full=true when all cap slots are occupied by other pilots). */
+  async checkCapacity({ cap = MAX_SLOTS } = {}) {
+    const uid = this.adapter.uid;
+    const [config, slotsMap] = await Promise.all([
+      this.adapter.get(`${this.basePath}/config`).catch(() => null),
+      this.adapter.get(`${this.basePath}/slots`).catch(() => null),
+    ]);
+    const now = this.adapter.now();
+    const slots = slotsMap || {};
+    const effectiveCap = Math.max(1, Math.min(MAX_SLOTS, Math.floor(config?.cap ?? cap) || MAX_SLOTS));
+    let alreadySeated = false;
+    for (let s = 0; s < MAX_SLOTS; s++) {
+      const entry = slots[String(s)];
+      if (entry && entry.uid === uid && entry.leaseUntil > now) {
+        alreadySeated = true;
+        break;
+      }
+    }
+    const activeByOthers = countActiveSlots(slots, now, uid);
+    return {
+      full: !alreadySeated && activeByOthers >= effectiveCap,
+      activeCount: activeByOthers + (alreadySeated ? 1 : 0),
+      cap: effectiveCap,
+      alreadySeated,
+    };
   }
 
   /** Renew slot lease every 20 s (respecting >= 10 s server pacing). Unseats cleanly if evicted. */

@@ -62,6 +62,25 @@ function el(tag, className, text) {
   return node;
 }
 
+function resolveConnStatus(netState) {
+  if (!netState) return 'connecting';
+  if (
+    netState.connStatus === 'online' ||
+    netState.connStatus === 'connecting' ||
+    netState.connStatus === 'offline_full' ||
+    netState.connStatus === 'offline_error'
+  ) {
+    return netState.connStatus;
+  }
+  if (netState.status === 'syncing') return 'connecting';
+  if (netState.status === 'offline' || netState.offlineFallback) {
+    const reason = String(netState.offlineReason || '').toLowerCase();
+    return reason.includes('full') || reason.includes('100') ? 'offline_full' : 'offline_error';
+  }
+  if (netState.status === 'host' || netState.status === 'live') return 'online';
+  return 'connecting';
+}
+
 export class SettingsDrawer {
   constructor({ onSettingChange, onClose } = {}) {
     this._onSettingChange = onSettingChange;
@@ -142,14 +161,14 @@ export class SettingsDrawer {
     const panel = el('div', 'ef-drawer-section');
     this._tabPanels.audio = panel;
 
-    // 1. Live Shared Airspace Status Card (zero Solo/MP switcher!)
-    panel.appendChild(el('div', 'ef-section-heading', 'SHARED LIVE AIRSPACE'));
+    // 1. Live Shared Airspace Status Card (zero Solo/MP mode switcher!)
+    panel.appendChild(el('div', 'ef-section-heading', 'AIRSPACE CONNECTION'));
     const statusCard = el('div', 'ef-airspace-card');
 
     const topRow = el('div', 'ef-airspace-row');
-    const stateBadge = el('span', 'ef-airspace-state');
+    const stateBadge = el('span', 'ef-airspace-state status-connecting');
     this._airspaceDot = el('span', 'ef-status-dot');
-    this._airspaceStateText = el('span', null, 'AIRSPACE: LIVE');
+    this._airspaceStateText = el('span', null, 'CONNECTING');
     stateBadge.appendChild(this._airspaceDot);
     stateBadge.appendChild(this._airspaceStateText);
     this._airspaceStateBadge = stateBadge;
@@ -159,11 +178,19 @@ export class SettingsDrawer {
     topRow.appendChild(this._airspacePilotsEl);
     statusCard.appendChild(topRow);
 
+    this._airspaceConnLine = el('div', 'ef-airspace-conn-line', 'CONNECTING — Joining Live Shared Airspace...');
+    statusCard.appendChild(this._airspaceConnLine);
+
+    this._retryLiveBtn = el('button', 'ef-retry-live-btn ef-hidden', 'RETRY LIVE');
+    this._retryLiveBtn.type = 'button';
+    this._retryLiveBtn.setAttribute('data-action', 'retry-live');
+    this._retryLiveBtn.addEventListener('click', () => {
+      if (this._onSettingChange) this._onSettingChange('retryLive', true);
+    });
+    statusCard.appendChild(this._retryLiveBtn);
+
     this._airspaceOpTitle = el('div', 'ef-airspace-op-title', 'OPERATION 01 / 05 · Cinderpine Basin');
     statusCard.appendChild(this._airspaceOpTitle);
-
-    this._airspaceOpSub = el('div', 'ef-airspace-op-sub', 'Open airspace — anyone joining flies this active operation with you.');
-    statusCard.appendChild(this._airspaceOpSub);
 
     // 5-Sector progression strip (read-only indicator)
     const sectorStrip = el('div', 'ef-sector-strip');
@@ -461,25 +488,49 @@ export class SettingsDrawer {
   }
 
   update({ opConfig, netState, settings } = {}) {
-    // 1. Live Shared Airspace Status
+    // 1. Online / Offline Airspace Connection Status
     const status = (netState && netState.status) || 'live';
+    const connStatus = resolveConnStatus(netState);
     const pilotsCount = Math.max(1, netState && typeof netState.pilotsCount === 'number' ? netState.pilotsCount : 1);
     const pilotsCap = (netState && netState.pilotsCap) || 100;
+    const isOffline = connStatus === 'offline_full' || connStatus === 'offline_error';
 
-    this._airspaceStateBadge.classList.remove('status-host', 'status-syncing', 'status-offline');
-    if (status === 'host') {
-      this._airspaceStateBadge.classList.add('status-host');
-      this._airspaceStateText.textContent = 'AIRSPACE: LIVE (HOST)';
-    } else if (status === 'syncing') {
-      this._airspaceStateBadge.classList.add('status-syncing');
-      this._airspaceStateText.textContent = 'AIRSPACE: SYNCING...';
-    } else if (status === 'offline') {
-      this._airspaceStateBadge.classList.add('status-offline');
-      this._airspaceStateText.textContent = 'AIRSPACE: RECONNECTING';
+    this._airspaceStateBadge.classList.remove(
+      'status-online',
+      'status-host',
+      'status-connecting',
+      'status-offline-full',
+      'status-offline-error'
+    );
+    this._airspaceStateBadge.setAttribute('data-conn-status', connStatus);
+
+    if (connStatus === 'online') {
+      this._airspaceStateBadge.classList.add('status-online');
+      if (status === 'host') this._airspaceStateBadge.classList.add('status-host');
+      this._airspaceStateText.textContent = status === 'host' ? 'ONLINE · HOST' : 'ONLINE';
+      this._airspacePilotsEl.textContent = `${pilotsCount} / ${pilotsCap} PILOTS`;
+      this._airspaceConnLine.textContent =
+        status === 'host'
+          ? 'ONLINE — Live Shared Airspace (Command Host)'
+          : 'ONLINE — Live Shared Airspace';
+    } else if (connStatus === 'connecting') {
+      this._airspaceStateBadge.classList.add('status-connecting');
+      this._airspaceStateText.textContent = 'CONNECTING';
+      this._airspacePilotsEl.textContent = `— / ${pilotsCap}`;
+      this._airspaceConnLine.textContent = 'CONNECTING — Joining Live Shared Airspace...';
+    } else if (connStatus === 'offline_full') {
+      this._airspaceStateBadge.classList.add('status-offline-full');
+      this._airspaceStateText.textContent = 'OFFLINE · FULL';
+      this._airspacePilotsEl.textContent = '100 / 100 FULL';
+      this._airspaceConnLine.textContent = 'OFFLINE — Local Mission (Airspace full · Reload to reconnect)';
     } else {
-      this._airspaceStateText.textContent = 'AIRSPACE: LIVE';
+      this._airspaceStateBadge.classList.add('status-offline-error');
+      this._airspaceStateText.textContent = 'OFFLINE · LOCAL';
+      this._airspacePilotsEl.textContent = 'LOCAL';
+      this._airspaceConnLine.textContent = 'OFFLINE — Local Mission (Reload to reconnect)';
     }
-    this._airspacePilotsEl.textContent = `${pilotsCount} / ${pilotsCap} PILOTS`;
+
+    this._retryLiveBtn.classList.toggle('ef-hidden', !isOffline);
 
     if (opConfig) {
       const idx = String(opConfig.index || 1).padStart(2, '0');
